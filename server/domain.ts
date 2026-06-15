@@ -1,4 +1,5 @@
 import type {
+  AutoDeposit,
   AppData,
   BillingPeriod,
   Debit,
@@ -88,6 +89,7 @@ export function seedData(): AppData {
       { id: id("mem"), serviceId, userId: userA, active: true, joinedAt: createdAt },
       { id: id("mem"), serviceId, userId: userB, active: true, joinedAt: createdAt }
     ],
+    autoDeposits: [],
     deposits: [],
     debits: [],
     notifications: [],
@@ -381,6 +383,26 @@ function buildMonthlyDate(year: number, month: number, anchorDay: number, anchor
   return date;
 }
 
+export function buildNextAutoDepositDate(from: Date, dayOfMonth: number, hour: number) {
+  let cursor = buildMonthlyDate(from.getFullYear(), from.getMonth(), dayOfMonth, hour, 0);
+
+  while (cursor <= from) {
+    cursor = buildMonthlyDate(cursor.getFullYear(), cursor.getMonth() + 1, dayOfMonth, hour, 0);
+  }
+
+  return cursor;
+}
+
+export function advanceAutoDepositDate(schedule: Pick<AutoDeposit, "dayOfMonth" | "hour">, from: Date) {
+  let cursor = buildMonthlyDate(from.getFullYear(), from.getMonth() + 1, schedule.dayOfMonth, schedule.hour, 0);
+
+  while (cursor <= from) {
+    cursor = buildMonthlyDate(cursor.getFullYear(), cursor.getMonth() + 1, schedule.dayOfMonth, schedule.hour, 0);
+  }
+
+  return cursor;
+}
+
 export function buildNextChargeDate(
   from: Date,
   period: BillingPeriod,
@@ -426,6 +448,52 @@ export function advanceChargeDate(service: Service, from: Date) {
   if (period === "day") next.setDate(next.getDate() + Math.max(1, interval || 1));
   if (period === "hour") next.setHours(next.getHours() + Math.max(1, interval || 1));
   return next;
+}
+
+function resolveAutoDepositService(data: AppData, schedule: AutoDeposit) {
+  const hasActiveMembership = (serviceId: string) =>
+    data.memberships.some((membership) => membership.userId === schedule.userId && membership.serviceId === serviceId && membership.active);
+  const serviceIsActive = (serviceId: string) => data.services.some((service) => service.id === serviceId && service.active);
+
+  if (schedule.serviceId && hasActiveMembership(schedule.serviceId) && serviceIsActive(schedule.serviceId)) {
+    return schedule.serviceId;
+  }
+
+  const fallback = data.memberships.find(
+    (membership) => membership.userId === schedule.userId && membership.active && serviceIsActive(membership.serviceId)
+  );
+
+  if (!fallback) {
+    throw new Error("Для автоплатежа нужен активный сервис участника");
+  }
+
+  schedule.serviceId = fallback.serviceId;
+  return fallback.serviceId;
+}
+
+export function runAutoDepositSchedule(data: AppData, scheduleId: string, options: { advance: boolean }) {
+  const schedule = data.autoDeposits.find((item) => item.id === scheduleId);
+  if (!schedule) throw new Error("Автоплатеж не найден");
+  if (!schedule.enabled && options.advance) return null;
+
+  const serviceId = resolveAutoDepositService(data, schedule);
+  const dueAt = new Date(schedule.nextDepositAt ?? nowIso());
+  const deposit = addDeposit(data, {
+    serviceId,
+    userId: schedule.userId,
+    amount: schedule.amount,
+    currency: schedule.currency,
+    comment: schedule.comment || "Автоплатеж",
+    source: "auto"
+  });
+
+  schedule.lastDepositedAt = deposit.createdAt;
+  schedule.updatedAt = nowIso();
+  if (options.advance) {
+    schedule.nextDepositAt = advanceAutoDepositDate(schedule, dueAt).toISOString();
+  }
+
+  return deposit;
 }
 
 export function getPeriodRange(service: Service, chargeDate: Date) {

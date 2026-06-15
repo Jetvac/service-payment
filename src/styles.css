@@ -426,6 +426,7 @@ label {
 
 .user-create,
 .deposit-form,
+.auto-payment-form,
 .bot-form {
   grid-template-columns: repeat(4, minmax(0, 1fr));
 }
@@ -599,6 +600,51 @@ td small {
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 12px;
   padding: 16px;
+}
+
+.auto-payment-list {
+  display: grid;
+  gap: 10px;
+  padding: 0 16px 16px;
+}
+
+.auto-payment-row {
+  display: grid;
+  grid-template-columns: minmax(150px, 1fr) minmax(150px, 1fr) 120px 92px 82px 74px 70px;
+  gap: 10px;
+  align-items: end;
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.035);
+}
+
+.auto-payment-row.disabled {
+  opacity: 0.66;
+}
+
+.auto-toggle {
+  align-self: center;
+}
+
+.auto-payment-meta,
+.auto-payment-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.auto-payment-meta {
+  grid-column: span 4;
+  color: #8a8f98;
+  font-size: 12px;
+}
+
+.auto-payment-actions {
+  grid-column: span 3;
+  justify-content: flex-end;
 }
 
 .person-card {
@@ -907,8 +953,15 @@ td small {
   }
 
   .member-row,
+  .auto-payment-row,
   .modal-form {
     grid-template-columns: 1fr;
+  }
+
+  .auto-payment-meta,
+  .auto-payment-actions {
+    grid-column: auto;
+    justify-content: flex-start;
   }
 
   .panel-head {

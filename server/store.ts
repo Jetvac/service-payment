@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { AppData } from "./types";
-import { BALANCE_CURRENCY, roundMoney, seedData } from "./domain";
+import { BALANCE_CURRENCY, buildNextAutoDepositDate, normalizeNumber, roundMoney, seedData } from "./domain";
 
 const dataDir = path.resolve(process.cwd(), "data");
 const dataFile = path.join(dataDir, "db.json");
@@ -75,6 +75,7 @@ export class Store {
       users: backup.users,
       services: backup.services,
       memberships: backup.memberships,
+      autoDeposits: Array.isArray(backup.autoDeposits) ? backup.autoDeposits : [],
       deposits: Array.isArray(backup.deposits) ? backup.deposits : [],
       debits: Array.isArray(backup.debits) ? backup.debits : [],
       notifications: Array.isArray(backup.notifications) ? backup.notifications : [],
@@ -127,6 +128,7 @@ export class Store {
     }
 
     data.notifications ??= [];
+    data.autoDeposits ??= [];
     data.deposits ??= [];
     data.debits ??= [];
     data.memberships ??= [];
@@ -138,6 +140,26 @@ export class Store {
 
     for (const membership of data.memberships) {
       delete membership.balance;
+    }
+
+    for (const schedule of data.autoDeposits) {
+      schedule.userId = String(schedule.userId ?? "");
+      schedule.serviceId =
+        String(schedule.serviceId ?? "") ||
+        data.memberships.find((membership) => membership.userId === schedule.userId && membership.active)?.serviceId ||
+        "";
+      schedule.amount = roundMoney(Math.max(0, normalizeNumber(schedule.amount, 0)));
+      schedule.currency = data.currencies.some((currency) => currency.code === schedule.currency)
+        ? schedule.currency
+        : BALANCE_CURRENCY;
+      schedule.dayOfMonth = Math.max(1, Math.min(31, normalizeNumber(schedule.dayOfMonth, 1)));
+      schedule.hour = Math.max(0, Math.min(23, normalizeNumber(schedule.hour, 12)));
+      schedule.enabled = Boolean(schedule.enabled);
+      schedule.comment ??= "";
+      schedule.lastDepositedAt ??= null;
+      schedule.nextDepositAt ??= buildNextAutoDepositDate(new Date(), schedule.dayOfMonth, schedule.hour).toISOString();
+      schedule.createdAt ??= new Date().toISOString();
+      schedule.updatedAt ??= schedule.createdAt;
     }
 
     for (const deposit of data.deposits) {

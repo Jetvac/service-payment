@@ -4,10 +4,12 @@ import fs from "node:fs";
 import path from "node:path";
 import { promisify } from "node:util";
 import { Store } from "./store";
-import type { BillingPeriod, Currency, Service, User } from "./types";
+import type { AppData, AutoDeposit, BillingPeriod, Currency, Service, User } from "./types";
 import {
   addDeposit,
   addNotification,
+  advanceAutoDepositDate,
+  buildNextAutoDepositDate,
   buildNextChargeDate,
   cancelDebit,
   cancelDeposit,
@@ -17,6 +19,7 @@ import {
   normalizeNumber,
   nowIso,
   roundMoney,
+  runAutoDepositSchedule,
   runDebitForService
 } from "./domain";
 import {
@@ -134,6 +137,45 @@ function scheduleServiceRestart() {
   return { scheduled: true, serviceUnit };
 }
 
+function normalizeAutoDepositInput(data: AppData, body: Partial<AutoDeposit>, fallback?: AutoDeposit) {
+  const userId = String(body.userId ?? fallback?.userId ?? "");
+  const user = data.users.find((item) => item.id === userId);
+  if (!user) throw new Error("РџРѕР»СЊР·РѕРІР°С‚РµР»СЊ РЅРµ РЅР°Р№РґРµРЅ");
+
+  const requestedServiceId = String(body.serviceId ?? fallback?.serviceId ?? "");
+  const activeMemberships = data.memberships.filter((membership) => membership.userId === userId && membership.active);
+  const serviceId =
+    activeMemberships.find((membership) => membership.serviceId === requestedServiceId)?.serviceId ??
+    activeMemberships.find((membership) => data.services.some((service) => service.id === membership.serviceId && service.active))?.serviceId ??
+    activeMemberships[0]?.serviceId ??
+    "";
+
+  if (!serviceId) {
+    throw new Error("Для автоплатежа нужно закрепить участника за сервисом");
+  }
+
+  const amount = roundMoney(Math.max(0, normalizeNumber(body.amount, fallback?.amount ?? 0)));
+  if (amount <= 0) throw new Error("Сумма автоплатежа должна быть больше нуля");
+
+  const currency = String(body.currency ?? fallback?.currency ?? "RUB").toUpperCase();
+  if (!data.currencies.some((item) => item.code === currency)) throw new Error("Валюта не найдена");
+
+  const dayOfMonth = Math.max(1, Math.min(31, normalizeNumber(body.dayOfMonth, fallback?.dayOfMonth ?? 1)));
+  const hour = Math.max(0, Math.min(23, normalizeNumber(body.hour, fallback?.hour ?? 12)));
+
+  return {
+    userId,
+    serviceId,
+    amount,
+    currency,
+    dayOfMonth,
+    hour,
+    enabled: body.enabled ?? fallback?.enabled ?? true,
+    comment: String(body.comment ?? fallback?.comment ?? ""),
+    nextDepositAt: buildNextAutoDepositDate(new Date(), dayOfMonth, hour).toISOString()
+  };
+}
+
 app.get("/api/state", (_req, res) => {
   res.json(ok(apiState()));
 });
@@ -237,6 +279,7 @@ app.delete("/api/users/:id", (req, res) => {
     store.write((data) => {
       data.users = data.users.filter((item) => item.id !== req.params.id);
       data.memberships = data.memberships.filter((item) => item.userId !== req.params.id);
+      data.autoDeposits = data.autoDeposits.filter((item) => item.userId !== req.params.id);
     });
 
     res.json(ok(apiState()));
@@ -328,6 +371,7 @@ app.delete("/api/services/:id", (req, res) => {
     store.write((data) => {
       data.services = data.services.filter((item) => item.id !== req.params.id);
       data.memberships = data.memberships.filter((item) => item.serviceId !== req.params.id);
+      data.autoDeposits = data.autoDeposits.filter((item) => item.serviceId !== req.params.id);
     });
 
     res.json(ok(apiState()));
@@ -359,6 +403,82 @@ app.delete("/api/services/:serviceId/members/:userId", (req, res) => {
         (item) => item.serviceId === req.params.serviceId && item.userId === req.params.userId
       );
       if (membership) membership.active = false;
+      for (const schedule of data.autoDeposits.filter(
+        (item) => item.userId === req.params.userId && item.serviceId === req.params.serviceId
+      )) {
+        const fallback = data.memberships.find(
+          (item) => item.userId === req.params.userId && item.active && item.serviceId !== req.params.serviceId
+        );
+        if (fallback) schedule.serviceId = fallback.serviceId;
+        else schedule.enabled = false;
+        schedule.updatedAt = nowIso();
+      }
+    });
+
+    res.json(ok(apiState()));
+  } catch (error) {
+    res.status(400).json(fail(error));
+  }
+});
+
+app.post("/api/auto-deposits", (req, res) => {
+  try {
+    store.write((data) => {
+      const input = normalizeAutoDepositInput(data, req.body);
+      const createdAt = nowIso();
+      const schedule: AutoDeposit = {
+        id: id("apm"),
+        ...input,
+        enabled: Boolean(input.enabled),
+        lastDepositedAt: null,
+        createdAt,
+        updatedAt: createdAt
+      };
+      data.autoDeposits.unshift(schedule);
+    });
+
+    res.json(ok(apiState()));
+  } catch (error) {
+    res.status(400).json(fail(error));
+  }
+});
+
+app.put("/api/auto-deposits/:id", (req, res) => {
+  try {
+    store.write((data) => {
+      const schedule = data.autoDeposits.find((item) => item.id === req.params.id);
+      if (!schedule) throw new Error("Автоплатеж не найден");
+      const input = normalizeAutoDepositInput(data, req.body, schedule);
+      Object.assign(schedule, {
+        ...input,
+        enabled: Boolean(input.enabled),
+        updatedAt: nowIso()
+      });
+    });
+
+    res.json(ok(apiState()));
+  } catch (error) {
+    res.status(400).json(fail(error));
+  }
+});
+
+app.delete("/api/auto-deposits/:id", (req, res) => {
+  try {
+    store.write((data) => {
+      data.autoDeposits = data.autoDeposits.filter((item) => item.id !== req.params.id);
+    });
+
+    res.json(ok(apiState()));
+  } catch (error) {
+    res.status(400).json(fail(error));
+  }
+});
+
+app.post("/api/auto-deposits/:id/run", (req, res) => {
+  try {
+    store.write((data) => {
+      const deposit = runAutoDepositSchedule(data, req.params.id, { advance: false });
+      if (!deposit) throw new Error("Автоплатеж отключён");
     });
 
     res.json(ok(apiState()));
@@ -597,6 +717,55 @@ async function processDueServices() {
   }
 }
 
+function processDueAutoDeposits() {
+  let processed = 0;
+  let failed = 0;
+
+  store.write((data) => {
+    const now = new Date();
+
+    for (const schedule of data.autoDeposits) {
+      if (!schedule.enabled) continue;
+
+      if (!schedule.nextDepositAt || Number.isNaN(new Date(schedule.nextDepositAt).getTime())) {
+        schedule.nextDepositAt = buildNextAutoDepositDate(now, schedule.dayOfMonth, schedule.hour).toISOString();
+        continue;
+      }
+
+      let guard = 0;
+      while (new Date(schedule.nextDepositAt) <= now && guard < 24) {
+        try {
+          runAutoDepositSchedule(data, schedule.id, { advance: true });
+          processed += 1;
+        } catch (error) {
+          failed += 1;
+          addNotification(data, {
+            serviceId: schedule.serviceId || data.services[0]?.id || "",
+            userId: schedule.userId,
+            kind: "system",
+            message: error instanceof Error ? error.message : "Ошибка автоплатежа",
+            status: "failed"
+          });
+          schedule.nextDepositAt = advanceAutoDepositDate(schedule, new Date(schedule.nextDepositAt)).toISOString();
+          schedule.updatedAt = nowIso();
+          break;
+        }
+        guard += 1;
+      }
+    }
+
+    if (processed || failed) {
+      addNotification(data, {
+        serviceId: data.services[0]?.id ?? "",
+        userId: null,
+        kind: "system",
+        message: `Автоплатежи: ${processed}, ошибки: ${failed}`,
+        status: failed ? "failed" : "sent"
+      });
+    }
+  });
+}
+
 setInterval(() => {
   processDueServices().catch((error) => {
     const data = store.read();
@@ -612,6 +781,22 @@ setInterval(() => {
 }, 60_000);
 
 processDueServices().catch(() => undefined);
+setInterval(() => {
+  try {
+    processDueAutoDeposits();
+  } catch (error) {
+    const data = store.read();
+    addNotification(data, {
+      serviceId: data.services[0]?.id ?? "",
+      userId: null,
+      kind: "system",
+      message: error instanceof Error ? error.message : "Ошибка планировщика автоплатежей",
+      status: "failed"
+    });
+    store.persist();
+  }
+}, 60_000);
+processDueAutoDeposits();
 
 let telegramPollingBusy = false;
 setInterval(() => {

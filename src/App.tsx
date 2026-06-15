@@ -5,6 +5,7 @@ import {
   BellRing,
   Bot,
   CalendarClock,
+  CalendarPlus,
   Check,
   CircleDollarSign,
   Clock3,
@@ -40,6 +41,7 @@ import {
   YAxis
 } from "recharts";
 import type { AppState, BillingPeriod, Currency, Service, TelegramSettings, User } from "./types";
+import type { AutoDeposit } from "./types";
 
 type View = "dashboard" | "services" | "people" | "ledger" | "bot";
 
@@ -48,6 +50,17 @@ type DepositForm = {
   userId: string;
   amount: number;
   currency: string;
+  comment: string;
+};
+
+type AutoDepositForm = {
+  userId: string;
+  serviceId: string;
+  amount: number;
+  currency: string;
+  dayOfMonth: number;
+  hour: number;
+  enabled: boolean;
   comment: string;
 };
 
@@ -67,6 +80,13 @@ const periodNames: Record<BillingPeriod, string> = {
   week: "Неделя",
   day: "День",
   hour: "Час"
+};
+
+const operationSourceNames: Record<string, string> = {
+  manual: "Ручной",
+  telegram: "Telegram",
+  auto: "Авто",
+  reversal: "Коррекция"
 };
 
 const navItems = [
@@ -102,6 +122,17 @@ const blankUser = {
   botAdmin: false
 };
 
+const blankAutoDeposit = {
+  userId: "",
+  serviceId: "",
+  amount: 600,
+  currency: "RUB",
+  dayOfMonth: 1,
+  hour: 12,
+  enabled: true,
+  comment: ""
+};
+
 function money(value: number, currency: string) {
   return `${Number(value || 0).toLocaleString("ru-RU", { minimumFractionDigits: 2, maximumFractionDigits: 2 })} ${currency}`;
 }
@@ -126,6 +157,25 @@ function plainDate(value: string) {
 
 function isEffectiveOperation(operation: { cancelledAt?: string | null; reversesId?: string | null }) {
   return !operation.cancelledAt && !operation.reversesId;
+}
+
+function activeServicesForUser(state: AppState, userId: string) {
+  return state.memberships
+    .filter((membership) => membership.userId === userId && membership.active)
+    .map((membership) => state.services.find((service) => service.id === membership.serviceId))
+    .filter((service): service is Service => Boolean(service));
+}
+
+function autoDepositDefaults(state: AppState, preferredUserId = ""): AutoDepositForm {
+  const userId = preferredUserId && state.users.some((user) => user.id === preferredUserId) ? preferredUserId : state.users[0]?.id ?? "";
+  const service = activeServicesForUser(state, userId)[0];
+
+  return {
+    ...blankAutoDeposit,
+    userId,
+    serviceId: service?.id ?? "",
+    currency: service?.currency ?? state.currencies[0]?.code ?? "RUB"
+  };
 }
 
 async function api<T = AppState>(path: string, options: RequestInit = {}) {
@@ -1083,6 +1133,7 @@ function PeopleView({
   state,
   userForm,
   setUserForm,
+  userById,
   serviceById,
   mutate,
   saveUser
@@ -1152,7 +1203,279 @@ function PeopleView({
           ))}
         </div>
       </div>
+
+      <AutoDepositsPanel state={state} userById={userById} serviceById={serviceById} mutate={mutate} />
     </section>
+  );
+}
+
+function AutoDepositsPanel({
+  state,
+  userById,
+  serviceById,
+  mutate
+}: {
+  state: AppState;
+  userById: (id: string) => User | undefined;
+  serviceById: (id: string) => Service | undefined;
+  mutate: (path: string, body?: unknown, method?: string) => Promise<AppState>;
+}) {
+  const [form, setForm] = useState<AutoDepositForm>(() => autoDepositDefaults(state));
+  const serviceOptions = activeServicesForUser(state, form.userId);
+
+  useEffect(() => {
+    setForm((current) => {
+      const userId = current.userId && state.users.some((user) => user.id === current.userId) ? current.userId : state.users[0]?.id ?? "";
+      const services = activeServicesForUser(state, userId);
+      const serviceId = services.some((service) => service.id === current.serviceId) ? current.serviceId : services[0]?.id ?? "";
+      const currency = current.currency || services[0]?.currency || state.currencies[0]?.code || "RUB";
+      return { ...current, userId, serviceId, currency };
+    });
+  }, [state.users, state.memberships, state.services, state.currencies]);
+
+  const createAutoDeposit = () =>
+    mutate("/api/auto-deposits", form).then((nextState) => setForm(autoDepositDefaults(nextState, form.userId)));
+
+  return (
+    <div className="panel wide">
+      <div className="panel-head">
+        <h2>Автоплатежи</h2>
+        <button className="primary" type="button" disabled={!form.userId || !form.serviceId || form.amount <= 0} onClick={createAutoDeposit}>
+          <CalendarPlus size={16} />
+          Добавить
+        </button>
+      </div>
+      <div className="form-grid auto-payment-form">
+        <label>
+          Участник
+          <select
+            value={form.userId}
+            onChange={(event) => {
+              const services = activeServicesForUser(state, event.target.value);
+              setForm({
+                ...form,
+                userId: event.target.value,
+                serviceId: services[0]?.id ?? "",
+                currency: services[0]?.currency ?? form.currency
+              });
+            }}
+          >
+            {state.users.map((user) => (
+              <option key={user.id} value={user.id}>
+                {user.name}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label>
+          Сервис для истории
+          <select
+            value={form.serviceId}
+            disabled={!serviceOptions.length}
+            onChange={(event) => setForm({ ...form, serviceId: event.target.value })}
+          >
+            {serviceOptions.map((service) => (
+              <option key={service.id} value={service.id}>
+                {service.name}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label>
+          Сумма
+          <input
+            type="number"
+            min="0"
+            step="0.01"
+            value={form.amount}
+            onChange={(event) => setForm({ ...form, amount: Number(event.target.value) })}
+          />
+        </label>
+        <label>
+          Валюта
+          <select value={form.currency} onChange={(event) => setForm({ ...form, currency: event.target.value })}>
+            {state.currencies.map((currency) => (
+              <option key={currency.code} value={currency.code}>
+                {currency.code}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label>
+          День месяца
+          <input
+            type="number"
+            min="1"
+            max="31"
+            value={form.dayOfMonth}
+            onChange={(event) => setForm({ ...form, dayOfMonth: Number(event.target.value) })}
+          />
+        </label>
+        <label>
+          Час
+          <input
+            type="number"
+            min="0"
+            max="23"
+            value={form.hour}
+            onChange={(event) => setForm({ ...form, hour: Number(event.target.value) })}
+          />
+        </label>
+        <label className="toggle-row">
+          <input type="checkbox" checked={form.enabled} onChange={(event) => setForm({ ...form, enabled: event.target.checked })} />
+          Активен
+        </label>
+        <label className="wide-field">
+          Комментарий
+          <input value={form.comment} onChange={(event) => setForm({ ...form, comment: event.target.value })} />
+        </label>
+      </div>
+      <div className="auto-payment-list">
+        {(state.autoDeposits ?? []).map((schedule) => (
+          <AutoDepositRow
+            key={schedule.id}
+            schedule={schedule}
+            state={state}
+            userById={userById}
+            serviceById={serviceById}
+            mutate={mutate}
+          />
+        ))}
+        {!state.autoDeposits?.length && <Empty label="Автоплатежи не настроены" />}
+      </div>
+    </div>
+  );
+}
+
+function AutoDepositRow({
+  schedule,
+  state,
+  userById,
+  serviceById,
+  mutate
+}: {
+  schedule: AutoDeposit;
+  state: AppState;
+  userById: (id: string) => User | undefined;
+  serviceById: (id: string) => Service | undefined;
+  mutate: (path: string, body?: unknown, method?: string) => Promise<AppState>;
+}) {
+  const [draft, setDraft] = useState<AutoDeposit>(schedule);
+  const serviceOptions = activeServicesForUser(state, draft.userId);
+
+  useEffect(() => setDraft(schedule), [schedule]);
+
+  useEffect(() => {
+    if (!serviceOptions.length) return;
+    if (!serviceOptions.some((service) => service.id === draft.serviceId)) {
+      setDraft((current) => ({ ...current, serviceId: serviceOptions[0].id }));
+    }
+  }, [draft.serviceId, serviceOptions]);
+
+  return (
+    <article className={classNames("auto-payment-row", !draft.enabled && "disabled")}>
+      <label>
+        Участник
+        <select
+          value={draft.userId}
+          onChange={(event) => {
+            const services = activeServicesForUser(state, event.target.value);
+            setDraft({
+              ...draft,
+              userId: event.target.value,
+              serviceId: services[0]?.id ?? "",
+              currency: services[0]?.currency ?? draft.currency
+            });
+          }}
+        >
+          {state.users.map((user) => (
+            <option key={user.id} value={user.id}>
+              {user.name}
+            </option>
+          ))}
+        </select>
+      </label>
+      <label>
+        Сервис
+        <select
+          value={draft.serviceId}
+          disabled={!serviceOptions.length}
+          onChange={(event) => setDraft({ ...draft, serviceId: event.target.value })}
+        >
+          {serviceOptions.map((service) => (
+            <option key={service.id} value={service.id}>
+              {service.name}
+            </option>
+          ))}
+        </select>
+      </label>
+      <label>
+        Сумма
+        <input
+          type="number"
+          min="0"
+          step="0.01"
+          value={draft.amount}
+          onChange={(event) => setDraft({ ...draft, amount: Number(event.target.value) })}
+        />
+      </label>
+      <label>
+        Валюта
+        <select value={draft.currency} onChange={(event) => setDraft({ ...draft, currency: event.target.value })}>
+          {state.currencies.map((currency) => (
+            <option key={currency.code} value={currency.code}>
+              {currency.code}
+            </option>
+          ))}
+        </select>
+      </label>
+      <label>
+        День
+        <input
+          type="number"
+          min="1"
+          max="31"
+          value={draft.dayOfMonth}
+          onChange={(event) => setDraft({ ...draft, dayOfMonth: Number(event.target.value) })}
+        />
+      </label>
+      <label>
+        Час
+        <input
+          type="number"
+          min="0"
+          max="23"
+          value={draft.hour}
+          onChange={(event) => setDraft({ ...draft, hour: Number(event.target.value) })}
+        />
+      </label>
+      <label className="toggle-row auto-toggle">
+        <input type="checkbox" checked={draft.enabled} onChange={(event) => setDraft({ ...draft, enabled: event.target.checked })} />
+        Вкл
+      </label>
+      <label className="wide-field">
+        Комментарий
+        <input value={draft.comment} onChange={(event) => setDraft({ ...draft, comment: event.target.value })} />
+      </label>
+      <div className="auto-payment-meta">
+        <span>Следующий: {dateTime(draft.nextDepositAt)}</span>
+        <span>Последний: {dateTime(draft.lastDepositedAt)}</span>
+        <span>
+          {userById(draft.userId)?.name ?? "Участник"} · {serviceById(draft.serviceId)?.name ?? "Сервис"}
+        </span>
+      </div>
+      <div className="auto-payment-actions">
+        <button className="ghost compact" type="button" disabled={!draft.serviceId || draft.amount <= 0} onClick={() => mutate(`/api/auto-deposits/${draft.id}/run`, {})}>
+          Сейчас
+        </button>
+        <button className="ghost compact" type="button" disabled={!draft.serviceId || draft.amount <= 0} onClick={() => mutate(`/api/auto-deposits/${draft.id}`, draft, "PUT")}>
+          Сохранить
+        </button>
+        <button className="icon-button danger" type="button" title="Удалить" onClick={() => mutate(`/api/auto-deposits/${draft.id}`, undefined, "DELETE")}>
+          <Trash2 size={15} />
+        </button>
+      </div>
+    </article>
   );
 }
 
@@ -1414,7 +1737,7 @@ function OperationCell({
 }) {
   return (
     <div className="operation-cell">
-      <span>{source}</span>
+      <span>{operationSourceNames[source] ?? source}</span>
       {cancelledAt && <span className="status-pill cancelled">Отменено</span>}
       {reversesId && <span className="status-pill reversal">Коррекция</span>}
       {!cancelledAt && !reversesId && <span className="status-pill">Активно</span>}

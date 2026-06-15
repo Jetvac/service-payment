@@ -65,13 +65,29 @@ export type Deposit = {
   balanceCurrency: string;
   rateSnapshot: Record<string, number>;
   comment: string;
-  source: "manual" | "telegram" | "reversal";
+  source: "manual" | "telegram" | "auto" | "reversal";
   createdAt: string;
   balanceAfter: number;
   cancelledAt?: string | null;
   cancellationReason?: string;
   reversalId?: string | null;
   reversesId?: string | null;
+};
+
+export type AutoDeposit = {
+  id: string;
+  userId: string;
+  serviceId: string;
+  amount: number;
+  currency: string;
+  dayOfMonth: number;
+  hour: number;
+  enabled: boolean;
+  comment: string;
+  lastDepositedAt: string | null;
+  nextDepositAt: string | null;
+  createdAt: string;
+  updatedAt: string;
 };
 
 export type Debit = {
@@ -128,6 +144,7 @@ export type AppData = {
   users: User[];
   services: Service[];
   memberships: Membership[];
+  autoDeposits: AutoDeposit[];
   deposits: Deposit[];
   debits: Debit[];
   notifications: Notification[];
