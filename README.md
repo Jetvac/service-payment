@@ -37,6 +37,30 @@ npm start
 
 После сборки backend отдаёт готовый интерфейс на `http://localhost:4077`.
 
+## Deploy на Ubuntu
+
+В репозитории есть скрипт `scripts/deploy-ubuntu.sh`. Он устанавливает Node.js, клонирует или обновляет `Jetvac/service-payment`, собирает приложение, создаёт systemd-сервис и при необходимости настраивает nginx.
+
+Минимальный запуск на сервере:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Jetvac/service-payment/main/scripts/deploy-ubuntu.sh | sudo bash
+```
+
+С доменом и nginx:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Jetvac/service-payment/main/scripts/deploy-ubuntu.sh | sudo env DOMAIN=pay.example.com bash
+```
+
+С HTTPS через Let's Encrypt:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Jetvac/service-payment/main/scripts/deploy-ubuntu.sh | sudo env DOMAIN=pay.example.com ENABLE_SSL=true EMAIL=admin@example.com bash
+```
+
+Полезные переменные: `APP_DIR=/opt/service-payment`, `PORT=4077`, `BRANCH=main`, `ENABLE_UFW=true`.
+
 ## Telegram
 
 Webhook endpoint отображается в разделе Telegram. Для Telegram Bot API его нужно установить как:
