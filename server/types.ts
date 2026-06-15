@@ -32,6 +32,28 @@ export type BillingSettings = {
   lowBalanceThresholdPeriods: number;
 };
 
+export type ServiceHealthStatus = "unknown" | "online" | "offline";
+export type ServiceDeployStatus = "unknown" | "success" | "failed";
+
+export type ServiceConnectionSettings = {
+  enabled: boolean;
+  host: string;
+  port: number;
+  sshPort: number;
+  user: string;
+  password: string;
+  passwordSet?: boolean;
+  websocketPath: string;
+  useTls: boolean;
+  lastStatus: ServiceHealthStatus;
+  lastLatencyMs: number | null;
+  lastCheckedAt: string | null;
+  lastError: string;
+  lastDeployStatus: ServiceDeployStatus;
+  lastDeployAt: string | null;
+  lastDeployOutput: string;
+};
+
 export type Service = {
   id: string;
   name: string;
@@ -40,6 +62,7 @@ export type Service = {
   monthlyCost: number;
   currency: string;
   active: boolean;
+  connection: ServiceConnectionSettings;
   billing: BillingSettings;
   createdAt: string;
 };

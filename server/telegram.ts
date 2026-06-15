@@ -53,7 +53,7 @@ function mentionUser(user: User) {
 
 function commandKeyboard() {
   return {
-    keyboard: [["/balance", "/services"], ["/pay 600", "/help"], ["/users"]],
+    keyboard: [["/balance", "/services"], ["/status", "/help"], ["/pay 600", "/users"]],
     resize_keyboard: true,
     is_persistent: true
   };
@@ -123,11 +123,13 @@ export async function configureTelegramIntegration(data: AppData, webhookUrl: st
     { command: "deposit", description: "Зачислить на сервис: /deposit 600 VPN Main" },
     { command: "balance", description: "Показать баланс" },
     { command: "services", description: "Показать подключенные сервисы" },
+    { command: "status", description: "Показать доступность сервисов" },
     { command: "users", description: "Пользователи и остатки по сервисам" },
     { command: "help", description: "Показать помощь" },
     { command: "settopic", description: "Назначить топик уведомлений" }
   ];
   const groupCommands = [
+    { command: "status", description: "Показать доступность сервисов" },
     { command: "users", description: "Пользователи и остатки по сервисам" },
     { command: "settopic", description: "Назначить топик уведомлений" },
     { command: "help", description: "Показать помощь" }
@@ -321,6 +323,7 @@ function helpText(user: User, data: AppData) {
     `/deposit 600 VPN Main — зачислить на конкретный сервис`,
     `/balance — показать текущий баланс`,
     `/services — показать подключенные сервисы и списания за период`,
+    `/status — показать последнюю доступность сервисов`,
     `/users — показать пользователей и остатки по сервисам (только админ)`,
     `/help — показать это сообщение`,
     `/settopic — назначить текущий топик общих уведомлений (только админ)`,
@@ -349,6 +352,29 @@ function usersByServiceText(data: AppData) {
   return [`👥 <b>Пользователи по сервисам</b>`, serviceBlocks.length ? serviceBlocks.join("\n\n") : "Активных участников нет"].join("\n");
 }
 
+function formatTelegramDate(value: string | null | undefined) {
+  if (!value) return "нет данных";
+  return new Intl.DateTimeFormat("ru-RU", {
+    day: "2-digit",
+    month: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit"
+  }).format(new Date(value));
+}
+
+function serviceHealthText(service: Service) {
+  const connection = service.connection;
+  if (!connection?.enabled || !connection.host) return "мониторинг не настроен";
+
+  const statusLabel =
+    connection.lastStatus === "online" ? "онлайн" : connection.lastStatus === "offline" ? "недоступен" : "нет данных";
+  const latency = connection.lastLatencyMs !== null ? `, ${connection.lastLatencyMs} мс` : "";
+  const checked = `проверка: ${formatTelegramDate(connection.lastCheckedAt)}`;
+  const error = connection.lastStatus === "offline" && connection.lastError ? `, ${escapeHtml(connection.lastError)}` : "";
+
+  return `${statusLabel}${latency}, ${checked}${error}`;
+}
+
 function userServicesText(data: AppData, user: User) {
   const rows = data.memberships
     .filter((item) => item.userId === user.id && item.active)
@@ -358,7 +384,7 @@ function userServicesText(data: AppData, user: User) {
       const charge = calculatePerMemberPeriod(data, service);
       const chargeBalanceCurrency = convertToBalanceCurrency(data, charge, service.currency);
       const converted = service.currency === BALANCE_CURRENCY ? "" : ` / ${formatMoney(chargeBalanceCurrency, BALANCE_CURRENCY)}`;
-      return `• <b>${escapeHtml(service.name)}</b>: ${formatMoney(charge, service.currency)}${converted} за ${periodLabel(service.billing.period)}`;
+      return `• <b>${escapeHtml(service.name)}</b>: ${formatMoney(charge, service.currency)}${converted} за ${periodLabel(service.billing.period)}\n  ${serviceHealthText(service)}`;
     });
 
   return [
@@ -366,6 +392,24 @@ function userServicesText(data: AppData, user: User) {
     `Общий баланс: <b>${formatMoney(user.balance, BALANCE_CURRENCY)}</b>`,
     rows.length ? rows.join("\n") : "Активных сервисов нет"
   ].join("\n");
+}
+
+function userServiceStatusText(data: AppData, user: User) {
+  const rows = data.memberships
+    .filter((item) => item.userId === user.id && item.active)
+    .map((membership) => data.services.find((service) => service.id === membership.serviceId))
+    .filter((service): service is Service => Boolean(service))
+    .map((service) => `• <b>${escapeHtml(service.name)}</b>: ${serviceHealthText(service)}`);
+
+  return [`📡 <b>Доступность сервисов</b>`, rows.length ? rows.join("\n") : "Активных сервисов нет"].join("\n");
+}
+
+function allServiceStatusText(data: AppData) {
+  const rows = data.services
+    .filter((service) => service.active)
+    .map((service) => `• <b>${escapeHtml(service.name)}</b>: ${serviceHealthText(service)}`);
+
+  return [`📡 <b>Доступность сервисов</b>`, rows.length ? rows.join("\n") : "Активных сервисов нет"].join("\n");
 }
 
 function findServiceForCommand(data: AppData, user: User, rest: string[]) {
@@ -388,7 +432,7 @@ export async function handleTelegramUpdate(data: AppData, message: TelegramMessa
   const text = message.text?.trim() ?? "";
   const { command, rest } = commandParts(text);
 
-  if (!["/pay", "/deposit", "/balance", "/services", "/users", "/start", "/help", "/settopic"].includes(command)) {
+  if (!["/pay", "/deposit", "/balance", "/services", "/status", "/users", "/start", "/help", "/settopic"].includes(command)) {
     return { handled: false };
   }
 
@@ -409,6 +453,12 @@ export async function handleTelegramUpdate(data: AppData, message: TelegramMessa
 
   if (command === "/services") {
     const reply = userServicesText(data, user);
+    await sendTelegramMessage(data, reply, message.chat?.id, { commandKeyboard: message.chat?.type === "private", threadId: message.message_thread_id });
+    return { handled: true, reply };
+  }
+
+  if (command === "/status") {
+    const reply = user.botAdmin ? allServiceStatusText(data) : userServiceStatusText(data, user);
     await sendTelegramMessage(data, reply, message.chat?.id, { commandKeyboard: message.chat?.type === "private", threadId: message.message_thread_id });
     return { handled: true, reply };
   }

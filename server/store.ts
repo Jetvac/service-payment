@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { AppData } from "./types";
-import { BALANCE_CURRENCY, buildNextAutoDepositDate, normalizeNumber, roundMoney, seedData } from "./domain";
+import { BALANCE_CURRENCY, buildNextAutoDepositDate, defaultServiceConnection, normalizeNumber, roundMoney, seedData } from "./domain";
 
 const dataDir = path.resolve(process.cwd(), "data");
 const dataFile = path.join(dataDir, "db.json");
@@ -102,6 +102,30 @@ export class Store {
       service.notes ??= "";
       service.active ??= true;
       service.monthlyCost = roundMoney(service.monthlyCost);
+      const connection = { ...defaultServiceConnection(), ...(service.connection ?? {}) };
+      connection.enabled = Boolean(connection.enabled);
+      connection.host = String(connection.host ?? "").trim();
+      connection.port = Math.max(1, Math.min(65535, normalizeNumber(connection.port, 8765)));
+      connection.sshPort = Math.max(1, Math.min(65535, normalizeNumber(connection.sshPort, 22)));
+      connection.user = String(connection.user ?? "").trim();
+      connection.password = String(connection.password ?? "");
+      connection.passwordSet = Boolean(connection.password);
+      connection.websocketPath = String(connection.websocketPath ?? "/echo").trim() || "/echo";
+      if (!connection.websocketPath.startsWith("/")) connection.websocketPath = `/${connection.websocketPath}`;
+      connection.useTls = Boolean(connection.useTls);
+      connection.lastStatus = ["online", "offline", "unknown"].includes(connection.lastStatus) ? connection.lastStatus : "unknown";
+      connection.lastLatencyMs =
+        typeof connection.lastLatencyMs === "number" && Number.isFinite(connection.lastLatencyMs)
+          ? Math.max(0, Math.round(connection.lastLatencyMs))
+          : null;
+      connection.lastCheckedAt ??= null;
+      connection.lastError = String(connection.lastError ?? "");
+      connection.lastDeployStatus = ["success", "failed", "unknown"].includes(connection.lastDeployStatus)
+        ? connection.lastDeployStatus
+        : "unknown";
+      connection.lastDeployAt ??= null;
+      connection.lastDeployOutput = String(connection.lastDeployOutput ?? "").slice(-8000);
+      service.connection = connection;
     }
 
     for (const user of data.users) {

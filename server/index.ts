@@ -3,8 +3,9 @@ import { execFile, spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { promisify } from "node:util";
+import { Client } from "ssh2";
 import { Store } from "./store";
-import type { AppData, AutoDeposit, BillingPeriod, Currency, Service, User } from "./types";
+import type { AppData, AutoDeposit, BillingPeriod, Currency, Service, ServiceConnectionSettings, ServiceHealthStatus, User } from "./types";
 import {
   addDeposit,
   addNotification,
@@ -14,6 +15,7 @@ import {
   cancelDebit,
   cancelDeposit,
   computeSummaries,
+  defaultServiceConnection,
   ensureMembership,
   id,
   normalizeNumber,
@@ -49,10 +51,24 @@ function fail(error: unknown) {
   return { ok: false, error: message };
 }
 
+function publicData(data: AppData) {
+  const clone = JSON.parse(JSON.stringify(data)) as AppData;
+
+  clone.services = clone.services.map((service) => {
+    const source = data.services.find((item) => item.id === service.id);
+    const connection = { ...defaultServiceConnection(), ...(service.connection ?? {}) };
+    connection.password = "";
+    connection.passwordSet = Boolean(source?.connection?.password);
+    return { ...service, connection };
+  });
+
+  return clone;
+}
+
 function apiState() {
   const data = store.read();
   return {
-    ...data,
+    ...publicData(data),
     summaries: computeSummaries(data),
     serverTime: nowIso()
   };
@@ -135,6 +151,170 @@ function scheduleServiceRestart() {
   }, 1200);
 
   return { scheduled: true, serviceUnit };
+}
+
+function normalizeConnectionInput(body: Partial<ServiceConnectionSettings> | undefined, fallback?: ServiceConnectionSettings) {
+  const base = { ...defaultServiceConnection(), ...(fallback ?? {}) };
+  const input = body ?? {};
+  const passwordInput = typeof input.password === "string" ? input.password : "";
+  const websocketPath = String(input.websocketPath ?? base.websocketPath ?? "/echo").trim() || "/echo";
+
+  return {
+    ...base,
+    enabled: Boolean(input.enabled ?? base.enabled),
+    host: String(input.host ?? base.host ?? "").trim(),
+    port: Math.max(1, Math.min(65535, normalizeNumber(input.port, base.port || 8765))),
+    sshPort: Math.max(1, Math.min(65535, normalizeNumber(input.sshPort, base.sshPort || 22))),
+    user: String(input.user ?? base.user ?? "").trim(),
+    password: passwordInput ? passwordInput : base.password,
+    passwordSet: Boolean(passwordInput || base.password),
+    websocketPath: websocketPath.startsWith("/") ? websocketPath : `/${websocketPath}`,
+    useTls: Boolean(input.useTls ?? base.useTls),
+    lastStatus: base.lastStatus,
+    lastLatencyMs: base.lastLatencyMs,
+    lastCheckedAt: base.lastCheckedAt,
+    lastError: base.lastError,
+    lastDeployStatus: base.lastDeployStatus,
+    lastDeployAt: base.lastDeployAt,
+    lastDeployOutput: base.lastDeployOutput
+  };
+}
+
+function normalizeHealthStatus(value: unknown): ServiceHealthStatus {
+  return value === "online" || value === "offline" || value === "unknown" ? value : "unknown";
+}
+
+const echoServerRepoUrl = "https://github.com/LazyDoomSlayer/rust-websocket-server.git";
+const echoServerServiceName = "rust-websocket-echo-server";
+
+function buildEchoServerDeployScript(password: string) {
+  const passwordBase64 = Buffer.from(password, "utf8").toString("base64");
+  const unitFile = `[Unit]
+Description=Rust WebSocket Echo Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/${echoServerServiceName}
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+`;
+
+  return [
+    "set -Eeuo pipefail",
+    "export DEBIAN_FRONTEND=noninteractive",
+    `SUDO_PASSWORD="$(printf '%s' ${shellQuote(passwordBase64)} | base64 -d)"`,
+    "run_sudo() { if [ \"$(id -u)\" -eq 0 ]; then \"$@\"; else printf '%s\\n' \"$SUDO_PASSWORD\" | sudo -S -p '' \"$@\"; fi; }",
+    "echo 'Checking sudo access'",
+    "run_sudo true",
+    "echo 'Installing system dependencies'",
+    "run_sudo apt-get update -y",
+    "run_sudo apt-get install -y ca-certificates curl git build-essential pkg-config libssl-dev",
+    "if ! command -v cargo >/dev/null 2>&1; then echo 'Installing Rust toolchain'; curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal; fi",
+    "if [ -f \"$HOME/.cargo/env\" ]; then . \"$HOME/.cargo/env\"; fi",
+    "if ! command -v cargo >/dev/null 2>&1; then echo 'cargo not found after rustup installation'; exit 1; fi",
+    "APP_DIR='/opt/rust-websocket-server'",
+    `REPO_URL=${shellQuote(echoServerRepoUrl)}`,
+    "echo 'Fetching repository'",
+    "if [ -d \"$APP_DIR/.git\" ]; then run_sudo chown -R \"$(id -un):$(id -gn)\" \"$APP_DIR\" || true; git -C \"$APP_DIR\" fetch --depth 1 origin main; git -C \"$APP_DIR\" reset --hard FETCH_HEAD; else run_sudo rm -rf \"$APP_DIR\"; run_sudo mkdir -p \"$APP_DIR\"; run_sudo chown \"$(id -un):$(id -gn)\" \"$APP_DIR\"; git clone --depth 1 \"$REPO_URL\" \"$APP_DIR\"; fi",
+    "cd \"$APP_DIR\"",
+    "echo 'Building release binary'",
+    "cargo build --release",
+    "BIN=\"$(find target/release -maxdepth 1 -type f -perm /111 \\( -name 'rust-websocket-server' -o -name 'rust-websocket-echo-server' \\) | head -n 1)\"",
+    "if [ -z \"$BIN\" ]; then echo 'Release binary not found'; find target/release -maxdepth 1 -type f -print; exit 1; fi",
+    "echo 'Installing binary'",
+    `run_sudo install -m 755 "$BIN" /usr/local/bin/${echoServerServiceName}`,
+    `printf '%s' ${shellQuote(unitFile)} | run_sudo tee /etc/systemd/system/${echoServerServiceName}.service >/dev/null`,
+    "run_sudo systemctl daemon-reload",
+    `run_sudo systemctl enable ${echoServerServiceName}.service`,
+    `run_sudo systemctl restart ${echoServerServiceName}.service`,
+    "if command -v ufw >/dev/null 2>&1 && run_sudo ufw status | grep -qi active; then run_sudo ufw allow 8765/tcp || true; fi",
+    "sleep 1",
+    `run_sudo systemctl --no-pager --full status ${echoServerServiceName}.service | sed -n '1,18p' || true`,
+    "echo 'Echo server is deployed on ws://0.0.0.0:8765/echo'"
+  ].join("\n");
+}
+
+function appendOutput(current: string, chunk: Buffer | string) {
+  return (current + chunk.toString()).slice(-12000);
+}
+
+function runSshScript(service: Service, script: string) {
+  const connection = service.connection;
+  return new Promise<string>((resolve, reject) => {
+    const client = new Client();
+    let output = "";
+    let settled = false;
+    let streamStarted = false;
+
+    const finish = (error?: Error, result = output) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      client.end();
+      if (error) {
+        (error as Error & { output?: string }).output = result;
+        reject(error);
+      } else {
+        resolve(result);
+      }
+    };
+
+    const timeout = setTimeout(() => {
+      finish(new Error("SSH deploy timeout"), output);
+    }, 10 * 60 * 1000);
+
+    client
+      .on("ready", () => {
+        client.exec("bash -s", { pty: true }, (error, stream) => {
+          if (error) {
+            finish(error);
+            return;
+          }
+
+          streamStarted = true;
+          stream
+            .on("close", (code: number | null) => {
+              if (code === 0) {
+                finish(undefined, output);
+              } else {
+                finish(new Error(`SSH deploy failed with exit code ${code ?? "unknown"}`), output);
+              }
+            })
+            .on("data", (chunk: Buffer) => {
+              output = appendOutput(output, chunk);
+            })
+            .stderr.on("data", (chunk: Buffer) => {
+              output = appendOutput(output, chunk);
+            });
+
+          stream.end(script);
+        });
+      })
+      .on("error", (error) => {
+        finish(error, streamStarted ? output : appendOutput(output, error.message));
+      })
+      .connect({
+        host: connection.host,
+        port: connection.sshPort || 22,
+        username: connection.user,
+        password: connection.password,
+        readyTimeout: 20000
+      });
+  });
+}
+
+async function deployEchoServer(service: Service) {
+  const connection = { ...defaultServiceConnection(), ...(service.connection ?? {}) };
+  if (!connection.host.trim()) throw new Error("Укажите IP / host сервиса");
+  if (!connection.user.trim()) throw new Error("Укажите SSH user");
+  if (!connection.password) throw new Error("Укажите SSH pass и сохраните сервис");
+
+  return runSshScript({ ...service, connection }, buildEchoServerDeployScript(connection.password));
 }
 
 function normalizeAutoDepositInput(data: AppData, body: Partial<AutoDeposit>, fallback?: AutoDeposit) {
@@ -304,6 +484,7 @@ app.post("/api/services", (req, res) => {
       monthlyCost: roundMoney(Math.max(0, normalizeNumber(req.body.monthlyCost, 0))),
       currency: String(req.body.currency ?? "RUB"),
       active: true,
+      connection: normalizeConnectionInput(req.body.connection),
       billing: {
         period,
         interval,
@@ -340,6 +521,7 @@ app.put("/api/services/:id", (req, res) => {
       service.monthlyCost = roundMoney(Math.max(0, normalizeNumber(req.body.monthlyCost, service.monthlyCost)));
       service.currency = String(req.body.currency ?? service.currency);
       service.active = Boolean(req.body.active);
+      service.connection = normalizeConnectionInput(req.body.connection, service.connection);
       service.billing.period = String(req.body.period ?? service.billing.period) as BillingPeriod;
       service.billing.interval = Math.max(1, normalizeNumber(req.body.interval, service.billing.interval));
       service.billing.autoDebit = Boolean(req.body.autoDebit);
@@ -363,6 +545,67 @@ app.put("/api/services/:id", (req, res) => {
     res.json(ok(apiState()));
   } catch (error) {
     res.status(400).json(fail(error));
+  }
+});
+
+app.post("/api/services/:id/health", (req, res) => {
+  try {
+    store.write((data) => {
+      const service = data.services.find((item) => item.id === req.params.id);
+      if (!service) throw new Error("Сервис не найден");
+      service.connection = { ...defaultServiceConnection(), ...(service.connection ?? {}) };
+      service.connection.lastStatus = normalizeHealthStatus(req.body.status);
+      service.connection.lastLatencyMs =
+        typeof req.body.latencyMs === "number" && Number.isFinite(req.body.latencyMs)
+          ? Math.max(0, Math.round(req.body.latencyMs))
+          : null;
+      service.connection.lastCheckedAt = String(req.body.checkedAt ?? nowIso());
+      service.connection.lastError = String(req.body.error ?? "").slice(0, 240);
+    });
+
+    res.json(ok(apiState()));
+  } catch (error) {
+    res.status(400).json(fail(error));
+  }
+});
+
+app.post("/api/services/:id/deploy-echo", async (req, res) => {
+  let deployOutput = "";
+
+  try {
+    const service = store.read().services.find((item) => item.id === req.params.id);
+    if (!service) throw new Error("Сервис не найден");
+
+    deployOutput = await deployEchoServer(service);
+
+    store.write((data) => {
+      const target = data.services.find((item) => item.id === req.params.id);
+      if (!target) throw new Error("Сервис не найден");
+      target.connection = { ...defaultServiceConnection(), ...(target.connection ?? {}) };
+      target.connection.enabled = true;
+      target.connection.port = 8765;
+      target.connection.websocketPath = "/echo";
+      target.connection.lastDeployStatus = "success";
+      target.connection.lastDeployAt = nowIso();
+      target.connection.lastDeployOutput = deployOutput.slice(-8000);
+      target.connection.lastStatus = "unknown";
+      target.connection.lastError = "";
+    });
+
+    res.json(ok(apiState()));
+  } catch (error) {
+    const output = (error as Error & { output?: string }).output || (error instanceof Error ? error.message : String(error));
+
+    store.write((data) => {
+      const target = data.services.find((item) => item.id === req.params.id);
+      if (!target) return;
+      target.connection = { ...defaultServiceConnection(), ...(target.connection ?? {}) };
+      target.connection.lastDeployStatus = "failed";
+      target.connection.lastDeployAt = nowIso();
+      target.connection.lastDeployOutput = output.slice(-8000);
+    });
+
+    res.json(ok(apiState()));
   }
 });
 

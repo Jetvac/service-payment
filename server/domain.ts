@@ -7,6 +7,7 @@ import type {
   Membership,
   Notification,
   Service,
+  ServiceConnectionSettings,
   ServiceSummary,
   User
 } from "./types";
@@ -24,6 +25,27 @@ export function roundMoney(value: number) {
 export function normalizeNumber(value: unknown, fallback = 0) {
   const number = Number(value);
   return Number.isFinite(number) ? number : fallback;
+}
+
+export function defaultServiceConnection(): ServiceConnectionSettings {
+  return {
+    enabled: false,
+    host: "",
+    port: 8765,
+    sshPort: 22,
+    user: "",
+    password: "",
+    passwordSet: false,
+    websocketPath: "/echo",
+    useTls: false,
+    lastStatus: "unknown",
+    lastLatencyMs: null,
+    lastCheckedAt: null,
+    lastError: "",
+    lastDeployStatus: "unknown",
+    lastDeployAt: null,
+    lastDeployOutput: ""
+  };
 }
 
 export function seedData(): AppData {
@@ -71,6 +93,7 @@ export function seedData(): AppData {
         monthlyCost: 600,
         currency: "RUB",
         active: true,
+        connection: defaultServiceConnection(),
         billing: {
           period: "month",
           interval: 1,

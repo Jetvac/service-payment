@@ -142,6 +142,21 @@ nav {
   box-shadow: 0 0 16px rgba(71, 209, 140, 0.5);
 }
 
+.status-dot.online {
+  background: #47d18c;
+  box-shadow: 0 0 14px rgba(71, 209, 140, 0.46);
+}
+
+.status-dot.offline {
+  background: #ff6f61;
+  box-shadow: 0 0 14px rgba(255, 111, 97, 0.34);
+}
+
+.status-dot.checking {
+  background: #f8c15d;
+  box-shadow: 0 0 14px rgba(248, 193, 93, 0.34);
+}
+
 .workspace {
   min-width: 0;
   padding: 24px;
@@ -295,6 +310,41 @@ h2 {
 .chip.positive {
   color: #47d18c;
   border-color: rgba(71, 209, 140, 0.26);
+}
+
+.service-health {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 26px;
+  max-width: 100%;
+  padding: 0 9px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 999px;
+  color: #aeb4bf;
+  background: rgba(255, 255, 255, 0.04);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.service-health.online {
+  color: #47d18c;
+  border-color: rgba(71, 209, 140, 0.26);
+}
+
+.service-health.offline {
+  color: #ff8b82;
+  border-color: rgba(255, 111, 97, 0.26);
+}
+
+.service-health.checking {
+  color: #f8c15d;
+  border-color: rgba(248, 193, 93, 0.26);
+}
+
+.service-health.compact {
+  min-height: 22px;
+  padding: 0 7px;
 }
 
 button.primary,
@@ -456,6 +506,51 @@ label {
   width: 16px;
   min-height: 16px;
   accent-color: #7aa8ff;
+}
+
+.deploy-control {
+  display: grid;
+  grid-column: span 3;
+  gap: 10px;
+  align-content: start;
+}
+
+.deploy-control .ghost {
+  width: max-content;
+  max-width: 100%;
+}
+
+.deploy-log {
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.035);
+  color: #aeb4bf;
+}
+
+.deploy-log.success {
+  border-color: rgba(71, 209, 140, 0.24);
+}
+
+.deploy-log.failed {
+  border-color: rgba(255, 111, 97, 0.24);
+}
+
+.deploy-log summary {
+  cursor: pointer;
+  padding: 10px 12px;
+  color: #d8dbe2;
+  font-size: 12px;
+}
+
+.deploy-log pre {
+  max-height: 220px;
+  margin: 0;
+  overflow: auto;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  padding: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 12px;
 }
 
 .service-strip {
@@ -944,7 +1039,8 @@ td small {
 
   .wide,
   .stats-grid,
-  .wide-field {
+  .wide-field,
+  .deploy-control {
     grid-column: auto;
   }
 

@@ -40,7 +40,7 @@ import {
   XAxis,
   YAxis
 } from "recharts";
-import type { AppState, BillingPeriod, Currency, Service, TelegramSettings, User } from "./types";
+import type { AppState, BillingPeriod, Currency, Service, ServiceConnectionSettings, ServiceHealthStatus, TelegramSettings, User } from "./types";
 import type { AutoDeposit } from "./types";
 
 type View = "dashboard" | "services" | "people" | "ledger" | "bot";
@@ -75,6 +75,13 @@ type SystemUpdateResult = {
   restart: { scheduled: boolean; serviceUnit?: string; reason?: string };
 };
 
+type ClientHealth = {
+  status: ServiceHealthStatus | "checking";
+  latencyMs: number | null;
+  checkedAt: string | null;
+  error: string;
+};
+
 const periodNames: Record<BillingPeriod, string> = {
   month: "Месяц",
   week: "Неделя",
@@ -87,6 +94,13 @@ const operationSourceNames: Record<string, string> = {
   telegram: "Telegram",
   auto: "Авто",
   reversal: "Коррекция"
+};
+
+const healthLabels: Record<ServiceHealthStatus | "checking", string> = {
+  online: "Онлайн",
+  offline: "Недоступен",
+  unknown: "Нет данных",
+  checking: "Проверка"
 };
 
 const navItems = [
@@ -103,6 +117,24 @@ const blankService = {
   notes: "",
   monthlyCost: 600,
   currency: "RUB",
+  connection: {
+    enabled: false,
+    host: "",
+    port: 8765,
+    sshPort: 22,
+    user: "",
+    password: "",
+    passwordSet: false,
+    websocketPath: "/echo",
+    useTls: false,
+    lastStatus: "unknown" as ServiceHealthStatus,
+    lastLatencyMs: null,
+    lastCheckedAt: null,
+    lastError: "",
+    lastDeployStatus: "unknown",
+    lastDeployAt: null,
+    lastDeployOutput: ""
+  },
   period: "month" as BillingPeriod,
   interval: 1,
   anchorDay: 1,
@@ -153,6 +185,97 @@ function plainDate(value: string) {
     day: "2-digit",
     month: "2-digit"
   }).format(new Date(value));
+}
+
+function serviceConnection(service: Service): ServiceConnectionSettings {
+  return { ...blankService.connection, ...(service.connection ?? {}) };
+}
+
+function serviceHealth(service: Service, clientHealth?: ClientHealth): ClientHealth {
+  const connection = serviceConnection(service);
+  return (
+    clientHealth ?? {
+      status: connection.lastStatus ?? "unknown",
+      latencyMs: connection.lastLatencyMs ?? null,
+      checkedAt: connection.lastCheckedAt ?? null,
+      error: connection.lastError ?? ""
+    }
+  );
+}
+
+function healthTone(status: ServiceHealthStatus | "checking"): "good" | "warn" | "bad" | undefined {
+  if (status === "online") return "good";
+  if (status === "offline") return "bad";
+  if (status === "checking") return "warn";
+  return undefined;
+}
+
+function healthValue(health: ClientHealth) {
+  const latency = health.latencyMs !== null ? ` · ${health.latencyMs} мс` : "";
+  return `${healthLabels[health.status]}${latency}`;
+}
+
+function buildServiceWebSocketUrl(service: Service) {
+  const connection = serviceConnection(service);
+  const rawHost = connection.host.trim();
+  let host = rawHost.replace(/^wss?:\/\//i, "").replace(/\/.*$/, "");
+  let port = String(connection.port || 8765);
+  try {
+    const parsed = new URL(/^[a-z]+:\/\//i.test(rawHost) ? rawHost : `ws://${rawHost}`);
+    host = parsed.hostname;
+    port = parsed.port || port;
+  } catch {
+    const hostMatch = host.match(/^(.*):(\d+)$/);
+    host = hostMatch?.[1] || host;
+    port = hostMatch?.[2] || port;
+  }
+  const hostForUrl = host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
+  const path = (connection.websocketPath || "/echo").startsWith("/")
+    ? connection.websocketPath || "/echo"
+    : `/${connection.websocketPath}`;
+  const protocol = connection.useTls || window.location.protocol === "https:" ? "wss" : "ws";
+
+  return `${protocol}://${hostForUrl}:${port}${path}`;
+}
+
+function checkServiceFromClient(service: Service) {
+  const connection = serviceConnection(service);
+  const checkedAt = new Date().toISOString();
+
+  if (!connection.enabled || !connection.host.trim()) {
+    return Promise.resolve({ status: "unknown" as ServiceHealthStatus, latencyMs: null, checkedAt, error: "" });
+  }
+
+  return new Promise<{ status: ServiceHealthStatus; latencyMs: number | null; checkedAt: string; error: string }>((resolve) => {
+    let settled = false;
+    let socket: WebSocket | null = null;
+    const started = performance.now();
+    const payload = `vpn-pay:${service.id}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
+
+    const finish = (status: ServiceHealthStatus, latencyMs: number | null, error = "") => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timeout);
+      try {
+        socket?.close();
+      } catch {
+        // ignore close errors after failed handshakes
+      }
+      resolve({ status, latencyMs, checkedAt: new Date().toISOString(), error });
+    };
+
+    const timeout = window.setTimeout(() => finish("offline", null, "timeout"), 5000);
+
+    try {
+      socket = new WebSocket(buildServiceWebSocketUrl(service));
+      socket.addEventListener("open", () => socket?.send(payload));
+      socket.addEventListener("message", () => finish("online", Math.round(performance.now() - started)));
+      socket.addEventListener("error", () => finish("offline", null, "websocket error"));
+      socket.addEventListener("close", () => finish("offline", null, "connection closed"));
+    } catch (error) {
+      finish("offline", null, error instanceof Error ? error.message : "connection failed");
+    }
+  });
 }
 
 function isEffectiveOperation(operation: { cancelledAt?: string | null; reversesId?: string | null }) {
@@ -221,6 +344,15 @@ function Stat({
   );
 }
 
+function ServiceHealthBadge({ health, compact = false }: { health: ClientHealth; compact?: boolean }) {
+  return (
+    <span className={classNames("service-health", health.status, compact && "compact")} title={health.error || undefined}>
+      <span className={classNames("status-dot", health.status)} />
+      <span>{healthValue(health)}</span>
+    </span>
+  );
+}
+
 function Empty({ label }: { label: string }) {
   return <div className="empty">{label}</div>;
 }
@@ -233,6 +365,8 @@ export default function App() {
   const [serviceForm, setServiceForm] = useState(blankService);
   const [userForm, setUserForm] = useState(blankUser);
   const [currencyForm, setCurrencyForm] = useState({ code: "", name: "", symbol: "", rateToRub: 1 });
+  const [clientHealth, setClientHealth] = useState<Record<string, ClientHealth>>({});
+  const [deployingServiceId, setDeployingServiceId] = useState("");
   const [depositForm, setDepositForm] = useState({
     serviceId: "",
     userId: "",
@@ -256,6 +390,81 @@ export default function App() {
   useEffect(() => {
     load().catch((error) => setToast(error.message));
   }, []);
+
+  const healthConfigKey = useMemo(
+    () =>
+      state?.services
+        .map((service) => {
+          const connection = serviceConnection(service);
+          return [
+            service.id,
+            connection.enabled,
+            connection.host,
+            connection.port,
+            connection.websocketPath,
+            connection.useTls
+          ].join(":");
+        })
+        .join("|") ?? "",
+    [state?.services]
+  );
+
+  const probeService = async (service: Service) => {
+    const connection = serviceConnection(service);
+    if (!connection.enabled || !connection.host.trim()) return;
+
+    setClientHealth((current) => ({
+      ...current,
+      [service.id]: { status: "checking", latencyMs: null, checkedAt: new Date().toISOString(), error: "" }
+    }));
+
+    const result = await checkServiceFromClient(service);
+    setClientHealth((current) => ({
+      ...current,
+      [service.id]: result
+    }));
+
+    try {
+      const nextState = await api(`/api/services/${service.id}/health`, {
+        method: "POST",
+        body: JSON.stringify(result)
+      });
+      setState(nextState);
+    } catch (error) {
+      setClientHealth((current) => ({
+        ...current,
+        [service.id]: {
+          ...result,
+          status: "offline",
+          error: error instanceof Error ? error.message : result.error
+        }
+      }));
+    }
+  };
+
+  useEffect(() => {
+    if (!state) return;
+    const services = state.services.filter((service) => {
+      const connection = serviceConnection(service);
+      return connection.enabled && connection.host.trim();
+    });
+    if (!services.length) return;
+
+    let cancelled = false;
+    const run = () => {
+      for (const service of services) {
+        if (!cancelled) void probeService(service);
+      }
+    };
+
+    run();
+    const timer = window.setInterval(run, 60_000);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [healthConfigKey]);
 
   useEffect(() => {
     if (!toast) return;
@@ -416,10 +625,24 @@ export default function App() {
         monthlyCost: service.monthlyCost,
         currency: service.currency,
         active: service.active,
+        connection: service.connection,
         ...service.billing
       },
       "PUT"
     );
+
+  const deployEchoServer = async (serviceId: string) => {
+    try {
+      setDeployingServiceId(serviceId);
+      setToast("Запускаю деплой echo-сервера");
+      const nextState = await mutate(`/api/services/${serviceId}/deploy-echo`, {});
+      const service = nextState.services.find((item) => item.id === serviceId);
+      setToast(service && serviceConnection(service).lastDeployStatus === "failed" ? "Деплой не удался" : "Echo-сервер развёрнут");
+      return nextState;
+    } finally {
+      setDeployingServiceId("");
+    }
+  };
 
   const saveUser = (user: User) => mutate(`/api/users/${user.id}`, user, "PUT");
   const saveTelegram = (telegram: TelegramSettings) => mutate("/api/settings/telegram", telegram, "PUT");
@@ -430,6 +653,7 @@ export default function App() {
       <Dashboard
         state={state}
         dashboard={dashboard}
+        clientHealth={clientHealth}
         serviceById={serviceById}
         userById={userById}
       />
@@ -446,6 +670,10 @@ export default function App() {
         userById={userById}
         mutate={mutate}
         setSelectedServiceId={setSelectedServiceId}
+        clientHealth={clientHealth}
+        probeService={probeService}
+        deployingServiceId={deployingServiceId}
+        deployEchoServer={deployEchoServer}
         saveService={saveService}
       />
     ),
@@ -557,6 +785,7 @@ export default function App() {
 function Dashboard({
   state,
   dashboard,
+  clientHealth,
   serviceById,
   userById
 }: {
@@ -569,6 +798,7 @@ function Dashboard({
     chart: Array<{ date: string; deposits: number; debits: number }>;
     balances: Array<{ name: string; balance: number }>;
   };
+  clientHealth: Record<string, ClientHealth>;
   serviceById: (id: string) => Service | undefined;
   userById: (id: string) => User | undefined;
 }) {
@@ -656,6 +886,7 @@ function Dashboard({
                 <th>Стоимость</th>
                 <th>Участники</th>
                 <th>Период</th>
+                <th>Сервер</th>
                 <th>Следующее списание</th>
               </tr>
             </thead>
@@ -671,6 +902,9 @@ function Dashboard({
                     <td>{money(service.monthlyCost, service.currency)}</td>
                     <td>{summary?.memberCount ?? 0}</td>
                     <td>{periodNames[service.billing.period]}</td>
+                    <td>
+                      <ServiceHealthBadge health={serviceHealth(service, clientHealth[service.id])} compact />
+                    </td>
                     <td>{dateTime(summary?.nextChargeAt)}</td>
                   </tr>
                 );
@@ -716,6 +950,10 @@ function ServicesView({
   userById,
   mutate,
   setSelectedServiceId,
+  clientHealth,
+  probeService,
+  deployingServiceId,
+  deployEchoServer,
   saveService
 }: {
   state: AppState;
@@ -728,6 +966,10 @@ function ServicesView({
   userById: (id: string) => User | undefined;
   mutate: (path: string, body?: unknown, method?: string) => Promise<AppState>;
   setSelectedServiceId: (id: string) => void;
+  clientHealth: Record<string, ClientHealth>;
+  probeService: (service: Service) => Promise<void>;
+  deployingServiceId: string;
+  deployEchoServer: (serviceId: string) => Promise<AppState>;
   saveService: (service: Service) => Promise<AppState>;
 }) {
   const [draft, setDraft] = useState<Service | null>(selectedService ?? null);
@@ -737,6 +979,8 @@ function ServicesView({
     setDraft(selectedService ?? null);
   }, [selectedService]);
 
+  const selectedHealth = selectedService ? serviceHealth(selectedService, clientHealth[selectedService.id]) : null;
+
   const openDeposit = (membership: AppState["memberships"][number]) => {
     setDepositDraft({
       serviceId: membership.serviceId,
@@ -745,6 +989,21 @@ function ServicesView({
       currency: selectedService?.currency ?? "RUB",
       comment: ""
     });
+  };
+
+  const deploySelectedEchoServer = async () => {
+    if (!draft) return;
+    const savedState = await saveService(draft);
+    const savedService = savedState.services.find((service) => service.id === draft.id);
+    if (!savedService) return;
+    const nextState = await deployEchoServer(savedService.id);
+    const nextService = nextState.services.find((service) => service.id === savedService.id);
+    if (nextService) {
+      setDraft(nextService);
+      if (serviceConnection(nextService).lastDeployStatus === "success") {
+        void probeService(nextService);
+      }
+    }
   };
 
   return (
@@ -820,6 +1079,7 @@ function ServicesView({
                 <small>
                   {summary?.memberCount ?? 0} · {money(summary?.perMemberPeriod ?? 0, service.currency)}
                 </small>
+                <ServiceHealthBadge health={serviceHealth(service, clientHealth[service.id])} compact />
               </button>
             );
           })}
@@ -839,6 +1099,15 @@ function ServicesView({
                   {draft.active ? <Archive size={16} /> : <ArchiveRestore size={16} />}
                   {draft.active ? "В архив" : "Вернуть"}
                 </button>
+                <button
+                  className="ghost"
+                  type="button"
+                  disabled={!serviceConnection(draft).enabled || !serviceConnection(draft).host || selectedHealth?.status === "checking"}
+                  onClick={() => probeService(draft)}
+                >
+                  <Activity size={16} />
+                  Проверить
+                </button>
                 <button className="ghost" type="button" onClick={() => mutate(`/api/debits/manual`, { serviceId: selectedService.id })}>
                   <CreditCard size={16} />
                   Списать
@@ -855,6 +1124,7 @@ function ServicesView({
               <Stat icon={CircleDollarSign} label="С человека в месяц" value={money(selectedSummary?.perMemberMonth ?? 0, draft.currency)} />
               <Stat icon={Clock3} label="Списание за период" value={money(selectedSummary?.perMemberPeriod ?? 0, draft.currency)} />
               <Stat icon={CalendarClock} label="Следующее списание" value={dateTime(draft.billing.nextChargeAt)} />
+              <Stat icon={Activity} label="Сервер" value={selectedHealth ? healthValue(selectedHealth) : "Нет данных"} tone={selectedHealth ? healthTone(selectedHealth.status) : undefined} />
             </div>
 
             <div className="form-grid service-edit">
@@ -968,6 +1238,103 @@ function ServicesView({
                 <input checked={draft.active} type="checkbox" onChange={(event) => setDraft({ ...draft, active: event.target.checked })} />
                 Активен
               </label>
+              <label className="toggle-row">
+                <input
+                  type="checkbox"
+                  checked={serviceConnection(draft).enabled}
+                  onChange={(event) =>
+                    setDraft({ ...draft, connection: { ...serviceConnection(draft), enabled: event.target.checked } })
+                  }
+                />
+                Мониторинг
+              </label>
+              <label>
+                IP / host
+                <input
+                  value={serviceConnection(draft).host}
+                  onChange={(event) => setDraft({ ...draft, connection: { ...serviceConnection(draft), host: event.target.value } })}
+                />
+              </label>
+              <label>
+                SSH port
+                <input
+                  type="number"
+                  min="1"
+                  max="65535"
+                  value={serviceConnection(draft).sshPort}
+                  onChange={(event) =>
+                    setDraft({ ...draft, connection: { ...serviceConnection(draft), sshPort: Number(event.target.value) } })
+                  }
+                />
+              </label>
+              <label>
+                WS port
+                <input
+                  type="number"
+                  min="1"
+                  max="65535"
+                  value={serviceConnection(draft).port}
+                  onChange={(event) => setDraft({ ...draft, connection: { ...serviceConnection(draft), port: Number(event.target.value) } })}
+                />
+              </label>
+              <label>
+                SSH user
+                <input
+                  value={serviceConnection(draft).user}
+                  onChange={(event) => setDraft({ ...draft, connection: { ...serviceConnection(draft), user: event.target.value } })}
+                />
+              </label>
+              <label>
+                SSH pass
+                <input
+                  type="password"
+                  placeholder={serviceConnection(draft).passwordSet ? "сохранён" : ""}
+                  value={serviceConnection(draft).password}
+                  onChange={(event) => setDraft({ ...draft, connection: { ...serviceConnection(draft), password: event.target.value } })}
+                />
+              </label>
+              <label>
+                WS path
+                <input
+                  value={serviceConnection(draft).websocketPath}
+                  onChange={(event) =>
+                    setDraft({ ...draft, connection: { ...serviceConnection(draft), websocketPath: event.target.value } })
+                  }
+                />
+              </label>
+              <label className="toggle-row">
+                <input
+                  type="checkbox"
+                  checked={serviceConnection(draft).useTls}
+                  onChange={(event) => setDraft({ ...draft, connection: { ...serviceConnection(draft), useTls: event.target.checked } })}
+                />
+                WSS
+              </label>
+              <div className="deploy-control">
+                <button
+                  className="ghost"
+                  type="button"
+                  disabled={
+                    deployingServiceId === draft.id ||
+                    !serviceConnection(draft).host.trim() ||
+                    !serviceConnection(draft).user.trim() ||
+                    (!serviceConnection(draft).password && !serviceConnection(draft).passwordSet)
+                  }
+                  onClick={deploySelectedEchoServer}
+                >
+                  <Upload size={16} />
+                  {deployingServiceId === draft.id ? "Развёртывание..." : "Развернуть echo-сервер"}
+                </button>
+                {serviceConnection(draft).lastDeployStatus !== "unknown" && (
+                  <details className={classNames("deploy-log", serviceConnection(draft).lastDeployStatus)}>
+                    <summary>
+                      {serviceConnection(draft).lastDeployStatus === "success" ? "Последний деплой успешен" : "Последний деплой не удался"} ·{" "}
+                      {dateTime(serviceConnection(draft).lastDeployAt)}
+                    </summary>
+                    <pre>{serviceConnection(draft).lastDeployOutput || "Лог пуст"}</pre>
+                  </details>
+                )}
+              </div>
             </div>
           </div>
 
@@ -2004,6 +2371,7 @@ function BotView({
           <code>/deposit 600 VPN Main</code>
           <code>/balance</code>
           <code>/services</code>
+          <code>/status</code>
           <code>/users</code>
           <code>/help</code>
           <code>/settopic</code>
