@@ -10,6 +10,7 @@ import {
   Clock3,
   Coins,
   CreditCard,
+  Download,
   Gauge,
   History,
   Lock,
@@ -20,6 +21,7 @@ import {
   Shield,
   Trash2,
   Unlock,
+  Upload,
   Wallet,
   X,
   UserPlus,
@@ -51,8 +53,13 @@ type DepositForm = {
 
 type ApiResult = {
   ok: boolean;
-  payload?: AppState;
+  payload?: unknown;
   error?: string;
+};
+
+type SystemUpdateResult = {
+  steps: Array<{ command: string; output: string }>;
+  restart: { scheduled: boolean; serviceUnit?: string; reason?: string };
 };
 
 const periodNames: Record<BillingPeriod, string> = {
@@ -117,7 +124,11 @@ function plainDate(value: string) {
   }).format(new Date(value));
 }
 
-async function api(path: string, options: RequestInit = {}) {
+function isEffectiveOperation(operation: { cancelledAt?: string | null; reversesId?: string | null }) {
+  return !operation.cancelledAt && !operation.reversesId;
+}
+
+async function api<T = AppState>(path: string, options: RequestInit = {}) {
   const response = await fetch(path, {
     ...options,
     headers: {
@@ -131,7 +142,7 @@ async function api(path: string, options: RequestInit = {}) {
     throw new Error(result.error ?? "Ошибка API");
   }
 
-  return result.payload!;
+  return result.payload! as T;
 }
 
 function classNames(...items: Array<string | false | null | undefined>) {
@@ -241,6 +252,54 @@ export default function App() {
     }
   };
 
+  const exportDatabase = async () => {
+    try {
+      const response = await fetch("/api/database/export");
+      if (!response.ok) throw new Error("Не удалось выгрузить базу");
+
+      const blob = await response.blob();
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      const disposition = response.headers.get("content-disposition") ?? "";
+      const fileName = disposition.match(/filename="([^"]+)"/)?.[1] ?? `service-payment-backup-${Date.now()}.json`;
+
+      link.href = url;
+      link.download = fileName;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+      setToast("База выгружена");
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : "Ошибка выгрузки");
+    }
+  };
+
+  const importDatabase = async (file: File) => {
+    try {
+      const backup = JSON.parse(await file.text());
+      await mutate("/api/database/import", backup);
+      setToast("База загружена");
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : "Ошибка загрузки базы");
+    }
+  };
+
+  const updateApplication = async () => {
+    try {
+      setToast("Обновление запущено");
+      const result = await api<SystemUpdateResult>("/api/system/update", {
+        method: "POST",
+        body: JSON.stringify({})
+      });
+      setToast(result.restart.scheduled ? `Обновлено, перезапуск: ${result.restart.serviceUnit}` : `Обновлено: ${result.restart.reason}`);
+      return result;
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : "Ошибка обновления");
+      throw error;
+    }
+  };
+
   const dashboard = useMemo(() => {
     if (!state) {
       return {
@@ -264,10 +323,10 @@ export default function App() {
       return byDate.get(key)!;
     };
 
-    for (const deposit of state.deposits.slice(0, 80)) {
+    for (const deposit of state.deposits.filter(isEffectiveOperation).slice(0, 80)) {
       ensure(deposit.createdAt).deposits += deposit.amountBalanceCurrency ?? deposit.amountServiceCurrency * rate(deposit.serviceCurrency);
     }
-    for (const debit of state.debits.slice(0, 80)) {
+    for (const debit of state.debits.filter(isEffectiveOperation).slice(0, 80)) {
       ensure(debit.createdAt).debits += debit.amountBalanceCurrency ?? debit.amount * rate(debit.currency);
     }
 
@@ -369,6 +428,9 @@ export default function App() {
         saveTelegram={saveTelegram}
         saveCurrency={saveCurrency}
         mutate={mutate}
+        exportDatabase={exportDatabase}
+        importDatabase={importDatabase}
+        updateApplication={updateApplication}
       />
     )
   }[view];
@@ -1417,7 +1479,10 @@ function BotView({
   setCurrencyForm,
   saveTelegram,
   saveCurrency,
-  mutate
+  mutate,
+  exportDatabase,
+  importDatabase,
+  updateApplication
 }: {
   state: AppState;
   currencyForm: { code: string; name: string; symbol: string; rateToRub: number };
@@ -1425,8 +1490,12 @@ function BotView({
   saveTelegram: (telegram: TelegramSettings) => Promise<AppState>;
   saveCurrency: (currency: Currency) => Promise<AppState>;
   mutate: (path: string, body?: unknown, method?: string) => Promise<AppState>;
+  exportDatabase: () => Promise<void>;
+  importDatabase: (file: File) => Promise<void>;
+  updateApplication: () => Promise<SystemUpdateResult>;
 }) {
   const [telegram, setTelegram] = useState(state.settings.telegram);
+  const [updating, setUpdating] = useState(false);
   const webhookUrl = `${window.location.origin.replace(/\/$/, "")}/api/telegram/webhook/${telegram.webhookSecret}`;
   const [publicWebhookUrl, setPublicWebhookUrl] = useState(webhookUrl);
 
@@ -1441,6 +1510,14 @@ function BotView({
   const saveAndTest = () => saveTelegram(telegram).then(() => mutate("/api/telegram/test", { chatId: telegram.chatId }));
   const startPolling = () => saveTelegram({ ...telegram, pollingEnabled: true }).then(() => mutate("/api/telegram/polling/start"));
   const stopPolling = () => mutate("/api/telegram/polling/stop");
+  const runUpdate = async () => {
+    setUpdating(true);
+    try {
+      await updateApplication();
+    } finally {
+      setUpdating(false);
+    }
+  };
 
   return (
     <section className="page-grid">
@@ -1519,6 +1596,38 @@ function BotView({
 
       <div className="panel wide">
         <div className="panel-head">
+          <h2>Система</h2>
+          <span className="chip">backup / update</span>
+        </div>
+        <div className="bot-quick-actions system-actions">
+          <button className="ghost" type="button" onClick={exportDatabase}>
+            <Download size={16} />
+            Скачать БД
+          </button>
+          <label className="ghost file-action">
+            <Upload size={16} />
+            Загрузить БД
+            <input
+              accept="application/json,.json"
+              type="file"
+              onChange={(event) => {
+                const file = event.currentTarget.files?.[0];
+                event.currentTarget.value = "";
+                if (file) {
+                  importDatabase(file);
+                }
+              }}
+            />
+          </label>
+          <button className="ghost" type="button" disabled={updating} onClick={runUpdate}>
+            <RefreshCcw size={16} />
+            {updating ? "Обновление..." : "Обновить приложение"}
+          </button>
+        </div>
+      </div>
+
+      <div className="panel wide">
+        <div className="panel-head">
           <h2>Валюты</h2>
           <button
             className="primary"
@@ -1572,6 +1681,7 @@ function BotView({
           <code>/deposit 600 VPN Main</code>
           <code>/balance</code>
           <code>/services</code>
+          <code>/users</code>
           <code>/help</code>
           <code>/settopic</code>
         </div>

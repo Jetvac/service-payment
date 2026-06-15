@@ -1,5 +1,8 @@
 import express from "express";
+import { execFile, spawn } from "node:child_process";
+import fs from "node:fs";
 import path from "node:path";
+import { promisify } from "node:util";
 import { Store } from "./store";
 import type { BillingPeriod, Currency, Service, User } from "./types";
 import {
@@ -30,8 +33,9 @@ import {
 const app = express();
 const port = Number(process.env.PORT ?? 4077);
 const store = new Store();
+const execFileAsync = promisify(execFile);
 
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: "25mb" }));
 
 function ok(payload: unknown) {
   return { ok: true, payload };
@@ -51,8 +55,135 @@ function apiState() {
   };
 }
 
+function backupFileName() {
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  return `service-payment-backup-${stamp}.json`;
+}
+
+function npmCommand() {
+  return process.platform === "win32" ? "npm.cmd" : "npm";
+}
+
+function shellQuote(value: string) {
+  return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
+function serviceUnitName() {
+  const serviceName = process.env.APP_SERVICE_NAME || process.env.SERVICE_NAME || "service-payment";
+  return serviceName.endsWith(".service") ? serviceName : `${serviceName}.service`;
+}
+
+async function runUpdateStep(command: string, args: string[]) {
+  const { stdout, stderr } = await execFileAsync(command, args, {
+    cwd: process.cwd(),
+    env: process.env,
+    maxBuffer: 20 * 1024 * 1024,
+    windowsHide: true
+  });
+
+  return {
+    command: [command, ...args].join(" "),
+    output: [stdout.trim(), stderr.trim()].filter(Boolean).join("\n").slice(-8000)
+  };
+}
+
+async function runRawUbuntuUpdate() {
+  const branch = process.env.UPDATE_BRANCH || "main";
+  const updateUrl =
+    process.env.UPDATE_SCRIPT_URL || `https://raw.githubusercontent.com/Jetvac/service-payment/${branch}/scripts/update-ubuntu.sh`;
+  const script = [
+    "set -Eeuo pipefail",
+    `curl -fsSL ${shellQuote(updateUrl)} | APP_DIR=${shellQuote(process.cwd())} APP_SERVICE_NAME=${shellQuote(
+      serviceUnitName()
+    )} BRANCH=${shellQuote(branch)} RESTART_SERVICE=false bash`
+  ].join("; ");
+
+  return runUpdateStep("bash", ["-lc", script]);
+}
+
+async function runLocalGitUpdate() {
+  const steps = [];
+  steps.push(await runUpdateStep("git", ["remote", "set-url", "origin", "https://github.com/Jetvac/service-payment.git"]));
+  steps.push(await runUpdateStep("git", ["fetch", "--all", "--prune"]));
+  steps.push(await runUpdateStep("git", ["pull", "--ff-only"]));
+  steps.push(
+    await runUpdateStep(npmCommand(), [
+      fs.existsSync(path.resolve(process.cwd(), "package-lock.json")) ? "ci" : "install"
+    ])
+  );
+  steps.push(await runUpdateStep(npmCommand(), ["run", "build"]));
+  return steps;
+}
+
+function scheduleServiceRestart() {
+  if (process.platform === "win32") {
+    return { scheduled: false, reason: "Перезапуск systemd недоступен на Windows" };
+  }
+
+  const serviceUnit = serviceUnitName();
+
+  setTimeout(() => {
+    const child = spawn("sudo", ["-n", "systemctl", "restart", serviceUnit], {
+      detached: true,
+      stdio: "ignore"
+    });
+    child.on("error", () => undefined);
+    child.unref();
+  }, 1200);
+
+  return { scheduled: true, serviceUnit };
+}
+
 app.get("/api/state", (_req, res) => {
   res.json(ok(apiState()));
+});
+
+app.get("/api/database/export", (_req, res) => {
+  const payload = JSON.stringify(store.exportData(), null, 2);
+  res.setHeader("Content-Type", "application/json; charset=utf-8");
+  res.setHeader("Content-Disposition", `attachment; filename="${backupFileName()}"`);
+  res.send(payload);
+});
+
+app.post("/api/database/import", (req, res) => {
+  try {
+    store.replace(req.body);
+    res.json(ok(apiState()));
+  } catch (error) {
+    res.status(400).json(fail(error));
+  }
+});
+
+app.post("/api/system/update", async (_req, res) => {
+  try {
+    const steps = process.platform === "win32" ? await runLocalGitUpdate() : [await runRawUbuntuUpdate()];
+
+    const restart = scheduleServiceRestart();
+    store.write((data) => {
+      addNotification(data, {
+        serviceId: data.services[0]?.id ?? "",
+        userId: null,
+        kind: "system",
+        message: restart.scheduled
+          ? `Обновление установлено. Перезапуск: ${restart.serviceUnit}`
+          : `Обновление установлено. ${restart.reason}`,
+        status: "sent"
+      });
+    });
+
+    res.json(ok({ steps, restart }));
+  } catch (error) {
+    const data = store.read();
+    addNotification(data, {
+      serviceId: data.services[0]?.id ?? "",
+      userId: null,
+      kind: "system",
+      message: error instanceof Error ? error.message : "Ошибка обновления",
+      status: "failed"
+    });
+    store.persist();
+    res.status(400).json(fail(error));
+  }
 });
 
 app.post("/api/users", (req, res) => {

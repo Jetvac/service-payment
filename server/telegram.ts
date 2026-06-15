@@ -53,7 +53,7 @@ function mentionUser(user: User) {
 
 function commandKeyboard() {
   return {
-    keyboard: [["/balance", "/services"], ["/pay 600", "/help"]],
+    keyboard: [["/balance", "/services"], ["/pay 600", "/help"], ["/users"]],
     resize_keyboard: true,
     is_persistent: true
   };
@@ -123,10 +123,12 @@ export async function configureTelegramIntegration(data: AppData, webhookUrl: st
     { command: "deposit", description: "Зачислить на сервис: /deposit 600 VPN Main" },
     { command: "balance", description: "Показать баланс" },
     { command: "services", description: "Показать подключенные сервисы" },
+    { command: "users", description: "Пользователи и остатки по сервисам" },
     { command: "help", description: "Показать помощь" },
     { command: "settopic", description: "Назначить топик уведомлений" }
   ];
   const groupCommands = [
+    { command: "users", description: "Пользователи и остатки по сервисам" },
     { command: "settopic", description: "Назначить топик уведомлений" },
     { command: "help", description: "Показать помощь" }
   ];
@@ -319,10 +321,32 @@ function helpText(user: User, data: AppData) {
     `/deposit 600 VPN Main — зачислить на конкретный сервис`,
     `/balance — показать текущий баланс`,
     `/services — показать подключенные сервисы и списания за период`,
+    `/users — показать пользователей и остатки по сервисам (только админ)`,
     `/help — показать это сообщение`,
     `/settopic — назначить текущий топик общих уведомлений (только админ)`,
     services ? `Ваши сервисы: <b>${escapeHtml(services)}</b>` : "Активных сервисов нет"
   ].join("\n");
+}
+
+function usersByServiceText(data: AppData) {
+  const serviceBlocks = data.services
+    .filter((service) => data.memberships.some((membership) => membership.serviceId === service.id && membership.active))
+    .map((service) => {
+      const charge = calculatePerMemberPeriod(data, service);
+      const rows = data.memberships
+        .filter((membership) => membership.serviceId === service.id && membership.active)
+        .map((membership) => data.users.find((user) => user.id === membership.userId))
+        .filter((user): user is User => Boolean(user))
+        .map((user) => `• ${mentionUser(user)}: <b>${formatMoney(user.balance, BALANCE_CURRENCY)}</b>`);
+
+      return [
+        `<b>${escapeHtml(service.name)}</b>${service.active ? "" : " (архив)"}`,
+        `Тариф: ${formatMoney(charge, service.currency)} за ${periodLabel(service.billing.period)}`,
+        ...rows
+      ].join("\n");
+    });
+
+  return [`👥 <b>Пользователи по сервисам</b>`, serviceBlocks.length ? serviceBlocks.join("\n\n") : "Активных участников нет"].join("\n");
 }
 
 function userServicesText(data: AppData, user: User) {
@@ -364,7 +388,7 @@ export async function handleTelegramUpdate(data: AppData, message: TelegramMessa
   const text = message.text?.trim() ?? "";
   const { command, rest } = commandParts(text);
 
-  if (!["/pay", "/deposit", "/balance", "/services", "/start", "/help", "/settopic"].includes(command)) {
+  if (!["/pay", "/deposit", "/balance", "/services", "/users", "/start", "/help", "/settopic"].includes(command)) {
     return { handled: false };
   }
 
@@ -385,6 +409,18 @@ export async function handleTelegramUpdate(data: AppData, message: TelegramMessa
 
   if (command === "/services") {
     const reply = userServicesText(data, user);
+    await sendTelegramMessage(data, reply, message.chat?.id, { commandKeyboard: message.chat?.type === "private", threadId: message.message_thread_id });
+    return { handled: true, reply };
+  }
+
+  if (command === "/users") {
+    if (!user.botAdmin) {
+      const reply = "Команда доступна только администратору бота.";
+      await sendTelegramMessage(data, reply, message.chat?.id, { commandKeyboard: message.chat?.type === "private", threadId: message.message_thread_id });
+      return { handled: true, reply };
+    }
+
+    const reply = usersByServiceText(data);
     await sendTelegramMessage(data, reply, message.chat?.id, { commandKeyboard: message.chat?.type === "private", threadId: message.message_thread_id });
     return { handled: true, reply };
   }

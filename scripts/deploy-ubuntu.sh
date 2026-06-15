@@ -29,7 +29,7 @@ require_root() {
 install_base_packages() {
   log "Installing base packages"
   apt-get update
-  apt-get install -y ca-certificates curl gnupg git
+  apt-get install -y ca-certificates curl gnupg git sudo
 }
 
 node_is_supported() {
@@ -66,6 +66,7 @@ checkout_repo() {
 
   if [[ -d "${APP_DIR}/.git" ]]; then
     git config --global --add safe.directory "${APP_DIR}" || true
+    git -C "${APP_DIR}" remote set-url origin "${REPO_URL}"
     git -C "${APP_DIR}" fetch --all --prune
     if [[ -n "${BRANCH}" ]]; then
       git -C "${APP_DIR}" checkout "${BRANCH}"
@@ -123,6 +124,7 @@ Group=${APP_USER}
 WorkingDirectory=${APP_DIR}
 Environment=NODE_ENV=production
 Environment=PORT=${PORT}
+Environment=APP_SERVICE_NAME=${APP_NAME}
 ExecStart=${npm_bin} start
 Restart=always
 RestartSec=5
@@ -136,6 +138,18 @@ EOF
   systemctl daemon-reload
   systemctl enable "${APP_NAME}.service"
   systemctl restart "${APP_NAME}.service"
+}
+
+install_restart_sudoers() {
+  local systemctl_bin
+  systemctl_bin="$(command -v systemctl)"
+
+  log "Allowing ${APP_USER} to restart ${APP_NAME}.service"
+  cat >"/etc/sudoers.d/${APP_NAME}-restart" <<EOF
+${APP_USER} ALL=(root) NOPASSWD: ${systemctl_bin} restart ${APP_NAME}.service
+EOF
+  chmod 440 "/etc/sudoers.d/${APP_NAME}-restart"
+  visudo -cf "/etc/sudoers.d/${APP_NAME}-restart"
 }
 
 install_nginx() {
@@ -247,6 +261,7 @@ main() {
   checkout_repo
   build_app
   install_systemd_service
+  install_restart_sudoers
   install_nginx
   install_ssl
   configure_ufw

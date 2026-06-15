@@ -17,8 +17,18 @@ export class Store {
     return this.data;
   }
 
+  exportData() {
+    return JSON.parse(JSON.stringify(this.data)) as AppData;
+  }
+
   write(mutator: (data: AppData) => void) {
     mutator(this.data);
+    this.persist();
+    return this.data;
+  }
+
+  replace(raw: unknown) {
+    this.data = this.migrate(this.normalizeImport(raw));
     this.persist();
     return this.data;
   }
@@ -39,6 +49,44 @@ export class Store {
 
     const parsed = JSON.parse(fs.readFileSync(dataFile, "utf-8")) as AppData;
     return this.migrate(parsed);
+  }
+
+  private normalizeImport(raw: unknown): AppData {
+    if (!raw || typeof raw !== "object") {
+      throw new Error("Некорректный файл базы данных");
+    }
+
+    const backup = raw as Partial<AppData>;
+    const fallback = seedData();
+
+    if (
+      !Array.isArray(backup.users) ||
+      !Array.isArray(backup.services) ||
+      !Array.isArray(backup.memberships) ||
+      !Array.isArray(backup.currencies)
+    ) {
+      throw new Error("Файл не похож на backup Service Payment");
+    }
+
+    return {
+      ...fallback,
+      ...backup,
+      currencies: backup.currencies,
+      users: backup.users,
+      services: backup.services,
+      memberships: backup.memberships,
+      deposits: Array.isArray(backup.deposits) ? backup.deposits : [],
+      debits: Array.isArray(backup.debits) ? backup.debits : [],
+      notifications: Array.isArray(backup.notifications) ? backup.notifications : [],
+      settings: {
+        ...fallback.settings,
+        ...(backup.settings ?? {}),
+        telegram: {
+          ...fallback.settings.telegram,
+          ...(backup.settings?.telegram ?? {})
+        }
+      }
+    } as AppData;
   }
 
   private migrate(data: AppData): AppData {
