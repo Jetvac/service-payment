@@ -24,6 +24,7 @@ import {
   Unlock,
   Upload,
   Wallet,
+  Wrench,
   X,
   UserPlus,
   Users
@@ -99,6 +100,7 @@ const operationSourceNames: Record<string, string> = {
 const healthLabels: Record<ServiceHealthStatus | "checking", string> = {
   online: "Онлайн",
   offline: "Недоступен",
+  maintenance: "Обслуживание",
   unknown: "Нет данных",
   checking: "Проверка"
 };
@@ -193,6 +195,15 @@ function serviceConnection(service: Service): ServiceConnectionSettings {
 
 function serviceHealth(service: Service, clientHealth?: ClientHealth): ClientHealth {
   const connection = serviceConnection(service);
+  if (connection.lastStatus === "maintenance") {
+    return {
+      status: "maintenance",
+      latencyMs: null,
+      checkedAt: connection.lastCheckedAt ?? null,
+      error: connection.lastError ?? ""
+    };
+  }
+
   return (
     clientHealth ?? {
       status: connection.lastStatus ?? "unknown",
@@ -206,7 +217,7 @@ function serviceHealth(service: Service, clientHealth?: ClientHealth): ClientHea
 function healthTone(status: ServiceHealthStatus | "checking"): "good" | "warn" | "bad" | undefined {
   if (status === "online") return "good";
   if (status === "offline") return "bad";
-  if (status === "checking") return "warn";
+  if (status === "checking" || status === "maintenance") return "warn";
   return undefined;
 }
 
@@ -411,7 +422,7 @@ export default function App() {
 
   const probeService = async (service: Service) => {
     const connection = serviceConnection(service);
-    if (!connection.enabled || !connection.host.trim()) return;
+    if (!connection.enabled || !connection.host.trim() || connection.lastStatus === "maintenance") return;
 
     setClientHealth((current) => ({
       ...current,
@@ -446,7 +457,7 @@ export default function App() {
     if (!state) return;
     const services = state.services.filter((service) => {
       const connection = serviceConnection(service);
-      return connection.enabled && connection.host.trim();
+      return connection.enabled && connection.host.trim() && connection.lastStatus !== "maintenance";
     });
     if (!services.length) return;
 
@@ -631,6 +642,27 @@ export default function App() {
       "PUT"
     );
 
+  const toggleServiceMaintenance = async (service: Service, maintenance: boolean) => {
+    try {
+      setToast(maintenance ? "Перевожу сервис на обслуживание" : "Возвращаю сервис в работу");
+      const nextState = await api(`/api/services/${service.id}/maintenance`, {
+        method: "POST",
+        body: JSON.stringify({ maintenance })
+      });
+      setState(nextState);
+      setClientHealth((current) => {
+        const next = { ...current };
+        delete next[service.id];
+        return next;
+      });
+      setToast(maintenance ? "Сервис на обслуживании" : "Сервис возвращён в работу");
+      return nextState;
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : "Ошибка переключения обслуживания");
+      throw error;
+    }
+  };
+
   const deployEchoServer = async (serviceId: string) => {
     try {
       setDeployingServiceId(serviceId);
@@ -672,6 +704,7 @@ export default function App() {
         setSelectedServiceId={setSelectedServiceId}
         clientHealth={clientHealth}
         probeService={probeService}
+        toggleServiceMaintenance={toggleServiceMaintenance}
         deployingServiceId={deployingServiceId}
         deployEchoServer={deployEchoServer}
         saveService={saveService}
@@ -952,6 +985,7 @@ function ServicesView({
   setSelectedServiceId,
   clientHealth,
   probeService,
+  toggleServiceMaintenance,
   deployingServiceId,
   deployEchoServer,
   saveService
@@ -968,6 +1002,7 @@ function ServicesView({
   setSelectedServiceId: (id: string) => void;
   clientHealth: Record<string, ClientHealth>;
   probeService: (service: Service) => Promise<void>;
+  toggleServiceMaintenance: (service: Service, maintenance: boolean) => Promise<AppState>;
   deployingServiceId: string;
   deployEchoServer: (serviceId: string) => Promise<AppState>;
   saveService: (service: Service) => Promise<AppState>;
@@ -1001,6 +1036,19 @@ function ServicesView({
     if (nextService) {
       setDraft(nextService);
       if (serviceConnection(nextService).lastDeployStatus === "success") {
+        void probeService(nextService);
+      }
+    }
+  };
+
+  const toggleSelectedMaintenance = async () => {
+    if (!draft) return;
+    const maintenance = serviceConnection(draft).lastStatus !== "maintenance";
+    const nextState = await toggleServiceMaintenance(draft, maintenance);
+    const nextService = nextState.services.find((service) => service.id === draft.id);
+    if (nextService) {
+      setDraft(nextService);
+      if (!maintenance) {
         void probeService(nextService);
       }
     }
@@ -1102,11 +1150,20 @@ function ServicesView({
                 <button
                   className="ghost"
                   type="button"
-                  disabled={!serviceConnection(draft).enabled || !serviceConnection(draft).host || selectedHealth?.status === "checking"}
+                  disabled={
+                    !serviceConnection(draft).enabled ||
+                    !serviceConnection(draft).host ||
+                    selectedHealth?.status === "checking" ||
+                    serviceConnection(draft).lastStatus === "maintenance"
+                  }
                   onClick={() => probeService(draft)}
                 >
                   <Activity size={16} />
                   Проверить
+                </button>
+                <button className="ghost" type="button" onClick={toggleSelectedMaintenance}>
+                  <Wrench size={16} />
+                  {serviceConnection(draft).lastStatus === "maintenance" ? "Вернуть в работу" : "На обслуживание"}
                 </button>
                 <button className="ghost" type="button" onClick={() => mutate(`/api/debits/manual`, { serviceId: selectedService.id })}>
                   <CreditCard size={16} />

@@ -157,6 +157,11 @@ nav {
   box-shadow: 0 0 14px rgba(248, 193, 93, 0.34);
 }
 
+.status-dot.maintenance {
+  background: #7aa8ff;
+  box-shadow: 0 0 14px rgba(122, 168, 255, 0.38);
+}
+
 .workspace {
   min-width: 0;
   padding: 24px;
@@ -340,6 +345,11 @@ h2 {
 .service-health.checking {
   color: #f8c15d;
   border-color: rgba(248, 193, 93, 0.26);
+}
+
+.service-health.maintenance {
+  color: #9fbdff;
+  border-color: rgba(122, 168, 255, 0.3);
 }
 
 .service-health.compact {

@@ -113,7 +113,9 @@ export class Store {
       connection.websocketPath = String(connection.websocketPath ?? "/echo").trim() || "/echo";
       if (!connection.websocketPath.startsWith("/")) connection.websocketPath = `/${connection.websocketPath}`;
       connection.useTls = Boolean(connection.useTls);
-      connection.lastStatus = ["online", "offline", "unknown"].includes(connection.lastStatus) ? connection.lastStatus : "unknown";
+      connection.lastStatus = ["online", "offline", "unknown", "maintenance"].includes(connection.lastStatus)
+        ? connection.lastStatus
+        : "unknown";
       connection.lastLatencyMs =
         typeof connection.lastLatencyMs === "number" && Number.isFinite(connection.lastLatencyMs)
           ? Math.max(0, Math.round(connection.lastLatencyMs))

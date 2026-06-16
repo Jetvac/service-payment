@@ -32,6 +32,7 @@ import {
   pollTelegramUpdates,
   sendLowBalanceWarnings,
   sendServiceBalanceSummary,
+  sendServiceMaintenanceNotice,
   sendTelegramMessage
 } from "./telegram";
 
@@ -181,7 +182,7 @@ function normalizeConnectionInput(body: Partial<ServiceConnectionSettings> | und
 }
 
 function normalizeHealthStatus(value: unknown): ServiceHealthStatus {
-  return value === "online" || value === "offline" || value === "unknown" ? value : "unknown";
+  return value === "online" || value === "offline" || value === "unknown" || value === "maintenance" ? value : "unknown";
 }
 
 const echoServerRepoUrl = "https://github.com/LazyDoomSlayer/rust-websocket-server.git";
@@ -554,6 +555,7 @@ app.post("/api/services/:id/health", (req, res) => {
       const service = data.services.find((item) => item.id === req.params.id);
       if (!service) throw new Error("Сервис не найден");
       service.connection = { ...defaultServiceConnection(), ...(service.connection ?? {}) };
+      if (service.connection.lastStatus === "maintenance" && req.body.status !== "maintenance") return;
       service.connection.lastStatus = normalizeHealthStatus(req.body.status);
       service.connection.lastLatencyMs =
         typeof req.body.latencyMs === "number" && Number.isFinite(req.body.latencyMs)
@@ -563,6 +565,38 @@ app.post("/api/services/:id/health", (req, res) => {
       service.connection.lastError = String(req.body.error ?? "").slice(0, 240);
     });
 
+    res.json(ok(apiState()));
+  } catch (error) {
+    res.status(400).json(fail(error));
+  }
+});
+
+app.post("/api/services/:id/maintenance", async (req, res) => {
+  try {
+    const data = store.read();
+    const service = data.services.find((item) => item.id === req.params.id);
+    if (!service) throw new Error("Сервис не найден");
+
+    const maintenance = Boolean(req.body.maintenance);
+    service.connection = { ...defaultServiceConnection(), ...(service.connection ?? {}) };
+    service.connection.lastStatus = maintenance ? "maintenance" : "unknown";
+    service.connection.lastLatencyMs = null;
+    service.connection.lastCheckedAt = nowIso();
+    service.connection.lastError = maintenance ? "Плановое обслуживание" : "";
+
+    try {
+      await sendServiceMaintenanceNotice(data, service, maintenance);
+    } catch (notifyError) {
+      addNotification(data, {
+        serviceId: service.id,
+        userId: null,
+        kind: "system",
+        message: `Telegram maintenance notice failed: ${notifyError instanceof Error ? notifyError.message : String(notifyError)}`,
+        status: "failed"
+      });
+    }
+
+    store.persist();
     res.json(ok(apiState()));
   } catch (error) {
     res.status(400).json(fail(error));

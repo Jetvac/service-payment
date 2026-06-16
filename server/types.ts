@@ -32,7 +32,7 @@ export type BillingSettings = {
   lowBalanceThresholdPeriods: number;
 };
 
-export type ServiceHealthStatus = "unknown" | "online" | "offline";
+export type ServiceHealthStatus = "unknown" | "online" | "offline" | "maintenance";
 export type ServiceDeployStatus = "unknown" | "success" | "failed";
 
 export type ServiceConnectionSettings = {

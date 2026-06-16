@@ -303,6 +303,29 @@ export async function sendServiceBalanceSummary(data: AppData, service: Service)
   });
 }
 
+export async function sendServiceMaintenanceNotice(data: AppData, service: Service, maintenance: boolean) {
+  const text = maintenance
+    ? [
+        `🛠 <b>${escapeHtml(service.name)}</b>`,
+        "Сервис переведён на обслуживание. Возможны перебои в доступности до завершения работ.",
+        `Время начала: <b>${formatTelegramDate(new Date().toISOString())}</b>.`
+      ].join("\n")
+    : [
+        `✅ <b>${escapeHtml(service.name)}</b>`,
+        "Обслуживание завершено, сервис возвращён в работу.",
+        `Время возврата: <b>${formatTelegramDate(new Date().toISOString())}</b>.`
+      ].join("\n");
+  const sent = await sendTelegramMessage(data, text, undefined, { notificationTopic: true });
+
+  addNotification(data, {
+    serviceId: service.id,
+    userId: null,
+    kind: "system",
+    message: text,
+    status: sent ? "sent" : "skipped"
+  });
+}
+
 function commandParts(text: string) {
   const [commandRaw, ...rest] = text.trim().split(/\s+/);
   const command = commandRaw.toLowerCase().split("@")[0];
@@ -367,7 +390,13 @@ function serviceHealthText(service: Service) {
   if (!connection?.enabled || !connection.host) return "мониторинг не настроен";
 
   const statusLabel =
-    connection.lastStatus === "online" ? "онлайн" : connection.lastStatus === "offline" ? "недоступен" : "нет данных";
+    connection.lastStatus === "online"
+      ? "онлайн"
+      : connection.lastStatus === "offline"
+        ? "недоступен"
+        : connection.lastStatus === "maintenance"
+          ? "на обслуживании"
+          : "нет данных";
   const latency = connection.lastLatencyMs !== null ? `, ${connection.lastLatencyMs} мс` : "";
   const checked = `проверка: ${formatTelegramDate(connection.lastCheckedAt)}`;
   const error = connection.lastStatus === "offline" && connection.lastError ? `, ${escapeHtml(connection.lastError)}` : "";
