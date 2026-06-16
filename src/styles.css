@@ -214,38 +214,53 @@ nav {
   gap: 4px;
 }
 
-.auth-users {
-  display: grid;
-  gap: 8px;
+.auth-combobox {
+  gap: 9px;
 }
 
-.auth-user {
+.auth-combobox-control {
   display: grid;
-  grid-template-columns: 40px minmax(0, 1fr) auto;
+  grid-template-columns: 40px minmax(0, 1fr);
   align-items: center;
   gap: 10px;
-  width: 100%;
+  min-height: 54px;
+  border: 1px solid rgba(122, 168, 255, 0.24);
+  border-radius: 8px;
+  background: rgba(122, 168, 255, 0.08);
+  padding: 8px;
+}
+
+.auth-combobox-control select {
+  min-height: 38px;
+  border-color: transparent;
+  background: rgba(7, 8, 10, 0.52);
+  font-weight: 700;
+}
+
+.auth-user-preview {
+  display: grid;
+  grid-template-columns: 54px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
   min-width: 0;
   border: 1px solid rgba(255, 255, 255, 0.08);
   border-radius: 8px;
-  color: #f4f5f7;
   background: rgba(255, 255, 255, 0.035);
   padding: 12px;
-  text-align: left;
 }
 
-.auth-user:hover {
-  border-color: rgba(122, 168, 255, 0.4);
-  background: rgba(122, 168, 255, 0.1);
-}
-
-.auth-user strong,
-.auth-user small {
+.auth-user-preview strong,
+.auth-user-preview small {
   display: block;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.auth-login {
+  width: 100%;
+  min-height: 40px;
 }
 
 .topbar {
@@ -404,6 +419,11 @@ h2 {
 
 .chart-wrap.compact {
   height: 300px;
+}
+
+.chart-wrap.latency-history {
+  height: 320px;
+  padding-bottom: 24px;
 }
 
 .chip {

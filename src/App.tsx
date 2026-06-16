@@ -36,6 +36,9 @@ import {
   Bar,
   BarChart,
   CartesianGrid,
+  Legend,
+  Line,
+  LineChart,
   ResponsiveContainer,
   Tooltip,
   XAxis,
@@ -86,6 +89,7 @@ type ClientHealth = {
 };
 
 const authStorageKey = "vpn-payment-current-user-id";
+const latencyLineColors = ["#7aa8ff", "#47d18c", "#f8c15d", "#ff8b82", "#b994ff", "#5ed4d6", "#f49ac2", "#c6cad2"];
 
 const periodNames: Record<BillingPeriod, string> = {
   month: "Месяц",
@@ -443,6 +447,9 @@ function ModalShell({
 }
 
 function AuthScreen({ state, onLogin }: { state: AppState; onLogin: (userId: string) => void }) {
+  const [selectedUserId, setSelectedUserId] = useState(state.users[0]?.id ?? "");
+  const selectedUser = state.users.find((user) => user.id === selectedUserId) ?? state.users[0];
+
   return (
     <main className="auth-screen">
       <section className="auth-panel">
@@ -459,19 +466,37 @@ function AuthScreen({ state, onLogin }: { state: AppState; onLogin: (userId: str
           <h1>Вход</h1>
           <span className="muted">Выберите участника</span>
         </div>
-        <div className="auth-users">
-          {state.users.map((user) => (
-            <button className="auth-user" key={user.id} type="button" onClick={() => onLogin(user.id)}>
-              <UserAvatar user={user} />
-              <div>
-                <strong>{user.name}</strong>
-                <small>{money(user.balance, "RUB")}</small>
+        {selectedUser ? (
+          <>
+            <label className="auth-combobox">
+              Участник
+              <div className="auth-combobox-control">
+                <UserAvatar user={selectedUser} />
+                <select value={selectedUser.id} onChange={(event) => setSelectedUserId(event.target.value)}>
+                  {state.users.map((user) => (
+                    <option key={user.id} value={user.id}>
+                      {user.name}
+                    </option>
+                  ))}
+                </select>
               </div>
-              {user.botAdmin && <span className="status-pill reversal">админ</span>}
+            </label>
+            <div className="auth-user-preview">
+              <UserAvatar user={selectedUser} size="large" />
+              <div>
+                <strong>{selectedUser.name}</strong>
+                <small>{money(selectedUser.balance, "RUB")}</small>
+              </div>
+              {selectedUser.botAdmin && <span className="status-pill reversal">админ</span>}
+            </div>
+            <button className="primary auth-login" type="button" onClick={() => onLogin(selectedUser.id)}>
+              <Shield size={16} />
+              Войти
             </button>
-          ))}
-          {!state.users.length && <Empty label="Участников пока нет" />}
-        </div>
+          </>
+        ) : (
+          <Empty label="Участников пока нет" />
+        )}
       </section>
     </main>
   );
@@ -707,6 +732,8 @@ export default function App() {
         debt: 0,
         chart: [],
         balances: [],
+        latencyTimeline: [],
+        latencySeries: [],
         latencyRecent: [],
         latencyByUser: []
       };
@@ -737,6 +764,54 @@ export default function App() {
       }))
       .slice(0, 10);
     const latencyRecent = state.latencyChecks.slice(0, 20);
+    const latencySeries: Array<{ key: string; name: string; color: string }> = [];
+    const latencySeriesByPair = new Map<string, { key: string; name: string; color: string }>();
+    const latencyBuckets = new Map<string, { time: string; ts: number; sums: Record<string, { sum: number; count: number }> }>();
+
+    for (const check of state.latencyChecks.filter((item) => item.latencyMs !== null).slice(0, 120).reverse()) {
+      const user = state.users.find((item) => item.id === check.userId);
+      const service = state.services.find((item) => item.id === check.serviceId);
+      const pair = `${check.userId ?? "unknown"}:${check.serviceId}`;
+      let series = latencySeriesByPair.get(pair);
+      if (!series && latencySeries.length < latencyLineColors.length) {
+        series = {
+          key: `latency_${latencySeries.length}`,
+          name: `${user?.name ?? "Не выбран"} · ${service?.name ?? "Сервис"}`,
+          color: latencyLineColors[latencySeries.length]
+        };
+        latencySeriesByPair.set(pair, series);
+        latencySeries.push(series);
+      }
+      if (!series) continue;
+
+      const bucketDate = new Date(check.checkedAt);
+      bucketDate.setSeconds(0, 0);
+      const bucketId = bucketDate.toISOString();
+      const bucket =
+        latencyBuckets.get(bucketId) ??
+        {
+          time: new Intl.DateTimeFormat("ru-RU", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" }).format(bucketDate),
+          ts: bucketDate.getTime(),
+          sums: {}
+        };
+      const current = bucket.sums[series.key] ?? { sum: 0, count: 0 };
+      current.sum += check.latencyMs ?? 0;
+      current.count += 1;
+      bucket.sums[series.key] = current;
+      latencyBuckets.set(bucketId, bucket);
+    }
+
+    const latencyTimeline = Array.from(latencyBuckets.values())
+      .sort((a, b) => a.ts - b.ts)
+      .slice(-40)
+      .map((bucket) => {
+        const point: Record<string, string | number> = { time: bucket.time };
+        for (const series of latencySeries) {
+          const value = bucket.sums[series.key];
+          if (value) point[series.key] = Math.round(value.sum / value.count);
+        }
+        return point;
+      });
     const latencyStats = new Map<string, { name: string; sum: number; count: number }>();
     for (const check of state.latencyChecks) {
       if (check.latencyMs === null || !check.userId) continue;
@@ -754,6 +829,8 @@ export default function App() {
       debt: state.summaries.reduce((sum, summary) => sum + summary.debtCount, 0),
       chart: Array.from(byDate.values()).reverse().slice(-14),
       balances,
+      latencyTimeline,
+      latencySeries,
       latencyRecent,
       latencyByUser: Array.from(latencyStats.values())
         .map((item) => ({ name: item.name, avg: Math.round(item.sum / item.count), count: item.count }))
@@ -1022,6 +1099,8 @@ function Dashboard({
     debt: number;
     chart: Array<{ date: string; deposits: number; debits: number }>;
     balances: Array<{ name: string; balance: number }>;
+    latencyTimeline: Array<Record<string, string | number>>;
+    latencySeries: Array<{ key: string; name: string; color: string }>;
     latencyRecent: AppState["latencyChecks"];
     latencyByUser: Array<{ name: string; avg: number; count: number }>;
   };
@@ -1166,6 +1245,40 @@ function Dashboard({
             </ResponsiveContainer>
           ) : (
             <Empty label="Замеров пока нет" />
+          )}
+        </div>
+      </div>
+
+      <div className="panel chart-panel wide">
+        <div className="panel-head">
+          <h2>История задержки</h2>
+          <span className="chip">{dashboard.latencySeries.length}</span>
+        </div>
+        <div className="chart-wrap latency-history">
+          {dashboard.latencyTimeline.length && dashboard.latencySeries.length ? (
+            <ResponsiveContainer width="100%" height="100%">
+              <LineChart data={dashboard.latencyTimeline}>
+                <CartesianGrid stroke="rgba(255,255,255,.06)" vertical={false} />
+                <XAxis dataKey="time" axisLine={false} tickLine={false} tick={{ fill: "#8a8f98", fontSize: 12 }} />
+                <YAxis axisLine={false} tickLine={false} tick={{ fill: "#8a8f98", fontSize: 12 }} />
+                <Tooltip contentStyle={{ background: "#111318", border: "1px solid #272a33", borderRadius: 8 }} />
+                <Legend wrapperStyle={{ color: "#c6cad2", fontSize: 12 }} />
+                {dashboard.latencySeries.map((series) => (
+                  <Line
+                    key={series.key}
+                    type="monotone"
+                    dataKey={series.key}
+                    name={series.name}
+                    stroke={series.color}
+                    strokeWidth={2}
+                    dot={false}
+                    connectNulls
+                  />
+                ))}
+              </LineChart>
+            </ResponsiveContainer>
+          ) : (
+            <Empty label="История замеров пока пуста" />
           )}
         </div>
       </div>

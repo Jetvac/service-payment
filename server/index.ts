@@ -190,48 +190,6 @@ function normalizeHealthStatus(value: unknown): ServiceHealthStatus {
   return value === "online" || value === "offline" || value === "unknown" || value === "maintenance" ? value : "unknown";
 }
 
-function escapeTelegramHtml(value: string) {
-  return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;");
-}
-
-function latencyText(check: LatencyCheck) {
-  if (check.status === "online" && check.latencyMs !== null) return `${check.latencyMs} мс`;
-  if (check.status === "maintenance") return "на обслуживании";
-  if (check.status === "offline") return "недоступен";
-  return "нет данных";
-}
-
-async function sendLatencyAnalytics(data: AppData, service: Service, user: User | undefined, check: LatencyCheck) {
-  if (!user?.telegramId) {
-    addNotification(data, {
-      serviceId: service.id,
-      userId: user?.id ?? null,
-      kind: "latency_report",
-      message: `Latency ${service.name}: ${latencyText(check)}`,
-      status: "skipped"
-    });
-    return;
-  }
-
-  const text = [
-    `📡 <b>${escapeTelegramHtml(service.name)}</b>`,
-    `Ваш замер доступа: <b>${latencyText(check)}</b>`,
-    check.error ? `Ошибка: ${escapeTelegramHtml(check.error)}` : "",
-    `Время: ${new Intl.DateTimeFormat("ru-RU", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" }).format(new Date(check.checkedAt))}`
-  ]
-    .filter(Boolean)
-    .join("\n");
-
-  const sent = await sendTelegramMessage(data, text, user.telegramId);
-  addNotification(data, {
-    serviceId: service.id,
-    userId: user.id,
-    kind: "latency_report",
-    message: `Latency ${service.name}: ${latencyText(check)}`,
-    status: sent ? "sent" : "failed"
-  });
-}
-
 async function telegramJson(token: string, method: string, body: Record<string, unknown>) {
   const response = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
     method: "POST",
@@ -693,18 +651,6 @@ app.post("/api/services/:id/health", async (req, res) => {
       service.connection.lastLatencyMs = latencyMs;
       service.connection.lastCheckedAt = checkedAt;
       service.connection.lastError = error;
-    }
-
-    try {
-      await sendLatencyAnalytics(data, service, user, check);
-    } catch (notifyError) {
-      addNotification(data, {
-        serviceId: service.id,
-        userId: user?.id ?? null,
-        kind: "latency_report",
-        message: notifyError instanceof Error ? notifyError.message : "Telegram latency report failed",
-        status: "failed"
-      });
     }
 
     store.persist();
