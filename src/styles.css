@@ -759,6 +759,16 @@ label {
   overflow-x: auto;
 }
 
+.pagination-controls {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  padding: 12px 16px 14px;
+  color: #8a8f98;
+  font-size: 13px;
+}
+
 table {
   width: 100%;
   min-width: 760px;
@@ -1338,5 +1348,9 @@ td small {
   .panel-head {
     align-items: flex-start;
     flex-direction: column;
+  }
+
+  .pagination-controls {
+    justify-content: space-between;
   }
 }

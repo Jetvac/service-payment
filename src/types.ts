@@ -183,6 +183,13 @@ export type SecuritySettings = {
   adminPasswordSet?: boolean;
 };
 
+export type AppCounts = {
+  deposits: number;
+  debits: number;
+  latencyChecks: number;
+  notifications: number;
+};
+
 export type AppState = {
   currencies: Currency[];
   users: User[];
@@ -195,5 +202,6 @@ export type AppState = {
   notifications: Notification[];
   settings: { telegram: TelegramSettings; security: SecuritySettings };
   summaries: ServiceSummary[];
+  counts: AppCounts;
   serverTime: string;
 };

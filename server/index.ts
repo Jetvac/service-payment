@@ -40,6 +40,7 @@ const app = express();
 const port = Number(process.env.PORT ?? 4077);
 const store = new Store();
 const execFileAsync = promisify(execFile);
+const latencyLineColors = ["#7aa8ff", "#47d18c", "#f8c15d", "#ff8b82", "#b994ff", "#5ed4d6", "#f49ac2", "#c6cad2"];
 
 app.use(express.json({ limit: "25mb" }));
 
@@ -52,10 +53,128 @@ function fail(error: unknown) {
   return { ok: false, error: message };
 }
 
-function publicData(data: AppData) {
-  const clone = JSON.parse(JSON.stringify(data)) as AppData;
+function readPage(query: Record<string, unknown>, defaultLimit = 20, maxLimit = 100) {
+  const limit = Math.min(maxLimit, Math.max(1, normalizeNumber(query.limit, defaultLimit)));
+  const offset = Math.max(0, normalizeNumber(query.offset, 0));
+  return { limit, offset };
+}
 
-  clone.services = clone.services.map((service) => {
+function pageResult<T>(items: T[], offset: number, limit: number) {
+  return {
+    rows: items.slice(offset, offset + limit),
+    total: items.length,
+    offset,
+    limit,
+    hasMore: offset + limit < items.length
+  };
+}
+
+function isEffectiveOperation(operation: { cancelledAt?: string | null; reversesId?: string | null }) {
+  return !operation.cancelledAt && !operation.reversesId;
+}
+
+function plainDate(value: string) {
+  return new Intl.DateTimeFormat("ru-RU", {
+    day: "2-digit",
+    month: "2-digit"
+  }).format(new Date(value));
+}
+
+function dashboardData(data: AppData, query: Record<string, unknown>) {
+  const notificationPage = readPage(
+    { offset: query.notificationOffset, limit: query.notificationLimit },
+    8,
+    50
+  );
+  const latencyPage = readPage({ offset: query.latencyOffset, limit: query.latencyLimit }, 20, 100);
+  const rate = (code: string) => data.currencies.find((currency) => currency.code === code)?.rateToRub ?? 1;
+
+  const byDate = new Map<string, { date: string; deposits: number; debits: number }>();
+  const ensure = (iso: string) => {
+    const key = plainDate(iso);
+    if (!byDate.has(key)) byDate.set(key, { date: key, deposits: 0, debits: 0 });
+    return byDate.get(key)!;
+  };
+
+  for (const deposit of data.deposits.filter(isEffectiveOperation).slice(0, 400)) {
+    ensure(deposit.createdAt).deposits += deposit.amountBalanceCurrency ?? deposit.amountServiceCurrency * rate(deposit.serviceCurrency);
+  }
+  for (const debit of data.debits.filter(isEffectiveOperation).slice(0, 400)) {
+    ensure(debit.createdAt).debits += debit.amountBalanceCurrency ?? debit.amount * rate(debit.currency);
+  }
+
+  const latencySeries: Array<{ key: string; name: string; color: string }> = [];
+  const latencySeriesByPair = new Map<string, { key: string; name: string; color: string }>();
+  const latencyBuckets = new Map<string, { time: string; ts: number; sums: Record<string, { sum: number; count: number }> }>();
+
+  for (const check of data.latencyChecks.filter((item) => item.latencyMs !== null).slice(0, 240).reverse()) {
+    const user = data.users.find((item) => item.id === check.userId);
+    const service = data.services.find((item) => item.id === check.serviceId);
+    const pair = `${check.userId ?? "unknown"}:${check.serviceId}`;
+    let series = latencySeriesByPair.get(pair);
+    if (!series && latencySeries.length < latencyLineColors.length) {
+      series = {
+        key: `latency_${latencySeries.length}`,
+        name: `${user?.name ?? "Не выбран"} · ${service?.name ?? "Сервис"}`,
+        color: latencyLineColors[latencySeries.length]
+      };
+      latencySeriesByPair.set(pair, series);
+      latencySeries.push(series);
+    }
+    if (!series) continue;
+
+    const bucketDate = new Date(check.checkedAt);
+    bucketDate.setSeconds(0, 0);
+    const bucketId = bucketDate.toISOString();
+    const bucket =
+      latencyBuckets.get(bucketId) ??
+      {
+        time: new Intl.DateTimeFormat("ru-RU", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" }).format(bucketDate),
+        ts: bucketDate.getTime(),
+        sums: {}
+      };
+    const current = bucket.sums[series.key] ?? { sum: 0, count: 0 };
+    current.sum += check.latencyMs ?? 0;
+    current.count += 1;
+    bucket.sums[series.key] = current;
+    latencyBuckets.set(bucketId, bucket);
+  }
+
+  const latencyStats = new Map<string, { name: string; sum: number; count: number }>();
+  for (const check of data.latencyChecks) {
+    if (check.latencyMs === null || !check.userId) continue;
+    const user = data.users.find((item) => item.id === check.userId);
+    const current = latencyStats.get(check.userId) ?? { name: user?.name ?? "Участник", sum: 0, count: 0 };
+    current.sum += check.latencyMs;
+    current.count += 1;
+    latencyStats.set(check.userId, current);
+  }
+
+  return {
+    chart: Array.from(byDate.values()).reverse().slice(-14),
+    latencyTimeline: Array.from(latencyBuckets.values())
+      .sort((a, b) => a.ts - b.ts)
+      .slice(-40)
+      .map((bucket) => {
+        const point: Record<string, string | number> = { time: bucket.time };
+        for (const series of latencySeries) {
+          const value = bucket.sums[series.key];
+          if (value) point[series.key] = Math.round(value.sum / value.count);
+        }
+        return point;
+      }),
+    latencySeries,
+    latencyByUser: Array.from(latencyStats.values())
+      .map((item) => ({ name: item.name, avg: Math.round(item.sum / item.count), count: item.count }))
+      .sort((a, b) => b.count - a.count)
+      .slice(0, 10),
+    latencyRecent: pageResult(data.latencyChecks, latencyPage.offset, latencyPage.limit),
+    notifications: pageResult(data.notifications, notificationPage.offset, notificationPage.limit)
+  };
+}
+
+function publicData(data: AppData) {
+  const services = data.services.map((service) => {
     const source = data.services.find((item) => item.id === service.id);
     const connection = { ...defaultServiceConnection(), ...(service.connection ?? {}) };
     connection.password = "";
@@ -63,12 +182,24 @@ function publicData(data: AppData) {
     return { ...service, connection };
   });
 
-  clone.settings.security = {
-    adminPassword: "",
-    adminPasswordSet: Boolean(data.settings.security?.adminPassword)
+  return {
+    currencies: data.currencies,
+    users: data.users,
+    services,
+    memberships: data.memberships,
+    autoDeposits: data.autoDeposits,
+    deposits: [],
+    debits: [],
+    latencyChecks: [],
+    notifications: [],
+    settings: {
+      telegram: data.settings.telegram,
+      security: {
+        adminPassword: "",
+        adminPasswordSet: Boolean(data.settings.security?.adminPassword)
+      }
+    }
   };
-
-  return clone;
 }
 
 function apiState() {
@@ -76,6 +207,12 @@ function apiState() {
   return {
     ...publicData(data),
     summaries: computeSummaries(data),
+    counts: {
+      deposits: data.deposits.length,
+      debits: data.debits.length,
+      latencyChecks: data.latencyChecks.length,
+      notifications: data.notifications.length
+    },
     serverTime: nowIso()
   };
 }
@@ -428,6 +565,32 @@ function normalizeAutoDepositInput(data: AppData, body: Partial<AutoDeposit>, fa
 
 app.get("/api/state", (_req, res) => {
   res.json(ok(apiState()));
+});
+
+app.get("/api/dashboard", (req, res) => {
+  try {
+    res.json(ok(dashboardData(store.read(), req.query as Record<string, unknown>)));
+  } catch (error) {
+    res.status(400).json(fail(error));
+  }
+});
+
+app.get("/api/notifications", (req, res) => {
+  try {
+    const { offset, limit } = readPage(req.query as Record<string, unknown>, 20, 100);
+    res.json(ok(pageResult(store.read().notifications, offset, limit)));
+  } catch (error) {
+    res.status(400).json(fail(error));
+  }
+});
+
+app.get("/api/latency-checks", (req, res) => {
+  try {
+    const { offset, limit } = readPage(req.query as Record<string, unknown>, 20, 100);
+    res.json(ok(pageResult(store.read().latencyChecks, offset, limit)));
+  } catch (error) {
+    res.status(400).json(fail(error));
+  }
 });
 
 app.get("/api/database/export", (_req, res) => {
@@ -854,6 +1017,17 @@ app.post("/api/auto-deposits/:id/run", (req, res) => {
   }
 });
 
+app.get("/api/deposits", (req, res) => {
+  try {
+    const { offset, limit } = readPage(req.query as Record<string, unknown>, 20, 100);
+    const userId = String(req.query.userId ?? "");
+    const rows = userId ? store.read().deposits.filter((deposit) => deposit.userId === userId) : store.read().deposits;
+    res.json(ok(pageResult(rows, offset, limit)));
+  } catch (error) {
+    res.status(400).json(fail(error));
+  }
+});
+
 app.post("/api/deposits", (req, res) => {
   try {
     store.write((data) => {
@@ -880,6 +1054,17 @@ app.post("/api/deposits/:id/cancel", (req, res) => {
     });
 
     res.json(ok(apiState()));
+  } catch (error) {
+    res.status(400).json(fail(error));
+  }
+});
+
+app.get("/api/debits", (req, res) => {
+  try {
+    const { offset, limit } = readPage(req.query as Record<string, unknown>, 20, 100);
+    const userId = String(req.query.userId ?? "");
+    const rows = userId ? store.read().debits.filter((debit) => debit.userId === userId) : store.read().debits;
+    res.json(ok(pageResult(rows, offset, limit)));
   } catch (error) {
     res.status(400).json(fail(error));
   }

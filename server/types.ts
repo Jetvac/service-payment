@@ -180,6 +180,13 @@ export type AppSettings = {
   security: SecuritySettings;
 };
 
+export type AppCounts = {
+  deposits: number;
+  debits: number;
+  latencyChecks: number;
+  notifications: number;
+};
+
 export type AppData = {
   currencies: Currency[];
   users: User[];

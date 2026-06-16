@@ -44,7 +44,20 @@ import {
   XAxis,
   YAxis
 } from "recharts";
-import type { AppState, BillingPeriod, Currency, Service, ServiceConnectionSettings, ServiceHealthStatus, TelegramSettings, User } from "./types";
+import type {
+  AppState,
+  BillingPeriod,
+  Currency,
+  Debit,
+  Deposit,
+  LatencyCheck,
+  Notification as AppNotification,
+  Service,
+  ServiceConnectionSettings,
+  ServiceHealthStatus,
+  TelegramSettings,
+  User
+} from "./types";
 import type { AutoDeposit } from "./types";
 
 type View = "dashboard" | "services" | "people" | "ledger" | "bot";
@@ -88,8 +101,30 @@ type ClientHealth = {
   error: string;
 };
 
+type PageResult<T> = {
+  rows: T[];
+  total: number;
+  offset: number;
+  limit: number;
+  hasMore: boolean;
+};
+
+type DashboardData = {
+  chart: Array<{ date: string; deposits: number; debits: number }>;
+  latencyTimeline: Array<Record<string, string | number>>;
+  latencySeries: Array<{ key: string; name: string; color: string }>;
+  latencyRecent: PageResult<LatencyCheck>;
+  latencyByUser: Array<{ name: string; avg: number; count: number }>;
+  notifications: PageResult<AppNotification>;
+};
+
+type OperationPages = {
+  deposits: PageResult<Deposit>;
+  debits: PageResult<Debit>;
+};
+
 const authStorageKey = "vpn-payment-current-user-id";
-const latencyLineColors = ["#7aa8ff", "#47d18c", "#f8c15d", "#ff8b82", "#b994ff", "#5ed4d6", "#f49ac2", "#c6cad2"];
+const ledgerPageLimit = 20;
 
 const periodNames: Record<BillingPeriod, string> = {
   month: "Месяц",
@@ -176,6 +211,28 @@ const blankAutoDeposit = {
   comment: ""
 };
 
+const emptyPage = <T,>(limit = ledgerPageLimit): PageResult<T> => ({
+  rows: [],
+  total: 0,
+  offset: 0,
+  limit,
+  hasMore: false
+});
+
+const emptyDashboardData: DashboardData = {
+  chart: [],
+  latencyTimeline: [],
+  latencySeries: [],
+  latencyRecent: emptyPage<LatencyCheck>(20),
+  latencyByUser: [],
+  notifications: emptyPage<AppNotification>(8)
+};
+
+const emptyOperationPages: OperationPages = {
+  deposits: emptyPage<Deposit>(),
+  debits: emptyPage<Debit>()
+};
+
 function money(value: number, currency: string) {
   return `${Number(value || 0).toLocaleString("ru-RU", { minimumFractionDigits: 2, maximumFractionDigits: 2 })} ${currency}`;
 }
@@ -196,13 +253,6 @@ function dateTime(value: string | null | undefined) {
     year: "2-digit",
     hour: "2-digit",
     minute: "2-digit"
-  }).format(new Date(value));
-}
-
-function plainDate(value: string) {
-  return new Intl.DateTimeFormat("ru-RU", {
-    day: "2-digit",
-    month: "2-digit"
   }).format(new Date(value));
 }
 
@@ -306,10 +356,6 @@ function checkServiceFromClient(service: Service) {
   });
 }
 
-function isEffectiveOperation(operation: { cancelledAt?: string | null; reversesId?: string | null }) {
-  return !operation.cancelledAt && !operation.reversesId;
-}
-
 function activeServicesForUser(state: AppState, userId: string) {
   return state.memberships
     .filter((membership) => membership.userId === userId && membership.active)
@@ -391,6 +437,29 @@ function ServiceHealthBadge({ health, compact = false }: { health: ClientHealth;
       <span className={classNames("status-dot", health.status)} />
       <span>{healthValue(health)}</span>
     </span>
+  );
+}
+
+function PaginationControls<T>({ page, onChange }: { page: PageResult<T>; onChange: (offset: number) => void }) {
+  const pageNumber = Math.floor(page.offset / page.limit) + 1;
+  const pageCount = Math.max(1, Math.ceil(page.total / page.limit));
+  const previousOffset = Math.max(0, page.offset - page.limit);
+  const nextOffset = page.offset + page.limit;
+
+  if (page.total <= page.limit && page.offset === 0) return null;
+
+  return (
+    <div className="pagination-controls">
+      <button className="ghost compact" type="button" disabled={page.offset === 0} onClick={() => onChange(previousOffset)}>
+        Назад
+      </button>
+      <span>
+        {pageNumber} / {pageCount}
+      </span>
+      <button className="ghost compact" type="button" disabled={!page.hasMore} onClick={() => onChange(nextOffset)}>
+        Вперёд
+      </button>
+    </div>
   );
 }
 
@@ -520,6 +589,11 @@ export default function App() {
     currency: "RUB",
     comment: ""
   });
+  const [dashboardData, setDashboardData] = useState<DashboardData>(emptyDashboardData);
+  const [dashboardNotificationOffset, setDashboardNotificationOffset] = useState(0);
+  const [dashboardLatencyOffset, setDashboardLatencyOffset] = useState(0);
+  const [operationPages, setOperationPages] = useState<OperationPages>(emptyOperationPages);
+  const [operationOffsets, setOperationOffsets] = useState({ deposits: 0, debits: 0 });
 
   const currentUser = useMemo(() => state?.users.find((user) => user.id === currentUserId), [currentUserId, state?.users]);
   const isAdmin = Boolean(currentUser?.botAdmin);
@@ -537,9 +611,66 @@ export default function App() {
     }));
   };
 
+  const loadDashboardData = async (notificationOffset = dashboardNotificationOffset, latencyOffset = dashboardLatencyOffset) => {
+    const query = new URLSearchParams({
+      notificationOffset: String(notificationOffset),
+      notificationLimit: "8",
+      latencyOffset: String(latencyOffset),
+      latencyLimit: "20"
+    });
+    const nextDashboard = await api<DashboardData>(`/api/dashboard?${query.toString()}`);
+    setDashboardData(nextDashboard);
+    setDashboardNotificationOffset(notificationOffset);
+    setDashboardLatencyOffset(latencyOffset);
+    return nextDashboard;
+  };
+
+  const loadOperationData = async (depositOffset = operationOffsets.deposits, debitOffset = operationOffsets.debits) => {
+    if (!currentUser) return emptyOperationPages;
+    const depositQuery = new URLSearchParams({
+      offset: String(depositOffset),
+      limit: String(ledgerPageLimit)
+    });
+    const debitQuery = new URLSearchParams({
+      offset: String(debitOffset),
+      limit: String(ledgerPageLimit)
+    });
+    if (!isAdmin) {
+      depositQuery.set("userId", currentUser.id);
+      debitQuery.set("userId", currentUser.id);
+    }
+    const [deposits, debits] = await Promise.all([
+      api<PageResult<Deposit>>(`/api/deposits?${depositQuery.toString()}`),
+      api<PageResult<Debit>>(`/api/debits?${debitQuery.toString()}`)
+    ]);
+    const nextPages = { deposits, debits };
+    setOperationPages(nextPages);
+    setOperationOffsets({ deposits: depositOffset, debits: debitOffset });
+    return nextPages;
+  };
+
+  const refreshOpenViewData = async (reset = false) => {
+    if (view === "dashboard") {
+      await loadDashboardData(reset ? 0 : dashboardNotificationOffset, reset ? 0 : dashboardLatencyOffset);
+    }
+    if (view === "ledger") {
+      await loadOperationData(reset ? 0 : operationOffsets.deposits, reset ? 0 : operationOffsets.debits);
+    }
+  };
+
   useEffect(() => {
     load().catch((error) => setToast(error.message));
   }, []);
+
+  useEffect(() => {
+    if (!state || !currentUser || view !== "dashboard") return;
+    loadDashboardData(0, 0).catch((error) => setToast(error.message));
+  }, [view, currentUser?.id]);
+
+  useEffect(() => {
+    if (!state || !currentUser || view !== "ledger") return;
+    loadOperationData(0, 0).catch((error) => setToast(error.message));
+  }, [view, currentUser?.id, isAdmin]);
 
   useEffect(() => {
     if (!state) return;
@@ -732,10 +863,11 @@ export default function App() {
         debt: 0,
         chart: [],
         balances: [],
-        latencyTimeline: [],
-        latencySeries: [],
-        latencyRecent: [],
-        latencyByUser: []
+        latencyTimeline: emptyDashboardData.latencyTimeline,
+        latencySeries: emptyDashboardData.latencySeries,
+        latencyRecent: emptyDashboardData.latencyRecent,
+        latencyByUser: emptyDashboardData.latencyByUser,
+        notifications: emptyDashboardData.notifications
       };
     }
 
@@ -743,101 +875,27 @@ export default function App() {
     const totalMonthly = state.services.reduce((sum, service) => sum + service.monthlyCost * rate(service.currency), 0);
     const totalBalanceRub = state.users.reduce((sum, user) => sum + user.balance, 0);
 
-    const byDate = new Map<string, { date: string; deposits: number; debits: number }>();
-    const ensure = (iso: string) => {
-      const key = plainDate(iso);
-      if (!byDate.has(key)) byDate.set(key, { date: key, deposits: 0, debits: 0 });
-      return byDate.get(key)!;
-    };
-
-    for (const deposit of state.deposits.filter(isEffectiveOperation).slice(0, 80)) {
-      ensure(deposit.createdAt).deposits += deposit.amountBalanceCurrency ?? deposit.amountServiceCurrency * rate(deposit.serviceCurrency);
-    }
-    for (const debit of state.debits.filter(isEffectiveOperation).slice(0, 80)) {
-      ensure(debit.createdAt).debits += debit.amountBalanceCurrency ?? debit.amount * rate(debit.currency);
-    }
-
     const balances = state.users
       .map((user) => ({
         name: user.name,
         balance: user.balance
       }))
       .slice(0, 10);
-    const latencyRecent = state.latencyChecks.slice(0, 20);
-    const latencySeries: Array<{ key: string; name: string; color: string }> = [];
-    const latencySeriesByPair = new Map<string, { key: string; name: string; color: string }>();
-    const latencyBuckets = new Map<string, { time: string; ts: number; sums: Record<string, { sum: number; count: number }> }>();
-
-    for (const check of state.latencyChecks.filter((item) => item.latencyMs !== null).slice(0, 120).reverse()) {
-      const user = state.users.find((item) => item.id === check.userId);
-      const service = state.services.find((item) => item.id === check.serviceId);
-      const pair = `${check.userId ?? "unknown"}:${check.serviceId}`;
-      let series = latencySeriesByPair.get(pair);
-      if (!series && latencySeries.length < latencyLineColors.length) {
-        series = {
-          key: `latency_${latencySeries.length}`,
-          name: `${user?.name ?? "Не выбран"} · ${service?.name ?? "Сервис"}`,
-          color: latencyLineColors[latencySeries.length]
-        };
-        latencySeriesByPair.set(pair, series);
-        latencySeries.push(series);
-      }
-      if (!series) continue;
-
-      const bucketDate = new Date(check.checkedAt);
-      bucketDate.setSeconds(0, 0);
-      const bucketId = bucketDate.toISOString();
-      const bucket =
-        latencyBuckets.get(bucketId) ??
-        {
-          time: new Intl.DateTimeFormat("ru-RU", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" }).format(bucketDate),
-          ts: bucketDate.getTime(),
-          sums: {}
-        };
-      const current = bucket.sums[series.key] ?? { sum: 0, count: 0 };
-      current.sum += check.latencyMs ?? 0;
-      current.count += 1;
-      bucket.sums[series.key] = current;
-      latencyBuckets.set(bucketId, bucket);
-    }
-
-    const latencyTimeline = Array.from(latencyBuckets.values())
-      .sort((a, b) => a.ts - b.ts)
-      .slice(-40)
-      .map((bucket) => {
-        const point: Record<string, string | number> = { time: bucket.time };
-        for (const series of latencySeries) {
-          const value = bucket.sums[series.key];
-          if (value) point[series.key] = Math.round(value.sum / value.count);
-        }
-        return point;
-      });
-    const latencyStats = new Map<string, { name: string; sum: number; count: number }>();
-    for (const check of state.latencyChecks) {
-      if (check.latencyMs === null || !check.userId) continue;
-      const user = state.users.find((item) => item.id === check.userId);
-      const current = latencyStats.get(check.userId) ?? { name: user?.name ?? "Участник", sum: 0, count: 0 };
-      current.sum += check.latencyMs;
-      current.count += 1;
-      latencyStats.set(check.userId, current);
-    }
 
     return {
       totalMonthly,
       totalBalanceRub,
       lowBalance: state.summaries.reduce((sum, summary) => sum + summary.lowBalanceCount, 0),
       debt: state.summaries.reduce((sum, summary) => sum + summary.debtCount, 0),
-      chart: Array.from(byDate.values()).reverse().slice(-14),
+      chart: dashboardData.chart,
       balances,
-      latencyTimeline,
-      latencySeries,
-      latencyRecent,
-      latencyByUser: Array.from(latencyStats.values())
-        .map((item) => ({ name: item.name, avg: Math.round(item.sum / item.count), count: item.count }))
-        .sort((a, b) => b.count - a.count)
-        .slice(0, 10)
+      latencyTimeline: dashboardData.latencyTimeline,
+      latencySeries: dashboardData.latencySeries,
+      latencyRecent: dashboardData.latencyRecent,
+      latencyByUser: dashboardData.latencyByUser,
+      notifications: dashboardData.notifications
     };
-  }, [state]);
+  }, [dashboardData, state]);
 
   if (!state) {
     return (
@@ -922,6 +980,8 @@ export default function App() {
         clientHealth={clientHealth}
         serviceById={serviceById}
         userById={userById}
+        onLatencyPageChange={(offset) => loadDashboardData(dashboardNotificationOffset, offset).catch((error) => setToast(error.message))}
+        onNotificationPageChange={(offset) => loadDashboardData(offset, dashboardLatencyOffset).catch((error) => setToast(error.message))}
       />
     ),
     services: (
@@ -965,6 +1025,13 @@ export default function App() {
         userById={userById}
         currentUser={currentUser}
         isAdmin={isAdmin}
+        operationPages={operationPages}
+        reloadOperations={() => loadOperationData()}
+        onOperationPageChange={(kind, offset) => {
+          const nextDepositOffset = kind === "deposits" ? offset : operationOffsets.deposits;
+          const nextDebitOffset = kind === "debits" ? offset : operationOffsets.debits;
+          loadOperationData(nextDepositOffset, nextDebitOffset).catch((error) => setToast(error.message));
+        }}
       />
     ),
     bot: (
@@ -1053,7 +1120,16 @@ export default function App() {
                 </option>
               ))}
             </select>
-            <button className="icon-button" onClick={load} type="button" title="Обновить">
+            <button
+              className="icon-button"
+              onClick={() => {
+                load()
+                  .then(() => refreshOpenViewData())
+                  .catch((error) => setToast(error.message));
+              }}
+              type="button"
+              title="Обновить"
+            >
               <RefreshCcw size={16} />
             </button>
           </div>
@@ -1089,7 +1165,9 @@ function Dashboard({
   dashboard,
   clientHealth,
   serviceById,
-  userById
+  userById,
+  onLatencyPageChange,
+  onNotificationPageChange
 }: {
   state: AppState;
   dashboard: {
@@ -1101,12 +1179,15 @@ function Dashboard({
     balances: Array<{ name: string; balance: number }>;
     latencyTimeline: Array<Record<string, string | number>>;
     latencySeries: Array<{ key: string; name: string; color: string }>;
-    latencyRecent: AppState["latencyChecks"];
+    latencyRecent: PageResult<LatencyCheck>;
     latencyByUser: Array<{ name: string; avg: number; count: number }>;
+    notifications: PageResult<AppNotification>;
   };
   clientHealth: Record<string, ClientHealth>;
   serviceById: (id: string) => Service | undefined;
   userById: (id: string) => User | undefined;
+  onLatencyPageChange: (offset: number) => void;
+  onNotificationPageChange: (offset: number) => void;
 }) {
   return (
     <section className="page-grid">
@@ -1286,7 +1367,7 @@ function Dashboard({
       <div className="panel wide">
         <div className="panel-head">
           <h2>Последние замеры</h2>
-          <span className="chip">{dashboard.latencyRecent.length}</span>
+          <span className="chip">{dashboard.latencyRecent.total}</span>
         </div>
         <div className="table-wrap">
           <table>
@@ -1300,7 +1381,7 @@ function Dashboard({
               </tr>
             </thead>
             <tbody>
-              {dashboard.latencyRecent.map((check) => (
+              {dashboard.latencyRecent.rows.map((check) => (
                 <tr key={check.id}>
                   <td>{dateTime(check.checkedAt)}</td>
                   <td>{userById(check.userId ?? "")?.name ?? "Не выбран"}</td>
@@ -1311,17 +1392,18 @@ function Dashboard({
               ))}
             </tbody>
           </table>
-          {!dashboard.latencyRecent.length && <Empty label="Замеров пока нет" />}
+          {!dashboard.latencyRecent.rows.length && <Empty label="Замеров пока нет" />}
         </div>
+        <PaginationControls page={dashboard.latencyRecent} onChange={onLatencyPageChange} />
       </div>
 
       <div className="panel">
         <div className="panel-head">
           <h2>Уведомления</h2>
-          <span className="chip">{state.notifications.length}</span>
+          <span className="chip">{dashboard.notifications.total}</span>
         </div>
         <div className="feed">
-          {state.notifications.slice(0, 8).map((notification) => (
+          {dashboard.notifications.rows.map((notification) => (
             <article key={notification.id} className="feed-item">
               <span className={classNames("feed-status", notification.status)} />
               <div>
@@ -1333,8 +1415,9 @@ function Dashboard({
               </div>
             </article>
           ))}
-          {!state.notifications.length && <Empty label="Нет уведомлений" />}
+          {!dashboard.notifications.rows.length && <Empty label="Нет уведомлений" />}
         </div>
+        <PaginationControls page={dashboard.notifications} onChange={onNotificationPageChange} />
       </div>
     </section>
   );
@@ -2124,7 +2207,8 @@ function DepositModal({
   userById,
   onClose,
   targetMode = "none",
-  serviceOptions
+  serviceOptions,
+  onSaved
 }: {
   state: AppState;
   depositForm: DepositForm;
@@ -2135,6 +2219,7 @@ function DepositModal({
   onClose: () => void;
   targetMode?: "none" | "service" | "all";
   serviceOptions?: Service[];
+  onSaved?: () => Promise<unknown>;
 }) {
   const availableServices = serviceOptions ?? state.services;
   const service = serviceById(depositForm.serviceId);
@@ -2153,7 +2238,16 @@ function DepositModal({
           <button className="ghost" type="button" onClick={onClose}>
             Отмена
           </button>
-          <button className="primary" type="button" disabled={!depositUserId || depositForm.amount <= 0} onClick={() => mutate("/api/deposits", { ...depositForm, userId: depositUserId }).then(onClose)}>
+          <button
+            className="primary"
+            type="button"
+            disabled={!depositUserId || depositForm.amount <= 0}
+            onClick={() =>
+              mutate("/api/deposits", { ...depositForm, userId: depositUserId })
+                .then(() => onSaved?.())
+                .then(onClose)
+            }
+          >
             <Plus size={16} />
             Зачислить
           </button>
@@ -2821,7 +2915,10 @@ function LedgerView({
   serviceById,
   userById,
   currentUser,
-  isAdmin
+  isAdmin,
+  operationPages,
+  reloadOperations,
+  onOperationPageChange
 }: {
   state: AppState;
   depositForm: DepositForm;
@@ -2831,6 +2928,9 @@ function LedgerView({
   userById: (id: string) => User | undefined;
   currentUser: User;
   isAdmin: boolean;
+  operationPages: OperationPages;
+  reloadOperations: () => Promise<OperationPages>;
+  onOperationPageChange: (kind: keyof OperationPages, offset: number) => void;
 }) {
   const availableServices = useMemo(
     () => (isAdmin ? state.services : activeServicesForUser(state, currentUser.id)),
@@ -2841,8 +2941,6 @@ function LedgerView({
   const selectedUserIsMember = members.some((membership) => membership.userId === depositForm.userId);
   const depositUserId = isAdmin ? (selectedUserIsMember ? depositForm.userId : members[0]?.userId ?? "") : currentUser.id;
   const [depositOpen, setDepositOpen] = useState(false);
-  const visibleDeposits = isAdmin ? state.deposits : state.deposits.filter((deposit) => deposit.userId === currentUser.id);
-  const visibleDebits = isAdmin ? state.debits : state.debits.filter((debit) => debit.userId === currentUser.id);
 
   useEffect(() => {
     const serviceAllowed = availableServices.some((service) => service.id === depositForm.serviceId);
@@ -2941,6 +3039,7 @@ function LedgerView({
             userById={userById}
             targetMode={isAdmin ? "all" : "service"}
             serviceOptions={availableServices}
+            onSaved={reloadOperations}
             onClose={() => setDepositOpen(false)}
           />
         )}
@@ -2948,7 +3047,8 @@ function LedgerView({
 
       <HistoryTable
         title="Зачисления"
-        rows={visibleDeposits}
+        page={operationPages.deposits}
+        onPageChange={(offset) => onOperationPageChange("deposits", offset)}
         columns={["Дата", "Сервис", "Участник", "Исходно", "В баланс", "Источник", "Баланс"]}
         render={(deposit) => [
           dateTime(deposit.createdAt),
@@ -2959,7 +3059,7 @@ function LedgerView({
           <OperationCell source={deposit.source} cancelledAt={deposit.cancelledAt} reversesId={deposit.reversesId}>
             <CancelOperationButton
               disabled={!isAdmin || Boolean(deposit.cancelledAt || deposit.reversesId)}
-              onCancel={() => mutate(`/api/deposits/${deposit.id}/cancel`, { reason: "Отмена из истории" })}
+              onCancel={() => mutate(`/api/deposits/${deposit.id}/cancel`, { reason: "Отмена из истории" }).then(() => reloadOperations())}
             />
           </OperationCell>,
           money(deposit.balanceAfter, deposit.balanceCurrency ?? "RUB")
@@ -2968,7 +3068,8 @@ function LedgerView({
 
       <HistoryTable
         title="Списания"
-        rows={visibleDebits}
+        page={operationPages.debits}
+        onPageChange={(offset) => onOperationPageChange("debits", offset)}
         columns={["Дата", "Сервис", "Участник", "Сумма сервиса", "С баланса", "Период", "Источник", "Баланс"]}
         render={(debit) => [
           dateTime(debit.createdAt),
@@ -2980,7 +3081,7 @@ function LedgerView({
           <OperationCell source={debit.source} cancelledAt={debit.cancelledAt} reversesId={debit.reversesId}>
             <CancelOperationButton
               disabled={!isAdmin || Boolean(debit.cancelledAt || debit.reversesId)}
-              onCancel={() => mutate(`/api/debits/${debit.id}/cancel`, { reason: "Отмена из истории" })}
+              onCancel={() => mutate(`/api/debits/${debit.id}/cancel`, { reason: "Отмена из истории" }).then(() => reloadOperations())}
             />
           </OperationCell>,
           money(debit.balanceAfter, debit.balanceCurrency ?? "RUB")
@@ -3012,7 +3113,7 @@ function OperationCell({
   );
 }
 
-function CancelOperationButton({ disabled, onCancel }: { disabled: boolean; onCancel: () => Promise<AppState> }) {
+function CancelOperationButton({ disabled, onCancel }: { disabled: boolean; onCancel: () => Promise<unknown> }) {
   return (
     <button className="ghost compact" type="button" disabled={disabled} onClick={onCancel}>
       Отменить
@@ -3022,20 +3123,22 @@ function CancelOperationButton({ disabled, onCancel }: { disabled: boolean; onCa
 
 function HistoryTable<T extends { id: string }>({
   title,
-  rows,
+  page,
   columns,
-  render
+  render,
+  onPageChange
 }: {
   title: string;
-  rows: T[];
+  page: PageResult<T>;
   columns: string[];
   render: (row: T) => ReactNode[];
+  onPageChange: (offset: number) => void;
 }) {
   return (
     <div className="panel wide">
       <div className="panel-head">
         <h2>{title}</h2>
-        <span className="chip">{rows.length}</span>
+        <span className="chip">{page.total}</span>
       </div>
       <div className="table-wrap">
         <table>
@@ -3047,7 +3150,7 @@ function HistoryTable<T extends { id: string }>({
             </tr>
           </thead>
           <tbody>
-            {rows.slice(0, 80).map((row) => (
+            {page.rows.map((row) => (
               <tr key={row.id}>
                 {render(row).map((cell, index) => (
                   <td key={`${row.id}-${index}`}>{cell}</td>
@@ -3056,8 +3159,9 @@ function HistoryTable<T extends { id: string }>({
             ))}
           </tbody>
         </table>
-        {!rows.length && <Empty label="Нет записей" />}
+        {!page.rows.length && <Empty label="Нет записей" />}
       </div>
+      <PaginationControls page={page} onChange={onPageChange} />
     </div>
   );
 }
@@ -3329,7 +3433,7 @@ function BotView({
         </div>
         <div className="bot-status">
           <Settings2 size={28} />
-          <strong>{state.notifications.filter((item) => item.kind !== "system").length}</strong>
+          <strong>{state.counts.notifications}</strong>
           <span>bot events</span>
         </div>
       </div>
