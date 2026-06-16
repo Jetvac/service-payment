@@ -5,7 +5,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { Client } from "ssh2";
 import { Store } from "./store";
-import type { AppData, AutoDeposit, BillingPeriod, Currency, Service, ServiceConnectionSettings, ServiceHealthStatus, User } from "./types";
+import type { AppData, AutoDeposit, BillingPeriod, Currency, LatencyCheck, Service, ServiceConnectionSettings, ServiceHealthStatus, User } from "./types";
 import {
   addDeposit,
   addNotification,
@@ -62,6 +62,11 @@ function publicData(data: AppData) {
     connection.passwordSet = Boolean(source?.connection?.password);
     return { ...service, connection };
   });
+
+  clone.settings.security = {
+    adminPassword: "",
+    adminPasswordSet: Boolean(data.settings.security?.adminPassword)
+  };
 
   return clone;
 }
@@ -185,6 +190,48 @@ function normalizeHealthStatus(value: unknown): ServiceHealthStatus {
   return value === "online" || value === "offline" || value === "unknown" || value === "maintenance" ? value : "unknown";
 }
 
+function escapeTelegramHtml(value: string) {
+  return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;");
+}
+
+function latencyText(check: LatencyCheck) {
+  if (check.status === "online" && check.latencyMs !== null) return `${check.latencyMs} мс`;
+  if (check.status === "maintenance") return "на обслуживании";
+  if (check.status === "offline") return "недоступен";
+  return "нет данных";
+}
+
+async function sendLatencyAnalytics(data: AppData, service: Service, user: User | undefined, check: LatencyCheck) {
+  if (!user?.telegramId) {
+    addNotification(data, {
+      serviceId: service.id,
+      userId: user?.id ?? null,
+      kind: "latency_report",
+      message: `Latency ${service.name}: ${latencyText(check)}`,
+      status: "skipped"
+    });
+    return;
+  }
+
+  const text = [
+    `📡 <b>${escapeTelegramHtml(service.name)}</b>`,
+    `Ваш замер доступа: <b>${latencyText(check)}</b>`,
+    check.error ? `Ошибка: ${escapeTelegramHtml(check.error)}` : "",
+    `Время: ${new Intl.DateTimeFormat("ru-RU", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" }).format(new Date(check.checkedAt))}`
+  ]
+    .filter(Boolean)
+    .join("\n");
+
+  const sent = await sendTelegramMessage(data, text, user.telegramId);
+  addNotification(data, {
+    serviceId: service.id,
+    userId: user.id,
+    kind: "latency_report",
+    message: `Latency ${service.name}: ${latencyText(check)}`,
+    status: sent ? "sent" : "failed"
+  });
+}
+
 async function telegramJson(token: string, method: string, body: Record<string, unknown>) {
   const response = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
     method: "POST",
@@ -226,14 +273,26 @@ async function tryFetchTelegramAvatar(data: AppData, user: User) {
   }
 }
 
-function applyUserInput(user: User, body: Partial<User>) {
+function validateAdminPassword(data: AppData, password: unknown) {
+  const expected = data.settings.security?.adminPassword || "admin";
+  if (String(password ?? "") !== expected) {
+    throw new Error("Неверный пароль администратора");
+  }
+}
+
+function applyUserInput(data: AppData, user: User, body: Partial<User> & { adminPassword?: string }) {
+  const nextBotAdmin = Boolean(body.botAdmin);
+  if (nextBotAdmin && !user.botAdmin) {
+    validateAdminPassword(data, body.adminPassword);
+  }
+
   user.name = String(body.name ?? user.name).trim() || user.name;
   user.balance = roundMoney(normalizeNumber(body.balance, user.balance));
   user.telegramId = String(body.telegramId ?? user.telegramId).trim();
   user.telegramUsername = String(body.telegramUsername ?? user.telegramUsername).trim().replace(/^@/, "");
   user.avatarUrl = String(body.avatarUrl ?? user.avatarUrl ?? "");
   user.commandDepositsBlocked = Boolean(body.commandDepositsBlocked);
-  user.botAdmin = Boolean(body.botAdmin);
+  user.botAdmin = nextBotAdmin;
   user.notes = String(body.notes ?? user.notes);
 }
 
@@ -463,21 +522,22 @@ app.post("/api/system/update", async (_req, res) => {
 
 app.post("/api/users", async (req, res) => {
   try {
-    const body = req.body as Partial<User>;
+    const body = req.body as Partial<User> & { adminPassword?: string };
     const user: User = {
       id: id("usr"),
-      name: String(body.name ?? "").trim() || "Новый участник",
-      balance: roundMoney(normalizeNumber(body.balance, 0)),
-      telegramId: String(body.telegramId ?? "").trim(),
-      telegramUsername: String(body.telegramUsername ?? "").trim().replace(/^@/, ""),
-      avatarUrl: String(body.avatarUrl ?? ""),
-      commandDepositsBlocked: Boolean(body.commandDepositsBlocked),
-      botAdmin: Boolean(body.botAdmin),
-      notes: String(body.notes ?? ""),
+      name: "Новый участник",
+      balance: 0,
+      telegramId: "",
+      telegramUsername: "",
+      avatarUrl: "",
+      commandDepositsBlocked: false,
+      botAdmin: false,
+      notes: "",
       createdAt: nowIso()
     };
 
     const data = store.read();
+    applyUserInput(data, user, body);
     user.avatarUrl = await tryFetchTelegramAvatar(data, user);
     data.users.push(user);
     store.persist();
@@ -494,7 +554,7 @@ app.put("/api/users/:id", async (req, res) => {
     const user = data.users.find((item) => item.id === req.params.id);
     if (!user) throw new Error("Пользователь не найден");
 
-    applyUserInput(user, req.body);
+    applyUserInput(data, user, req.body);
     user.avatarUrl = await tryFetchTelegramAvatar(data, user);
     store.persist();
 
@@ -598,21 +658,56 @@ app.put("/api/services/:id", (req, res) => {
   }
 });
 
-app.post("/api/services/:id/health", (req, res) => {
+app.post("/api/services/:id/health", async (req, res) => {
   try {
-    store.write((data) => {
-      const service = data.services.find((item) => item.id === req.params.id);
-      if (!service) throw new Error("Сервис не найден");
-      service.connection = { ...defaultServiceConnection(), ...(service.connection ?? {}) };
-      if (service.connection.lastStatus === "maintenance" && req.body.status !== "maintenance") return;
-      service.connection.lastStatus = normalizeHealthStatus(req.body.status);
-      service.connection.lastLatencyMs =
-        typeof req.body.latencyMs === "number" && Number.isFinite(req.body.latencyMs)
-          ? Math.max(0, Math.round(req.body.latencyMs))
-          : null;
-      service.connection.lastCheckedAt = String(req.body.checkedAt ?? nowIso());
-      service.connection.lastError = String(req.body.error ?? "").slice(0, 240);
-    });
+    const data = store.read();
+    const service = data.services.find((item) => item.id === req.params.id);
+    if (!service) throw new Error("Сервис не найден");
+
+    service.connection = { ...defaultServiceConnection(), ...(service.connection ?? {}) };
+    const status = normalizeHealthStatus(req.body.status);
+    const checkedAt = String(req.body.checkedAt ?? nowIso());
+    const latencyMs =
+      typeof req.body.latencyMs === "number" && Number.isFinite(req.body.latencyMs)
+        ? Math.max(0, Math.round(req.body.latencyMs))
+        : null;
+    const error = String(req.body.error ?? "").slice(0, 240);
+    const user = data.users.find((item) => item.id === String(req.body.userId ?? ""));
+
+    const check: LatencyCheck = {
+      id: id("lat"),
+      serviceId: service.id,
+      userId: user?.id ?? null,
+      status,
+      latencyMs,
+      checkedAt,
+      error,
+      createdAt: nowIso()
+    };
+
+    data.latencyChecks.unshift(check);
+    data.latencyChecks = data.latencyChecks.slice(0, 2000);
+
+    if (service.connection.lastStatus !== "maintenance" || status === "maintenance") {
+      service.connection.lastStatus = status;
+      service.connection.lastLatencyMs = latencyMs;
+      service.connection.lastCheckedAt = checkedAt;
+      service.connection.lastError = error;
+    }
+
+    try {
+      await sendLatencyAnalytics(data, service, user, check);
+    } catch (notifyError) {
+      addNotification(data, {
+        serviceId: service.id,
+        userId: user?.id ?? null,
+        kind: "latency_report",
+        message: notifyError instanceof Error ? notifyError.message : "Telegram latency report failed",
+        status: "failed"
+      });
+    }
+
+    store.persist();
 
     res.json(ok(apiState()));
   } catch (error) {
@@ -931,6 +1026,22 @@ app.put("/api/settings/telegram", (req, res) => {
       data.settings.telegram.updateOffset = normalizeNumber(req.body.updateOffset, data.settings.telegram.updateOffset);
       data.settings.telegram.lastUpdateAt = req.body.lastUpdateAt ?? data.settings.telegram.lastUpdateAt ?? null;
       data.settings.telegram.lastError = String(req.body.lastError ?? data.settings.telegram.lastError ?? "");
+    });
+
+    res.json(ok(apiState()));
+  } catch (error) {
+    res.status(400).json(fail(error));
+  }
+});
+
+app.put("/api/settings/security", (req, res) => {
+  try {
+    store.write((data) => {
+      validateAdminPassword(data, req.body.currentPassword);
+      const nextPassword = String(req.body.newPassword ?? "").trim();
+      if (!nextPassword) throw new Error("Укажите новый пароль администратора");
+      data.settings.security.adminPassword = nextPassword;
+      data.settings.security.adminPasswordSet = true;
     });
 
     res.json(ok(apiState()));

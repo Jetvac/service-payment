@@ -1,5 +1,6 @@
 import {
   Activity,
+  AlertTriangle,
   Archive,
   ArchiveRestore,
   BellRing,
@@ -14,6 +15,7 @@ import {
   Download,
   Gauge,
   History,
+  LogOut,
   Plus,
   RefreshCcw,
   Send,
@@ -82,6 +84,8 @@ type ClientHealth = {
   checkedAt: string | null;
   error: string;
 };
+
+const authStorageKey = "vpn-payment-current-user-id";
 
 const periodNames: Record<BillingPeriod, string> = {
   month: "Месяц",
@@ -170,6 +174,14 @@ const blankAutoDeposit = {
 
 function money(value: number, currency: string) {
   return `${Number(value || 0).toLocaleString("ru-RU", { minimumFractionDigits: 2, maximumFractionDigits: 2 })} ${currency}`;
+}
+
+function currencyRate(state: AppState, code: string) {
+  return state.currencies.find((currency) => currency.code === code)?.rateToRub ?? 1;
+}
+
+function toRub(state: AppState, amount: number, currency: string) {
+  return amount * currencyRate(state, currency);
 }
 
 function dateTime(value: string | null | undefined) {
@@ -301,6 +313,19 @@ function activeServicesForUser(state: AppState, userId: string) {
     .filter((service): service is Service => Boolean(service));
 }
 
+function userBalanceWarning(state: AppState, user: User) {
+  const required = activeServicesForUser(state, user.id).reduce((sum, service) => {
+    const summary = state.summaries.find((item) => item.serviceId === service.id);
+    const periods = Math.max(1, service.billing.lowBalanceThresholdPeriods || 1);
+    return sum + toRub(state, summary?.perMemberPeriod ?? 0, service.currency) * periods;
+  }, 0);
+
+  return {
+    required,
+    low: required > 0 && user.balance < required
+  };
+}
+
 function autoDepositDefaults(state: AppState, preferredUserId = ""): AutoDepositForm {
   const userId = preferredUserId && state.users.some((user) => user.id === preferredUserId) ? preferredUserId : state.users[0]?.id ?? "";
   const service = activeServicesForUser(state, userId)[0];
@@ -417,9 +442,45 @@ function ModalShell({
   );
 }
 
+function AuthScreen({ state, onLogin }: { state: AppState; onLogin: (userId: string) => void }) {
+  return (
+    <main className="auth-screen">
+      <section className="auth-panel">
+        <div className="brand auth-brand">
+          <span className="brand-mark">
+            <Shield size={18} />
+          </span>
+          <div>
+            <strong>VPN Pay</strong>
+            <small>Control</small>
+          </div>
+        </div>
+        <div className="auth-heading">
+          <h1>Вход</h1>
+          <span className="muted">Выберите участника</span>
+        </div>
+        <div className="auth-users">
+          {state.users.map((user) => (
+            <button className="auth-user" key={user.id} type="button" onClick={() => onLogin(user.id)}>
+              <UserAvatar user={user} />
+              <div>
+                <strong>{user.name}</strong>
+                <small>{money(user.balance, "RUB")}</small>
+              </div>
+              {user.botAdmin && <span className="status-pill reversal">админ</span>}
+            </button>
+          ))}
+          {!state.users.length && <Empty label="Участников пока нет" />}
+        </div>
+      </section>
+    </main>
+  );
+}
+
 export default function App() {
   const [state, setState] = useState<AppState | null>(null);
   const [view, setView] = useState<View>("dashboard");
+  const [currentUserId, setCurrentUserId] = useState(() => window.localStorage.getItem(authStorageKey) ?? "");
   const [selectedServiceId, setSelectedServiceId] = useState("");
   const [toast, setToast] = useState("");
   const [serviceForm, setServiceForm] = useState(blankService);
@@ -434,6 +495,10 @@ export default function App() {
     currency: "RUB",
     comment: ""
   });
+
+  const currentUser = useMemo(() => state?.users.find((user) => user.id === currentUserId), [currentUserId, state?.users]);
+  const isAdmin = Boolean(currentUser?.botAdmin);
+  const visibleNavItems = useMemo(() => navItems.filter((item) => isAdmin || item.id !== "bot"), [isAdmin]);
 
   const load = async () => {
     const nextState = await api("/api/state");
@@ -451,6 +516,20 @@ export default function App() {
     load().catch((error) => setToast(error.message));
   }, []);
 
+  useEffect(() => {
+    if (!state) return;
+    if (currentUserId && !state.users.some((user) => user.id === currentUserId)) {
+      window.localStorage.removeItem(authStorageKey);
+      setCurrentUserId("");
+    }
+  }, [currentUserId, state]);
+
+  useEffect(() => {
+    if (!isAdmin && view === "bot") {
+      setView("dashboard");
+    }
+  }, [isAdmin, view]);
+
   const healthConfigKey = useMemo(
     () =>
       state?.services
@@ -466,12 +545,12 @@ export default function App() {
           ].join(":");
         })
         .join("|") ?? "",
-    [state?.services]
+    [currentUser?.id, state?.services]
   );
 
   const probeService = async (service: Service) => {
     const connection = serviceConnection(service);
-    if (!connection.enabled || !connection.host.trim() || connection.lastStatus === "maintenance") return;
+    if (!currentUser || !connection.enabled || !connection.host.trim() || connection.lastStatus === "maintenance") return;
 
     setClientHealth((current) => ({
       ...current,
@@ -487,7 +566,7 @@ export default function App() {
     try {
       const nextState = await api(`/api/services/${service.id}/health`, {
         method: "POST",
-        body: JSON.stringify(result)
+        body: JSON.stringify({ ...result, userId: currentUser.id })
       });
       setState(nextState);
     } catch (error) {
@@ -503,7 +582,7 @@ export default function App() {
   };
 
   useEffect(() => {
-    if (!state) return;
+    if (!state || !currentUser) return;
     const services = state.services.filter((service) => {
       const connection = serviceConnection(service);
       return connection.enabled && connection.host.trim() && connection.lastStatus !== "maintenance";
@@ -524,7 +603,7 @@ export default function App() {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [healthConfigKey]);
+  }, [healthConfigKey, currentUser?.id]);
 
   useEffect(() => {
     if (!toast) return;
@@ -627,7 +706,9 @@ export default function App() {
         lowBalance: 0,
         debt: 0,
         chart: [],
-        balances: []
+        balances: [],
+        latencyRecent: [],
+        latencyByUser: []
       };
     }
 
@@ -655,6 +736,16 @@ export default function App() {
         balance: user.balance
       }))
       .slice(0, 10);
+    const latencyRecent = state.latencyChecks.slice(0, 20);
+    const latencyStats = new Map<string, { name: string; sum: number; count: number }>();
+    for (const check of state.latencyChecks) {
+      if (check.latencyMs === null || !check.userId) continue;
+      const user = state.users.find((item) => item.id === check.userId);
+      const current = latencyStats.get(check.userId) ?? { name: user?.name ?? "Участник", sum: 0, count: 0 };
+      current.sum += check.latencyMs;
+      current.count += 1;
+      latencyStats.set(check.userId, current);
+    }
 
     return {
       totalMonthly,
@@ -662,7 +753,12 @@ export default function App() {
       lowBalance: state.summaries.reduce((sum, summary) => sum + summary.lowBalanceCount, 0),
       debt: state.summaries.reduce((sum, summary) => sum + summary.debtCount, 0),
       chart: Array.from(byDate.values()).reverse().slice(-14),
-      balances
+      balances,
+      latencyRecent,
+      latencyByUser: Array.from(latencyStats.values())
+        .map((item) => ({ name: item.name, avg: Math.round(item.sum / item.count), count: item.count }))
+        .sort((a, b) => b.count - a.count)
+        .slice(0, 10)
     };
   }, [state]);
 
@@ -672,6 +768,18 @@ export default function App() {
         <Shield size={34} />
         <span>Загрузка</span>
       </main>
+    );
+  }
+
+  if (!currentUser) {
+    return (
+      <AuthScreen
+        state={state}
+        onLogin={(userId) => {
+          window.localStorage.setItem(authStorageKey, userId);
+          setCurrentUserId(userId);
+        }}
+      />
     );
   }
 
@@ -725,7 +833,7 @@ export default function App() {
     }
   };
 
-  const saveUser = (user: User) => mutate(`/api/users/${user.id}`, user, "PUT");
+  const saveUser = (user: User & { adminPassword?: string }) => mutate(`/api/users/${user.id}`, user, "PUT");
   const saveTelegram = (telegram: TelegramSettings) => mutate("/api/settings/telegram", telegram, "PUT");
   const saveCurrency = (currency: Currency) => mutate(`/api/currencies/${currency.code}`, currency, "PUT");
 
@@ -778,6 +886,8 @@ export default function App() {
         mutate={mutate}
         serviceById={serviceById}
         userById={userById}
+        currentUser={currentUser}
+        isAdmin={isAdmin}
       />
     ),
     bot: (
@@ -795,6 +905,8 @@ export default function App() {
     )
   }[view];
 
+  const warning = userBalanceWarning(state, currentUser);
+
   return (
     <div className="app-shell">
       <aside className="sidebar">
@@ -809,7 +921,7 @@ export default function App() {
         </div>
 
         <nav>
-          {navItems.map((item) => {
+          {visibleNavItems.map((item) => {
             const Icon = item.icon;
             return (
               <button
@@ -824,6 +936,25 @@ export default function App() {
             );
           })}
         </nav>
+
+        <div className="account-card">
+          <UserAvatar user={currentUser} />
+          <div>
+            <strong>{currentUser.name}</strong>
+            <small>{money(currentUser.balance, "RUB")}</small>
+          </div>
+          <button
+            className="icon-button"
+            type="button"
+            title="Выйти"
+            onClick={() => {
+              window.localStorage.removeItem(authStorageKey);
+              setCurrentUserId("");
+            }}
+          >
+            <LogOut size={15} />
+          </button>
+        </div>
 
         <div className="sidebar-footer">
           <span className={classNames("status-dot", state.settings.telegram.enabled && "enabled")} />
@@ -850,6 +981,18 @@ export default function App() {
             </button>
           </div>
         </header>
+
+        {warning.low && (
+          <div className="balance-alert">
+            <AlertTriangle size={18} />
+            <div>
+              <strong>Малый остаток</strong>
+              <span>
+                Текущий баланс {money(currentUser.balance, "RUB")}, ближайший порог оплат {money(warning.required, "RUB")}
+              </span>
+            </div>
+          </div>
+        )}
 
         {content}
       </main>
@@ -879,6 +1022,8 @@ function Dashboard({
     debt: number;
     chart: Array<{ date: string; deposits: number; debits: number }>;
     balances: Array<{ name: string; balance: number }>;
+    latencyRecent: AppState["latencyChecks"];
+    latencyByUser: Array<{ name: string; avg: number; count: number }>;
   };
   clientHealth: Record<string, ClientHealth>;
   serviceById: (id: string) => Service | undefined;
@@ -993,6 +1138,67 @@ function Dashboard({
               })}
             </tbody>
           </table>
+        </div>
+      </div>
+
+      <div className="panel chart-panel">
+        <div className="panel-head">
+          <h2>Пинг пользователей</h2>
+          <span className="chip">{dashboard.latencyByUser.length}</span>
+        </div>
+        <div className="chart-wrap compact">
+          {dashboard.latencyByUser.length ? (
+            <ResponsiveContainer width="100%" height="100%">
+              <BarChart data={dashboard.latencyByUser} layout="vertical" margin={{ left: 12, right: 12 }}>
+                <CartesianGrid stroke="rgba(255,255,255,.06)" horizontal={false} />
+                <XAxis type="number" axisLine={false} tickLine={false} tick={{ fill: "#8a8f98", fontSize: 12 }} />
+                <YAxis
+                  type="category"
+                  width={116}
+                  dataKey="name"
+                  axisLine={false}
+                  tickLine={false}
+                  tick={{ fill: "#c6cad2", fontSize: 12 }}
+                />
+                <Tooltip contentStyle={{ background: "#111318", border: "1px solid #272a33", borderRadius: 8 }} />
+                <Bar dataKey="avg" fill="#47d18c" radius={[0, 4, 4, 0]} name="Средний пинг, мс" />
+              </BarChart>
+            </ResponsiveContainer>
+          ) : (
+            <Empty label="Замеров пока нет" />
+          )}
+        </div>
+      </div>
+
+      <div className="panel wide">
+        <div className="panel-head">
+          <h2>Последние замеры</h2>
+          <span className="chip">{dashboard.latencyRecent.length}</span>
+        </div>
+        <div className="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Дата</th>
+                <th>Пользователь</th>
+                <th>Сервис</th>
+                <th>Статус</th>
+                <th>Задержка</th>
+              </tr>
+            </thead>
+            <tbody>
+              {dashboard.latencyRecent.map((check) => (
+                <tr key={check.id}>
+                  <td>{dateTime(check.checkedAt)}</td>
+                  <td>{userById(check.userId ?? "")?.name ?? "Не выбран"}</td>
+                  <td>{serviceById(check.serviceId)?.name ?? "Сервис"}</td>
+                  <td>{healthLabels[check.status]}</td>
+                  <td>{check.latencyMs === null ? "нет данных" : `${check.latencyMs} мс`}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          {!dashboard.latencyRecent.length && <Empty label="Замеров пока нет" />}
         </div>
       </div>
 
@@ -1804,7 +2010,8 @@ function DepositModal({
   serviceById,
   userById,
   onClose,
-  showTargets = false
+  targetMode = "none",
+  serviceOptions
 }: {
   state: AppState;
   depositForm: DepositForm;
@@ -1813,12 +2020,14 @@ function DepositModal({
   serviceById: (id: string) => Service | undefined;
   userById: (id: string) => User | undefined;
   onClose: () => void;
-  showTargets?: boolean;
+  targetMode?: "none" | "service" | "all";
+  serviceOptions?: Service[];
 }) {
+  const availableServices = serviceOptions ?? state.services;
   const service = serviceById(depositForm.serviceId);
   const members = state.memberships.filter((membership) => membership.serviceId === depositForm.serviceId && membership.active);
   const selectedUserIsMember = members.some((membership) => membership.userId === depositForm.userId);
-  const depositUserId = selectedUserIsMember ? depositForm.userId : members[0]?.userId ?? "";
+  const depositUserId = targetMode === "all" ? (selectedUserIsMember ? depositForm.userId : members[0]?.userId ?? "") : depositForm.userId;
   const user = userById(depositUserId);
 
   return (
@@ -1839,7 +2048,7 @@ function DepositModal({
       }
     >
       <div className="form-grid modal-form">
-        {showTargets && (
+        {targetMode !== "none" && (
           <>
             <label>
               Сервис
@@ -1852,34 +2061,36 @@ function DepositModal({
                   setDepositForm({
                     ...depositForm,
                     serviceId: event.target.value,
-                    userId: member?.userId ?? "",
+                    userId: targetMode === "all" ? member?.userId ?? "" : depositForm.userId,
                     currency: nextService?.currency ?? depositForm.currency
                   });
                 }}
               >
-                {state.services.map((item) => (
+                {availableServices.map((item) => (
                   <option key={item.id} value={item.id}>
                     {item.name}
                   </option>
                 ))}
               </select>
             </label>
-            <label>
-              Участник
-              <select value={depositUserId} onChange={(event) => setDepositForm({ ...depositForm, userId: event.target.value })}>
-                {members.map((membership) => (
-                  <option key={membership.id} value={membership.userId}>
-                    {userById(membership.userId)?.name ?? "Участник"}
-                  </option>
-                ))}
-              </select>
-            </label>
+            {targetMode === "all" && (
+              <label>
+                Участник
+                <select value={depositUserId} onChange={(event) => setDepositForm({ ...depositForm, userId: event.target.value })}>
+                  {members.map((membership) => (
+                    <option key={membership.id} value={membership.userId}>
+                      {userById(membership.userId)?.name ?? "Участник"}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            )}
           </>
         )}
         <label>
           Сумма
           <input
-            autoFocus={!showTargets}
+            autoFocus={targetMode === "none"}
             type="number"
             min="0"
             step="0.01"
@@ -1921,7 +2132,7 @@ function PeopleView({
   userById: (id: string) => User | undefined;
   serviceById: (id: string) => Service | undefined;
   mutate: (path: string, body?: unknown, method?: string) => Promise<AppState>;
-  saveUser: (user: User) => Promise<AppState>;
+  saveUser: (user: User & { adminPassword?: string }) => Promise<AppState>;
 }) {
   const [createOpen, setCreateOpen] = useState(false);
 
@@ -1967,6 +2178,7 @@ function PeopleView({
           title="Новый участник"
           draft={userForm}
           setDraft={setUserForm}
+          wasAdmin={false}
           onClose={() => setCreateOpen(false)}
           onSave={(nextUser) =>
             mutate("/api/users", nextUser).then((nextState) => {
@@ -2383,6 +2595,7 @@ function UserCard({
           title="Участник"
           draft={draft}
           setDraft={setDraft}
+          wasAdmin={user.botAdmin}
           onClose={() => {
             setDraft(user);
             setEditing(false);
@@ -2401,15 +2614,20 @@ function UserEditModal({
   title,
   draft,
   setDraft,
+  wasAdmin,
   onSave,
   onClose
 }: {
   title: string;
   draft: User | typeof blankUser;
   setDraft: (value: any) => void;
-  onSave: (user: User | typeof blankUser) => Promise<AppState>;
+  wasAdmin: boolean;
+  onSave: (user: (User | typeof blankUser) & { adminPassword?: string }) => Promise<AppState>;
   onClose: () => void;
 }) {
+  const [adminPassword, setAdminPassword] = useState("");
+  const needsAdminPassword = draft.botAdmin && !wasAdmin;
+
   return (
     <ModalShell
       title={title}
@@ -2419,7 +2637,12 @@ function UserEditModal({
           <button className="ghost" type="button" onClick={onClose}>
             Отмена
           </button>
-          <button className="primary" type="button" onClick={() => onSave(draft)}>
+          <button
+            className="primary"
+            type="button"
+            disabled={needsAdminPassword && !adminPassword}
+            onClick={() => onSave({ ...draft, adminPassword })}
+          >
             <Check size={16} />
             Сохранить
           </button>
@@ -2462,6 +2685,12 @@ function UserEditModal({
           <input type="checkbox" checked={draft.botAdmin} onChange={(event) => setDraft({ ...draft, botAdmin: event.target.checked })} />
           Администратор бота
         </label>
+        {needsAdminPassword && (
+          <label className="wide-field">
+            Пароль администратора
+            <input type="password" value={adminPassword} onChange={(event) => setAdminPassword(event.target.value)} />
+          </label>
+        )}
         <label className="wide-field">
           Заметка
           <textarea value={draft.notes} onChange={(event) => setDraft({ ...draft, notes: event.target.value })} />
@@ -2477,7 +2706,9 @@ function LedgerView({
   setDepositForm,
   mutate,
   serviceById,
-  userById
+  userById,
+  currentUser,
+  isAdmin
 }: {
   state: AppState;
   depositForm: DepositForm;
@@ -2485,25 +2716,34 @@ function LedgerView({
   mutate: (path: string, body?: unknown, method?: string) => Promise<AppState>;
   serviceById: (id: string) => Service | undefined;
   userById: (id: string) => User | undefined;
+  currentUser: User;
+  isAdmin: boolean;
 }) {
+  const availableServices = useMemo(
+    () => (isAdmin ? state.services : activeServicesForUser(state, currentUser.id)),
+    [currentUser.id, isAdmin, state.memberships, state.services]
+  );
   const selectedService = serviceById(depositForm.serviceId);
   const members = state.memberships.filter((membership) => membership.serviceId === depositForm.serviceId && membership.active);
   const selectedUserIsMember = members.some((membership) => membership.userId === depositForm.userId);
-  const depositUserId = selectedUserIsMember ? depositForm.userId : members[0]?.userId ?? "";
+  const depositUserId = isAdmin ? (selectedUserIsMember ? depositForm.userId : members[0]?.userId ?? "") : currentUser.id;
   const [depositOpen, setDepositOpen] = useState(false);
+  const visibleDeposits = isAdmin ? state.deposits : state.deposits.filter((deposit) => deposit.userId === currentUser.id);
+  const visibleDebits = isAdmin ? state.debits : state.debits.filter((debit) => debit.userId === currentUser.id);
 
   useEffect(() => {
-    if (!depositForm.serviceId && state.services[0]) {
-      const service = state.services[0];
+    const serviceAllowed = availableServices.some((service) => service.id === depositForm.serviceId);
+    if ((!depositForm.serviceId || !serviceAllowed) && availableServices[0]) {
+      const service = availableServices[0];
       const member = state.memberships.find((membership) => membership.serviceId === service.id && membership.active);
-      setDepositForm({ ...depositForm, serviceId: service.id, userId: member?.userId ?? "", currency: service.currency });
+      setDepositForm({ ...depositForm, serviceId: service.id, userId: isAdmin ? member?.userId ?? "" : currentUser.id, currency: service.currency });
       return;
     }
 
     if (depositForm.serviceId && depositForm.userId !== depositUserId) {
       setDepositForm({ ...depositForm, userId: depositUserId, currency: selectedService?.currency ?? depositForm.currency });
     }
-  }, [depositForm.serviceId, depositForm.userId, depositUserId, selectedService?.currency, state.memberships, state.services]);
+  }, [availableServices, currentUser.id, depositForm.serviceId, depositForm.userId, depositUserId, isAdmin, selectedService?.currency, state.memberships]);
 
   return (
     <section className="page-grid">
@@ -2513,7 +2753,7 @@ function LedgerView({
           <button
             className="primary"
             type="button"
-            disabled={!depositUserId}
+            disabled={!depositUserId || !availableServices.length}
             onClick={() => setDepositOpen(true)}
           >
             <Plus size={16} />
@@ -2586,7 +2826,8 @@ function LedgerView({
             mutate={mutate}
             serviceById={serviceById}
             userById={userById}
-            showTargets
+            targetMode={isAdmin ? "all" : "service"}
+            serviceOptions={availableServices}
             onClose={() => setDepositOpen(false)}
           />
         )}
@@ -2594,7 +2835,7 @@ function LedgerView({
 
       <HistoryTable
         title="Зачисления"
-        rows={state.deposits}
+        rows={visibleDeposits}
         columns={["Дата", "Сервис", "Участник", "Исходно", "В баланс", "Источник", "Баланс"]}
         render={(deposit) => [
           dateTime(deposit.createdAt),
@@ -2604,7 +2845,7 @@ function LedgerView({
           money(deposit.amountBalanceCurrency ?? deposit.amountServiceCurrency, deposit.balanceCurrency ?? "RUB"),
           <OperationCell source={deposit.source} cancelledAt={deposit.cancelledAt} reversesId={deposit.reversesId}>
             <CancelOperationButton
-              disabled={Boolean(deposit.cancelledAt || deposit.reversesId)}
+              disabled={!isAdmin || Boolean(deposit.cancelledAt || deposit.reversesId)}
               onCancel={() => mutate(`/api/deposits/${deposit.id}/cancel`, { reason: "Отмена из истории" })}
             />
           </OperationCell>,
@@ -2614,7 +2855,7 @@ function LedgerView({
 
       <HistoryTable
         title="Списания"
-        rows={state.debits}
+        rows={visibleDebits}
         columns={["Дата", "Сервис", "Участник", "Сумма сервиса", "С баланса", "Период", "Источник", "Баланс"]}
         render={(debit) => [
           dateTime(debit.createdAt),
@@ -2625,7 +2866,7 @@ function LedgerView({
           `${dateTime(debit.periodStart)} - ${dateTime(debit.periodEnd)}`,
           <OperationCell source={debit.source} cancelledAt={debit.cancelledAt} reversesId={debit.reversesId}>
             <CancelOperationButton
-              disabled={Boolean(debit.cancelledAt || debit.reversesId)}
+              disabled={!isAdmin || Boolean(debit.cancelledAt || debit.reversesId)}
               onCancel={() => mutate(`/api/debits/${debit.id}/cancel`, { reason: "Отмена из истории" })}
             />
           </OperationCell>,
@@ -2732,6 +2973,8 @@ function BotView({
   const [telegram, setTelegram] = useState(state.settings.telegram);
   const [telegramOpen, setTelegramOpen] = useState(false);
   const [currencyOpen, setCurrencyOpen] = useState(false);
+  const [securityOpen, setSecurityOpen] = useState(false);
+  const [securityForm, setSecurityForm] = useState({ currentPassword: "", newPassword: "" });
   const [updating, setUpdating] = useState(false);
   const webhookUrl = `${window.location.origin.replace(/\/$/, "")}/api/telegram/webhook/${telegram.webhookSecret}`;
   const [publicWebhookUrl, setPublicWebhookUrl] = useState(webhookUrl);
@@ -2747,6 +2990,12 @@ function BotView({
   const saveAndTest = () => saveTelegram(telegram).then(() => mutate("/api/telegram/test", { chatId: telegram.chatId }));
   const startPolling = () => saveTelegram({ ...telegram, pollingEnabled: true }).then(() => mutate("/api/telegram/polling/start"));
   const stopPolling = () => mutate("/api/telegram/polling/stop");
+  const saveSecurity = () =>
+    mutate("/api/settings/security", securityForm, "PUT").then((nextState) => {
+      setSecurityForm({ currentPassword: "", newPassword: "" });
+      setSecurityOpen(false);
+      return nextState;
+    });
   const runUpdate = async () => {
     setUpdating(true);
     try {
@@ -2870,7 +3119,19 @@ function BotView({
             <RefreshCcw size={16} />
             {updating ? "Обновление..." : "Обновить приложение"}
           </button>
+          <button className="ghost" type="button" onClick={() => setSecurityOpen(true)}>
+            <Shield size={16} />
+            Пароль админки
+          </button>
         </div>
+        {securityOpen && (
+          <SecurityModal
+            form={securityForm}
+            setForm={setSecurityForm}
+            onClose={() => setSecurityOpen(false)}
+            onSave={saveSecurity}
+          />
+        )}
       </div>
 
       <div className="panel wide">
@@ -3036,6 +3297,47 @@ function TelegramSettingsModal({
           <span>Последний update: {dateTime(telegram.lastUpdateAt)}</span>
           {telegram.lastError && <span className="text-danger">{telegram.lastError}</span>}
         </div>
+      </div>
+    </ModalShell>
+  );
+}
+
+function SecurityModal({
+  form,
+  setForm,
+  onSave,
+  onClose
+}: {
+  form: { currentPassword: string; newPassword: string };
+  setForm: (value: { currentPassword: string; newPassword: string }) => void;
+  onSave: () => Promise<unknown>;
+  onClose: () => void;
+}) {
+  return (
+    <ModalShell
+      title="Пароль админки"
+      onClose={onClose}
+      footer={
+        <>
+          <button className="ghost" type="button" onClick={onClose}>
+            Отмена
+          </button>
+          <button className="primary" type="button" disabled={!form.currentPassword || !form.newPassword} onClick={() => onSave()}>
+            <Check size={16} />
+            Сохранить
+          </button>
+        </>
+      }
+    >
+      <div className="form-grid modal-form">
+        <label>
+          Текущий пароль
+          <input autoFocus type="password" value={form.currentPassword} onChange={(event) => setForm({ ...form, currentPassword: event.target.value })} />
+        </label>
+        <label>
+          Новый пароль
+          <input type="password" value={form.newPassword} onChange={(event) => setForm({ ...form, newPassword: event.target.value })} />
+        </label>
       </div>
     </ModalShell>
   );

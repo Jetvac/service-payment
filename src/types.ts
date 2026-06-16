@@ -21,6 +21,17 @@ export type User = {
   createdAt: string;
 };
 
+export type LatencyCheck = {
+  id: string;
+  serviceId: string;
+  userId: string | null;
+  status: ServiceHealthStatus;
+  latencyMs: number | null;
+  checkedAt: string;
+  error: string;
+  createdAt: string;
+};
+
 export type BillingSettings = {
   period: BillingPeriod;
   interval: number;
@@ -137,7 +148,7 @@ export type Notification = {
   id: string;
   serviceId: string;
   userId: string | null;
-  kind: "low_balance" | "period_summary" | "telegram_reply" | "system";
+  kind: "low_balance" | "period_summary" | "telegram_reply" | "latency_report" | "system";
   message: string;
   status: "sent" | "skipped" | "failed";
   createdAt: string;
@@ -167,6 +178,11 @@ export type TelegramSettings = {
   lastError: string;
 };
 
+export type SecuritySettings = {
+  adminPassword: string;
+  adminPasswordSet?: boolean;
+};
+
 export type AppState = {
   currencies: Currency[];
   users: User[];
@@ -175,8 +191,9 @@ export type AppState = {
   autoDeposits: AutoDeposit[];
   deposits: Deposit[];
   debits: Debit[];
+  latencyChecks: LatencyCheck[];
   notifications: Notification[];
-  settings: { telegram: TelegramSettings };
+  settings: { telegram: TelegramSettings; security: SecuritySettings };
   summaries: ServiceSummary[];
   serverTime: string;
 };

@@ -69,7 +69,7 @@ export function seedData(): AppData {
         telegramUsername: "alex",
         avatarUrl: "",
         commandDepositsBlocked: false,
-        botAdmin: false,
+        botAdmin: true,
         notes: "",
         createdAt
       },
@@ -117,6 +117,7 @@ export function seedData(): AppData {
     autoDeposits: [],
     deposits: [],
     debits: [],
+    latencyChecks: [],
     notifications: [],
     settings: {
       telegram: {
@@ -131,6 +132,10 @@ export function seedData(): AppData {
         updateOffset: 0,
         lastUpdateAt: null,
         lastError: ""
+      },
+      security: {
+        adminPassword: "admin",
+        adminPasswordSet: true
       }
     }
   };

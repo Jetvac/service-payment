@@ -78,6 +78,7 @@ export class Store {
       autoDeposits: Array.isArray(backup.autoDeposits) ? backup.autoDeposits : [],
       deposits: Array.isArray(backup.deposits) ? backup.deposits : [],
       debits: Array.isArray(backup.debits) ? backup.debits : [],
+      latencyChecks: Array.isArray(backup.latencyChecks) ? backup.latencyChecks : [],
       notifications: Array.isArray(backup.notifications) ? backup.notifications : [],
       settings: {
         ...fallback.settings,
@@ -85,6 +86,10 @@ export class Store {
         telegram: {
           ...fallback.settings.telegram,
           ...(backup.settings?.telegram ?? {})
+        },
+        security: {
+          ...fallback.settings.security,
+          ...(backup.settings?.security ?? {})
         }
       }
     } as AppData;
@@ -154,11 +159,21 @@ export class Store {
       }
     }
 
+    if (data.users.length > 0 && !data.users.some((user) => user.botAdmin)) {
+      data.users[0].botAdmin = true;
+    }
+
     data.notifications ??= [];
     data.autoDeposits ??= [];
     data.deposits ??= [];
     data.debits ??= [];
+    data.latencyChecks ??= [];
     data.memberships ??= [];
+    data.settings ??= seedData().settings;
+    data.settings.telegram ??= seedData().settings.telegram;
+    data.settings.security ??= { adminPassword: "admin", adminPasswordSet: true };
+    data.settings.security.adminPassword = String(data.settings.security.adminPassword || "admin");
+    data.settings.security.adminPasswordSet = Boolean(data.settings.security.adminPassword);
     data.settings.telegram.pollingEnabled ??= false;
     data.settings.telegram.notificationTopicId ??= "";
     data.settings.telegram.updateOffset ??= 0;
@@ -224,6 +239,21 @@ export class Store {
         debit.balanceAfter = roundMoney(debit.balanceAfter);
       }
     }
+
+    for (const check of data.latencyChecks) {
+      check.userId = check.userId ? String(check.userId) : null;
+      check.serviceId = String(check.serviceId ?? "");
+      check.status = ["online", "offline", "unknown", "maintenance"].includes(check.status) ? check.status : "unknown";
+      check.latencyMs =
+        typeof check.latencyMs === "number" && Number.isFinite(check.latencyMs)
+          ? Math.max(0, Math.round(check.latencyMs))
+          : null;
+      check.checkedAt = String(check.checkedAt ?? check.createdAt ?? new Date().toISOString());
+      check.createdAt = String(check.createdAt ?? check.checkedAt);
+      check.error = String(check.error ?? "").slice(0, 240);
+    }
+
+    data.latencyChecks = data.latencyChecks.slice(0, 2000);
 
     return data;
   }

@@ -129,6 +129,26 @@ nav {
   background: rgba(255, 255, 255, 0.035);
 }
 
+.account-card {
+  display: grid;
+  grid-template-columns: 40px minmax(0, 1fr) 34px;
+  align-items: center;
+  gap: 10px;
+  padding: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.035);
+}
+
+.account-card strong,
+.account-card small {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .status-dot {
   width: 8px;
   height: 8px;
@@ -167,12 +187,96 @@ nav {
   padding: 24px;
 }
 
+.auth-screen {
+  display: grid;
+  min-height: 100vh;
+  place-items: center;
+  padding: 24px;
+}
+
+.auth-panel {
+  display: grid;
+  gap: 18px;
+  width: min(520px, 100%);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 8px;
+  background: rgba(18, 20, 25, 0.84);
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.32);
+  padding: 20px;
+}
+
+.auth-brand {
+  padding: 0;
+}
+
+.auth-heading {
+  display: grid;
+  gap: 4px;
+}
+
+.auth-users {
+  display: grid;
+  gap: 8px;
+}
+
+.auth-user {
+  display: grid;
+  grid-template-columns: 40px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  min-width: 0;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 8px;
+  color: #f4f5f7;
+  background: rgba(255, 255, 255, 0.035);
+  padding: 12px;
+  text-align: left;
+}
+
+.auth-user:hover {
+  border-color: rgba(122, 168, 255, 0.4);
+  background: rgba(122, 168, 255, 0.1);
+}
+
+.auth-user strong,
+.auth-user small {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .topbar {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 20px;
   margin-bottom: 22px;
+}
+
+.balance-alert {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin-bottom: 16px;
+  border: 1px solid rgba(248, 193, 93, 0.24);
+  border-radius: 8px;
+  color: #f7d893;
+  background: rgba(248, 193, 93, 0.08);
+  padding: 12px 14px;
+}
+
+.balance-alert strong,
+.balance-alert span {
+  display: block;
+}
+
+.balance-alert span {
+  margin-top: 2px;
+  color: #d8dbe2;
+  font-size: 13px;
 }
 
 .eyebrow {
@@ -1091,8 +1195,19 @@ td small {
 
   .brand div,
   .nav-item span,
-  .sidebar-footer span:not(.status-dot) {
+  .sidebar-footer span:not(.status-dot),
+  .account-card div {
     display: none;
+  }
+
+  .account-card {
+    grid-template-columns: 40px;
+    justify-content: center;
+  }
+
+  .account-card .icon-button {
+    width: 40px;
+    grid-row: 2;
   }
 
   .nav-item {
@@ -1142,6 +1257,11 @@ td small {
   .sidebar-footer {
     margin-left: auto;
     margin-top: 0;
+  }
+
+  .account-card {
+    grid-template-columns: 40px 34px;
+    margin-left: auto;
   }
 
   .workspace {
