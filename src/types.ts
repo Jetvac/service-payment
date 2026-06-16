@@ -14,6 +14,7 @@ export type User = {
   balance: number;
   telegramId: string;
   telegramUsername: string;
+  avatarUrl: string;
   commandDepositsBlocked: boolean;
   botAdmin: boolean;
   notes: string;

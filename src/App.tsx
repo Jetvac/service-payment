@@ -14,14 +14,12 @@ import {
   Download,
   Gauge,
   History,
-  Lock,
   Plus,
   RefreshCcw,
   Send,
   Settings2,
   Shield,
   Trash2,
-  Unlock,
   Upload,
   Wallet,
   Wrench,
@@ -64,6 +62,8 @@ type AutoDepositForm = {
   enabled: boolean;
   comment: string;
 };
+
+type CurrencyDraft = Omit<Currency, "updatedAt"> & { updatedAt?: string };
 
 type ApiResult = {
   ok: boolean;
@@ -151,6 +151,7 @@ const blankUser = {
   balance: 0,
   telegramId: "",
   telegramUsername: "",
+  avatarUrl: "",
   notes: "",
   commandDepositsBlocked: false,
   botAdmin: false
@@ -364,8 +365,56 @@ function ServiceHealthBadge({ health, compact = false }: { health: ClientHealth;
   );
 }
 
+function UserAvatar({ user, size = "normal" }: { user: Pick<User, "name" | "avatarUrl">; size?: "normal" | "large" }) {
+  const initials = (user.name || "?").slice(0, 2).toUpperCase();
+  return (
+    <span className={classNames("avatar", size === "large" && "large")}>
+      {user.avatarUrl ? <img src={user.avatarUrl} alt="" /> : initials}
+    </span>
+  );
+}
+
 function Empty({ label }: { label: string }) {
   return <div className="empty">{label}</div>;
+}
+
+function ModalShell({
+  title,
+  subtitle,
+  wide = false,
+  children,
+  footer,
+  onClose
+}: {
+  title: string;
+  subtitle?: string;
+  wide?: boolean;
+  children: ReactNode;
+  footer: ReactNode;
+  onClose: () => void;
+}) {
+  return (
+    <div className="modal-backdrop" role="presentation" onMouseDown={onClose}>
+      <section
+        className={classNames("modal-panel", wide && "wide-modal")}
+        role="dialog"
+        aria-modal="true"
+        onMouseDown={(event) => event.stopPropagation()}
+      >
+        <div className="modal-head">
+          <div>
+            <h2>{title}</h2>
+            {subtitle && <small>{subtitle}</small>}
+          </div>
+          <button className="icon-button" type="button" title="Закрыть" onClick={onClose}>
+            <X size={15} />
+          </button>
+        </div>
+        <div className="modal-body">{children}</div>
+        <div className="modal-actions">{footer}</div>
+      </section>
+    </div>
+  );
 }
 
 export default function App() {
@@ -1009,6 +1058,8 @@ function ServicesView({
 }) {
   const [draft, setDraft] = useState<Service | null>(selectedService ?? null);
   const [depositDraft, setDepositDraft] = useState<DepositForm | null>(null);
+  const [createOpen, setCreateOpen] = useState(false);
+  const [editOpen, setEditOpen] = useState(false);
 
   useEffect(() => {
     setDraft(selectedService ?? null);
@@ -1062,15 +1113,13 @@ function ServicesView({
           <button
             className="primary"
             type="button"
-            onClick={() => {
-              mutate("/api/services", serviceForm).then(() => setServiceForm(blankService));
-            }}
+            onClick={() => setCreateOpen(true)}
           >
             <Plus size={16} />
             Добавить
           </button>
         </div>
-        <div className="form-grid service-create">
+        <div className="form-grid service-create service-edit-hidden" aria-hidden="true">
           <label>
             Название
             <input value={serviceForm.name} onChange={(event) => setServiceForm({ ...serviceForm, name: event.target.value })} />
@@ -1169,9 +1218,9 @@ function ServicesView({
                   <CreditCard size={16} />
                   Списать
                 </button>
-                <button className="primary" type="button" onClick={() => saveService(draft)}>
-                  <Check size={16} />
-                  Сохранить
+                <button className="primary" type="button" onClick={() => setEditOpen(true)}>
+                  <Settings2 size={16} />
+                  Настройки
                 </button>
               </div>
             </div>
@@ -1184,7 +1233,22 @@ function ServicesView({
               <Stat icon={Activity} label="Сервер" value={selectedHealth ? healthValue(selectedHealth) : "Нет данных"} tone={selectedHealth ? healthTone(selectedHealth.status) : undefined} />
             </div>
 
-            <div className="form-grid service-edit">
+            <div className="service-overview">
+              <div>
+                <span className="muted">Заметки</span>
+                <p>{draft.notes || "Заметок пока нет"}</p>
+              </div>
+              <div>
+                <span className="muted">Мониторинг</span>
+                <p>
+                  {serviceConnection(draft).enabled && serviceConnection(draft).host
+                    ? `${serviceConnection(draft).host}:${serviceConnection(draft).port}${serviceConnection(draft).websocketPath}`
+                    : "Не настроен"}
+                </p>
+              </div>
+            </div>
+
+            <div className="form-grid service-edit service-edit-hidden" aria-hidden="true">
               <label>
                 Название
                 <input value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} />
@@ -1467,9 +1531,268 @@ function ServicesView({
               onClose={() => setDepositDraft(null)}
             />
           )}
+          {createOpen && (
+            <ServiceCreateModal
+              state={state}
+              serviceForm={serviceForm}
+              setServiceForm={setServiceForm}
+              mutate={mutate}
+              onClose={() => setCreateOpen(false)}
+            />
+          )}
+          {editOpen && draft && (
+            <ServiceEditModal
+              state={state}
+              draft={draft}
+              setDraft={setDraft}
+              deploying={deployingServiceId === draft.id}
+              deploySelectedEchoServer={deploySelectedEchoServer}
+              saveService={saveService}
+              onClose={() => {
+                setDraft(selectedService);
+                setEditOpen(false);
+              }}
+            />
+          )}
         </>
       )}
     </section>
+  );
+}
+
+function ServiceCreateModal({
+  state,
+  serviceForm,
+  setServiceForm,
+  mutate,
+  onClose
+}: {
+  state: AppState;
+  serviceForm: typeof blankService;
+  setServiceForm: (value: typeof blankService) => void;
+  mutate: (path: string, body?: unknown, method?: string) => Promise<AppState>;
+  onClose: () => void;
+}) {
+  return (
+    <ModalShell
+      title="Новый сервис"
+      onClose={onClose}
+      footer={
+        <>
+          <button className="ghost" type="button" onClick={onClose}>
+            Отмена
+          </button>
+          <button
+            className="primary"
+            type="button"
+            onClick={() => mutate("/api/services", serviceForm).then(() => {
+              setServiceForm(blankService);
+              onClose();
+            })}
+          >
+            <Plus size={16} />
+            Добавить
+          </button>
+        </>
+      }
+    >
+      <div className="form-grid modal-form">
+        <label>
+          Название
+          <input autoFocus value={serviceForm.name} onChange={(event) => setServiceForm({ ...serviceForm, name: event.target.value })} />
+        </label>
+        <label>
+          Стоимость в месяц
+          <input
+            type="number"
+            min="0"
+            step="0.01"
+            value={serviceForm.monthlyCost}
+            onChange={(event) => setServiceForm({ ...serviceForm, monthlyCost: Number(event.target.value) })}
+          />
+        </label>
+        <label>
+          Валюта
+          <select value={serviceForm.currency} onChange={(event) => setServiceForm({ ...serviceForm, currency: event.target.value })}>
+            {state.currencies.map((currency) => (
+              <option key={currency.code} value={currency.code}>
+                {currency.code}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label>
+          Интервал
+          <select value={serviceForm.period} onChange={(event) => setServiceForm({ ...serviceForm, period: event.target.value as BillingPeriod })}>
+            {Object.entries(periodNames).map(([value, label]) => (
+              <option key={value} value={value}>
+                {label}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label className="wide-field">
+          Заметки
+          <textarea value={serviceForm.notes} onChange={(event) => setServiceForm({ ...serviceForm, notes: event.target.value })} />
+        </label>
+      </div>
+    </ModalShell>
+  );
+}
+
+function ServiceEditModal({
+  state,
+  draft,
+  setDraft,
+  deploying,
+  deploySelectedEchoServer,
+  saveService,
+  onClose
+}: {
+  state: AppState;
+  draft: Service;
+  setDraft: (service: Service) => void;
+  deploying: boolean;
+  deploySelectedEchoServer: () => Promise<void>;
+  saveService: (service: Service) => Promise<AppState>;
+  onClose: () => void;
+}) {
+  const connection = serviceConnection(draft);
+  const setConnection = (next: Partial<ServiceConnectionSettings>) =>
+    setDraft({ ...draft, connection: { ...connection, ...next } });
+
+  return (
+    <ModalShell
+      title="Настройки сервиса"
+      subtitle={draft.name}
+      wide
+      onClose={onClose}
+      footer={
+        <>
+          <button className="ghost" type="button" onClick={onClose}>
+            Отмена
+          </button>
+          <button className="primary" type="button" onClick={() => saveService(draft).then(onClose)}>
+            <Check size={16} />
+            Сохранить
+          </button>
+        </>
+      }
+    >
+      <div className="form-grid modal-form service-settings-form">
+        <label>
+          Название
+          <input autoFocus value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} />
+        </label>
+        <label>
+          Описание
+          <input value={draft.description} onChange={(event) => setDraft({ ...draft, description: event.target.value })} />
+        </label>
+        <label className="wide-field">
+          Заметки
+          <textarea value={draft.notes ?? ""} onChange={(event) => setDraft({ ...draft, notes: event.target.value })} />
+        </label>
+        <label>
+          Стоимость
+          <input type="number" min="0" step="0.01" value={draft.monthlyCost} onChange={(event) => setDraft({ ...draft, monthlyCost: Number(event.target.value) })} />
+        </label>
+        <label>
+          Валюта
+          <select value={draft.currency} onChange={(event) => setDraft({ ...draft, currency: event.target.value })}>
+            {state.currencies.map((currency) => (
+              <option key={currency.code} value={currency.code}>{currency.code}</option>
+            ))}
+          </select>
+        </label>
+        <label>
+          Период
+          <select value={draft.billing.period} onChange={(event) => setDraft({ ...draft, billing: { ...draft.billing, period: event.target.value as BillingPeriod } })}>
+            {Object.entries(periodNames).map(([value, label]) => (
+              <option key={value} value={value}>{label}</option>
+            ))}
+          </select>
+        </label>
+        <label>
+          Шаг
+          <input type="number" min="1" value={draft.billing.interval} onChange={(event) => setDraft({ ...draft, billing: { ...draft.billing, interval: Number(event.target.value) } })} />
+        </label>
+        <label>
+          День месяца
+          <input type="number" min="1" max="31" value={draft.billing.anchorDay} onChange={(event) => setDraft({ ...draft, billing: { ...draft.billing, anchorDay: Number(event.target.value) } })} />
+        </label>
+        <label>
+          Час
+          <input type="number" min="0" max="23" value={draft.billing.anchorHour} onChange={(event) => setDraft({ ...draft, billing: { ...draft.billing, anchorHour: Number(event.target.value) } })} />
+        </label>
+        <label>
+          Смещение, дней
+          <input type="number" value={draft.billing.shiftDays} onChange={(event) => setDraft({ ...draft, billing: { ...draft.billing, shiftDays: Number(event.target.value) } })} />
+        </label>
+        <label>
+          Порог периодов
+          <input type="number" min="1" value={draft.billing.lowBalanceThresholdPeriods} onChange={(event) => setDraft({ ...draft, billing: { ...draft.billing, lowBalanceThresholdPeriods: Number(event.target.value) } })} />
+        </label>
+        <label className="toggle-row">
+          <input type="checkbox" checked={draft.billing.autoDebit} onChange={(event) => setDraft({ ...draft, billing: { ...draft.billing, autoDebit: event.target.checked } })} />
+          Автосписание
+        </label>
+        <label className="toggle-row">
+          <input checked={draft.active} type="checkbox" onChange={(event) => setDraft({ ...draft, active: event.target.checked })} />
+          Активен
+        </label>
+        <label className="toggle-row">
+          <input type="checkbox" checked={connection.enabled} onChange={(event) => setConnection({ enabled: event.target.checked })} />
+          Мониторинг
+        </label>
+        <label>
+          IP / host
+          <input value={connection.host} onChange={(event) => setConnection({ host: event.target.value })} />
+        </label>
+        <label>
+          SSH port
+          <input type="number" min="1" max="65535" value={connection.sshPort} onChange={(event) => setConnection({ sshPort: Number(event.target.value) })} />
+        </label>
+        <label>
+          WS port
+          <input type="number" min="1" max="65535" value={connection.port} onChange={(event) => setConnection({ port: Number(event.target.value) })} />
+        </label>
+        <label>
+          SSH user
+          <input value={connection.user} onChange={(event) => setConnection({ user: event.target.value })} />
+        </label>
+        <label>
+          SSH pass
+          <input type="password" placeholder={connection.passwordSet ? "сохранён" : ""} value={connection.password} onChange={(event) => setConnection({ password: event.target.value })} />
+        </label>
+        <label>
+          WS path
+          <input value={connection.websocketPath} onChange={(event) => setConnection({ websocketPath: event.target.value })} />
+        </label>
+        <label className="toggle-row">
+          <input type="checkbox" checked={connection.useTls} onChange={(event) => setConnection({ useTls: event.target.checked })} />
+          WSS
+        </label>
+        <div className="deploy-control">
+          <button
+            className="ghost"
+            type="button"
+            disabled={deploying || !connection.host.trim() || !connection.user.trim() || (!connection.password && !connection.passwordSet)}
+            onClick={deploySelectedEchoServer}
+          >
+            <Upload size={16} />
+            {deploying ? "Развёртывание..." : "Развернуть echo-сервер"}
+          </button>
+          {connection.lastDeployStatus !== "unknown" && (
+            <details className={classNames("deploy-log", connection.lastDeployStatus)}>
+              <summary>
+                {connection.lastDeployStatus === "success" ? "Последний деплой успешен" : "Последний деплой не удался"} · {dateTime(connection.lastDeployAt)}
+              </summary>
+              <pre>{connection.lastDeployOutput || "Лог пуст"}</pre>
+            </details>
+          )}
+        </div>
+      </div>
+    </ModalShell>
   );
 }
 
@@ -1480,7 +1803,8 @@ function DepositModal({
   mutate,
   serviceById,
   userById,
-  onClose
+  onClose,
+  showTargets = false
 }: {
   state: AppState;
   depositForm: DepositForm;
@@ -1489,67 +1813,96 @@ function DepositModal({
   serviceById: (id: string) => Service | undefined;
   userById: (id: string) => User | undefined;
   onClose: () => void;
+  showTargets?: boolean;
 }) {
   const service = serviceById(depositForm.serviceId);
-  const user = userById(depositForm.userId);
+  const members = state.memberships.filter((membership) => membership.serviceId === depositForm.serviceId && membership.active);
+  const selectedUserIsMember = members.some((membership) => membership.userId === depositForm.userId);
+  const depositUserId = selectedUserIsMember ? depositForm.userId : members[0]?.userId ?? "";
+  const user = userById(depositUserId);
 
   return (
-    <div className="modal-backdrop" role="presentation" onMouseDown={onClose}>
-      <section className="modal-panel" role="dialog" aria-modal="true" onMouseDown={(event) => event.stopPropagation()}>
-        <div className="modal-head">
-          <div>
-            <h2>Зачисление</h2>
-            <small>
-              {service?.name ?? "Сервис"} · {user?.name ?? "Участник"}
-            </small>
-          </div>
-          <button className="icon-button" type="button" title="Закрыть" onClick={onClose}>
-            <X size={15} />
-          </button>
-        </div>
-        <div className="form-grid modal-form">
-          <label>
-            Сумма
-            <input
-              autoFocus
-              type="number"
-              min="0"
-              step="0.01"
-              value={depositForm.amount}
-              onChange={(event) => setDepositForm({ ...depositForm, amount: Number(event.target.value) })}
-            />
-          </label>
-          <label>
-            Валюта
-            <select value={depositForm.currency} onChange={(event) => setDepositForm({ ...depositForm, currency: event.target.value })}>
-              {state.currencies.map((currency) => (
-                <option key={currency.code} value={currency.code}>
-                  {currency.code}
-                </option>
-              ))}
-            </select>
-          </label>
-          <label className="wide-field">
-            Комментарий
-            <input value={depositForm.comment} onChange={(event) => setDepositForm({ ...depositForm, comment: event.target.value })} />
-          </label>
-        </div>
-        <div className="modal-actions">
+    <ModalShell
+      title="Зачисление"
+      subtitle={`${service?.name ?? "Сервис"} · ${user?.name ?? "Участник"}`}
+      onClose={onClose}
+      footer={
+        <>
           <button className="ghost" type="button" onClick={onClose}>
             Отмена
           </button>
-          <button
-            className="primary"
-            type="button"
-            disabled={depositForm.amount <= 0}
-            onClick={() => mutate("/api/deposits", depositForm).then(onClose)}
-          >
+          <button className="primary" type="button" disabled={!depositUserId || depositForm.amount <= 0} onClick={() => mutate("/api/deposits", { ...depositForm, userId: depositUserId }).then(onClose)}>
             <Plus size={16} />
             Зачислить
           </button>
-        </div>
-      </section>
-    </div>
+        </>
+      }
+    >
+      <div className="form-grid modal-form">
+        {showTargets && (
+          <>
+            <label>
+              Сервис
+              <select
+                autoFocus
+                value={depositForm.serviceId}
+                onChange={(event) => {
+                  const nextService = serviceById(event.target.value);
+                  const member = state.memberships.find((membership) => membership.serviceId === event.target.value && membership.active);
+                  setDepositForm({
+                    ...depositForm,
+                    serviceId: event.target.value,
+                    userId: member?.userId ?? "",
+                    currency: nextService?.currency ?? depositForm.currency
+                  });
+                }}
+              >
+                {state.services.map((item) => (
+                  <option key={item.id} value={item.id}>
+                    {item.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label>
+              Участник
+              <select value={depositUserId} onChange={(event) => setDepositForm({ ...depositForm, userId: event.target.value })}>
+                {members.map((membership) => (
+                  <option key={membership.id} value={membership.userId}>
+                    {userById(membership.userId)?.name ?? "Участник"}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </>
+        )}
+        <label>
+          Сумма
+          <input
+            autoFocus={!showTargets}
+            type="number"
+            min="0"
+            step="0.01"
+            value={depositForm.amount}
+            onChange={(event) => setDepositForm({ ...depositForm, amount: Number(event.target.value) })}
+          />
+        </label>
+        <label>
+          Валюта
+          <select value={depositForm.currency} onChange={(event) => setDepositForm({ ...depositForm, currency: event.target.value })}>
+            {state.currencies.map((currency) => (
+              <option key={currency.code} value={currency.code}>
+                {currency.code}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label className="wide-field">
+          Комментарий
+          <input value={depositForm.comment} onChange={(event) => setDepositForm({ ...depositForm, comment: event.target.value })} />
+        </label>
+      </div>
+    </ModalShell>
   );
 }
 
@@ -1570,6 +1923,8 @@ function PeopleView({
   mutate: (path: string, body?: unknown, method?: string) => Promise<AppState>;
   saveUser: (user: User) => Promise<AppState>;
 }) {
+  const [createOpen, setCreateOpen] = useState(false);
+
   return (
     <section className="page-grid">
       <div className="panel wide">
@@ -1578,15 +1933,13 @@ function PeopleView({
           <button
             className="primary"
             type="button"
-            onClick={() => {
-              mutate("/api/users", userForm).then(() => setUserForm(blankUser));
-            }}
+            onClick={() => setCreateOpen(true)}
           >
             <UserPlus size={16} />
             Добавить
           </button>
         </div>
-        <div className="form-grid user-create">
+        <div className="form-grid user-create service-edit-hidden" aria-hidden="true">
           <label>
             Имя
             <input value={userForm.name} onChange={(event) => setUserForm({ ...userForm, name: event.target.value })} />
@@ -1608,6 +1961,22 @@ function PeopleView({
           </label>
         </div>
       </div>
+
+      {createOpen && (
+        <UserEditModal
+          title="Новый участник"
+          draft={userForm}
+          setDraft={setUserForm}
+          onClose={() => setCreateOpen(false)}
+          onSave={(nextUser) =>
+            mutate("/api/users", nextUser).then((nextState) => {
+              setUserForm(blankUser);
+              setCreateOpen(false);
+              return nextState;
+            })
+          }
+        />
+      )}
 
       <div className="panel wide">
         <div className="panel-head">
@@ -1645,6 +2014,7 @@ function AutoDepositsPanel({
   mutate: (path: string, body?: unknown, method?: string) => Promise<AppState>;
 }) {
   const [form, setForm] = useState<AutoDepositForm>(() => autoDepositDefaults(state));
+  const [createOpen, setCreateOpen] = useState(false);
   const serviceOptions = activeServicesForUser(state, form.userId);
 
   useEffect(() => {
@@ -1664,12 +2034,12 @@ function AutoDepositsPanel({
     <div className="panel wide">
       <div className="panel-head">
         <h2>Автоплатежи</h2>
-        <button className="primary" type="button" disabled={!form.userId || !form.serviceId || form.amount <= 0} onClick={createAutoDeposit}>
+        <button className="primary" type="button" disabled={!form.userId || !form.serviceId} onClick={() => setCreateOpen(true)}>
           <CalendarPlus size={16} />
           Добавить
         </button>
       </div>
-      <div className="form-grid auto-payment-form">
+      <div className="form-grid auto-payment-form service-edit-hidden" aria-hidden="true">
         <label>
           Участник
           <select
@@ -1754,6 +2124,17 @@ function AutoDepositsPanel({
           <input value={form.comment} onChange={(event) => setForm({ ...form, comment: event.target.value })} />
         </label>
       </div>
+      {createOpen && (
+        <AutoDepositModal
+          title="Новый автоплатеж"
+          state={state}
+          form={form}
+          setForm={setForm}
+          serviceOptions={serviceOptions}
+          onClose={() => setCreateOpen(false)}
+          onSave={() => createAutoDeposit().then(() => setCreateOpen(false))}
+        />
+      )}
       <div className="auto-payment-list">
         {(state.autoDeposits ?? []).map((schedule) => (
           <AutoDepositRow
@@ -1785,6 +2166,7 @@ function AutoDepositRow({
   mutate: (path: string, body?: unknown, method?: string) => Promise<AppState>;
 }) {
   const [draft, setDraft] = useState<AutoDeposit>(schedule);
+  const [editing, setEditing] = useState(false);
   const serviceOptions = activeServicesForUser(state, draft.userId);
 
   useEffect(() => setDraft(schedule), [schedule]);
@@ -1798,108 +2180,142 @@ function AutoDepositRow({
 
   return (
     <article className={classNames("auto-payment-row", !draft.enabled && "disabled")}>
-      <label>
-        Участник
-        <select
-          value={draft.userId}
-          onChange={(event) => {
-            const services = activeServicesForUser(state, event.target.value);
-            setDraft({
-              ...draft,
-              userId: event.target.value,
-              serviceId: services[0]?.id ?? "",
-              currency: services[0]?.currency ?? draft.currency
-            });
-          }}
-        >
-          {state.users.map((user) => (
-            <option key={user.id} value={user.id}>
-              {user.name}
-            </option>
-          ))}
-        </select>
-      </label>
-      <label>
-        Сервис
-        <select
-          value={draft.serviceId}
-          disabled={!serviceOptions.length}
-          onChange={(event) => setDraft({ ...draft, serviceId: event.target.value })}
-        >
-          {serviceOptions.map((service) => (
-            <option key={service.id} value={service.id}>
-              {service.name}
-            </option>
-          ))}
-        </select>
-      </label>
-      <label>
-        Сумма
-        <input
-          type="number"
-          min="0"
-          step="0.01"
-          value={draft.amount}
-          onChange={(event) => setDraft({ ...draft, amount: Number(event.target.value) })}
-        />
-      </label>
-      <label>
-        Валюта
-        <select value={draft.currency} onChange={(event) => setDraft({ ...draft, currency: event.target.value })}>
-          {state.currencies.map((currency) => (
-            <option key={currency.code} value={currency.code}>
-              {currency.code}
-            </option>
-          ))}
-        </select>
-      </label>
-      <label>
-        День
-        <input
-          type="number"
-          min="1"
-          max="31"
-          value={draft.dayOfMonth}
-          onChange={(event) => setDraft({ ...draft, dayOfMonth: Number(event.target.value) })}
-        />
-      </label>
-      <label>
-        Час
-        <input
-          type="number"
-          min="0"
-          max="23"
-          value={draft.hour}
-          onChange={(event) => setDraft({ ...draft, hour: Number(event.target.value) })}
-        />
-      </label>
-      <label className="toggle-row auto-toggle">
-        <input type="checkbox" checked={draft.enabled} onChange={(event) => setDraft({ ...draft, enabled: event.target.checked })} />
-        Вкл
-      </label>
-      <label className="wide-field">
-        Комментарий
-        <input value={draft.comment} onChange={(event) => setDraft({ ...draft, comment: event.target.value })} />
-      </label>
-      <div className="auto-payment-meta">
-        <span>Следующий: {dateTime(draft.nextDepositAt)}</span>
-        <span>Последний: {dateTime(draft.lastDepositedAt)}</span>
-        <span>
-          {userById(draft.userId)?.name ?? "Участник"} · {serviceById(draft.serviceId)?.name ?? "Сервис"}
-        </span>
+      <div className="auto-payment-summary">
+        <strong>
+          {userById(schedule.userId)?.name ?? "Участник"} · {money(schedule.amount, schedule.currency)}
+        </strong>
+        <small>
+          {serviceById(schedule.serviceId)?.name ?? "Сервис"} · {schedule.dayOfMonth} число, {schedule.hour}:00 ·{" "}
+          {schedule.enabled ? "активен" : "выключен"}
+        </small>
+        <small>Следующий: {dateTime(schedule.nextDepositAt)}</small>
       </div>
       <div className="auto-payment-actions">
-        <button className="ghost compact" type="button" disabled={!draft.serviceId || draft.amount <= 0} onClick={() => mutate(`/api/auto-deposits/${draft.id}/run`, {})}>
+        <button className="ghost compact" type="button" disabled={!schedule.serviceId || schedule.amount <= 0} onClick={() => mutate(`/api/auto-deposits/${schedule.id}/run`, {})}>
           Сейчас
         </button>
-        <button className="ghost compact" type="button" disabled={!draft.serviceId || draft.amount <= 0} onClick={() => mutate(`/api/auto-deposits/${draft.id}`, draft, "PUT")}>
-          Сохранить
+        <button className="ghost compact" type="button" onClick={() => setEditing(true)}>
+          Изменить
         </button>
-        <button className="icon-button danger" type="button" title="Удалить" onClick={() => mutate(`/api/auto-deposits/${draft.id}`, undefined, "DELETE")}>
+        <button className="icon-button danger" type="button" title="Удалить" onClick={() => mutate(`/api/auto-deposits/${schedule.id}`, undefined, "DELETE")}>
           <Trash2 size={15} />
         </button>
       </div>
+      {editing && (
+        <AutoDepositModal
+          title="Автоплатеж"
+          state={state}
+          form={draft}
+          setForm={setDraft}
+          serviceOptions={serviceOptions}
+          onClose={() => {
+            setDraft(schedule);
+            setEditing(false);
+          }}
+          onSave={() => mutate(`/api/auto-deposits/${draft.id}`, draft, "PUT").then(() => setEditing(false))}
+        />
+      )}
     </article>
+  );
+}
+
+function AutoDepositModal({
+  title,
+  state,
+  form,
+  setForm,
+  serviceOptions,
+  onSave,
+  onClose
+}: {
+  title: string;
+  state: AppState;
+  form: AutoDepositForm | AutoDeposit;
+  setForm: (value: any) => void;
+  serviceOptions: Service[];
+  onSave: () => Promise<unknown>;
+  onClose: () => void;
+}) {
+  return (
+    <ModalShell
+      title={title}
+      onClose={onClose}
+      footer={
+        <>
+          <button className="ghost" type="button" onClick={onClose}>
+            Отмена
+          </button>
+          <button className="primary" type="button" disabled={!form.serviceId || form.amount <= 0} onClick={() => onSave()}>
+            <Check size={16} />
+            Сохранить
+          </button>
+        </>
+      }
+    >
+      <div className="form-grid modal-form">
+        <label>
+          Участник
+          <select
+            value={form.userId}
+            onChange={(event) => {
+              const services = activeServicesForUser(state, event.target.value);
+              setForm({
+                ...form,
+                userId: event.target.value,
+                serviceId: services[0]?.id ?? "",
+                currency: services[0]?.currency ?? form.currency
+              });
+            }}
+          >
+            {state.users.map((user) => (
+              <option key={user.id} value={user.id}>
+                {user.name}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label>
+          Сервис
+          <select value={form.serviceId} disabled={!serviceOptions.length} onChange={(event) => setForm({ ...form, serviceId: event.target.value })}>
+            {serviceOptions.map((service) => (
+              <option key={service.id} value={service.id}>
+                {service.name}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label>
+          Сумма
+          <input type="number" min="0" step="0.01" value={form.amount} onChange={(event) => setForm({ ...form, amount: Number(event.target.value) })} />
+        </label>
+        <label>
+          Валюта
+          <select value={form.currency} onChange={(event) => setForm({ ...form, currency: event.target.value })}>
+            {state.currencies.map((currency) => (
+              <option key={currency.code} value={currency.code}>
+                {currency.code}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label>
+          День месяца
+          <input type="number" min="1" max="31" value={form.dayOfMonth} onChange={(event) => setForm({ ...form, dayOfMonth: Number(event.target.value) })} />
+        </label>
+        <label>
+          Час
+          <input type="number" min="0" max="23" value={form.hour} onChange={(event) => setForm({ ...form, hour: Number(event.target.value) })} />
+        </label>
+        <label className="toggle-row">
+          <input type="checkbox" checked={form.enabled} onChange={(event) => setForm({ ...form, enabled: event.target.checked })} />
+          Активен
+        </label>
+        <label className="wide-field">
+          Комментарий
+          <textarea value={form.comment} onChange={(event) => setForm({ ...form, comment: event.target.value })} />
+        </label>
+      </div>
+    </ModalShell>
   );
 }
 
@@ -1917,54 +2333,29 @@ function UserCard({
   onDelete: () => Promise<AppState>;
 }) {
   const [draft, setDraft] = useState(user);
+  const [editing, setEditing] = useState(false);
 
   useEffect(() => setDraft(user), [user]);
 
   const memberships = state.memberships.filter((membership) => membership.userId === user.id && membership.active);
 
   return (
-    <article className="person-card">
-      <div className="person-head">
-        <span className="avatar">{draft.name.slice(0, 2).toUpperCase()}</span>
+    <article className="person-card compact-person">
+      <div className="person-head compact">
+        <UserAvatar user={user} />
         <div>
-          <input className="inline-input strong" value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} />
-          <small>{draft.telegramUsername ? `@${draft.telegramUsername}` : "Telegram username"}</small>
+          <strong>{user.name}</strong>
+          <small>{user.telegramUsername ? `@${user.telegramUsername}` : user.telegramId || "Telegram не задан"}</small>
         </div>
-        <button
-          className={classNames("lock-button", draft.commandDepositsBlocked && "locked")}
-          type="button"
-          onClick={() => setDraft({ ...draft, commandDepositsBlocked: !draft.commandDepositsBlocked })}
-          title={draft.commandDepositsBlocked ? "Разрешить команду" : "Заблокировать команду"}
-        >
-          {draft.commandDepositsBlocked ? <Lock size={15} /> : <Unlock size={15} />}
-        </button>
-        <button
-          className={classNames("lock-button", draft.botAdmin && "admin")}
-          type="button"
-          onClick={() => setDraft({ ...draft, botAdmin: !draft.botAdmin })}
-          title={draft.botAdmin ? "Убрать администратора бота" : "Сделать администратором бота"}
-        >
-          <Shield size={15} />
-        </button>
-      </div>
-      <div className="form-grid person-fields">
-        <label>
-          Telegram ID
-          <input value={draft.telegramId} onChange={(event) => setDraft({ ...draft, telegramId: event.target.value })} />
-        </label>
-        <label>
-          Username
-          <input value={draft.telegramUsername} onChange={(event) => setDraft({ ...draft, telegramUsername: event.target.value })} />
-        </label>
-        <label className="wide-field">
-          Заметка
-          <input value={draft.notes} onChange={(event) => setDraft({ ...draft, notes: event.target.value })} />
-        </label>
+        <div className="person-flags">
+          {user.commandDepositsBlocked && <span className="status-pill cancelled">команда закрыта</span>}
+          {user.botAdmin && <span className="status-pill reversal">админ</span>}
+        </div>
       </div>
       <div className="balance-stack">
         <div className="balance-row">
           <span>Общий баланс</span>
-          <strong className={classNames(draft.balance < 0 && "text-danger")}>{money(draft.balance, "RUB")}</strong>
+          <strong className={classNames(user.balance < 0 && "text-danger")}>{money(user.balance, "RUB")}</strong>
         </div>
         {memberships.map((membership) => {
           const service = serviceById(membership.serviceId);
@@ -1982,12 +2373,101 @@ function UserCard({
           <Trash2 size={15} />
           Удалить
         </button>
-        <button className="primary" type="button" onClick={() => onSave(draft)}>
-          <Check size={15} />
-          Сохранить
+        <button className="primary" type="button" onClick={() => setEditing(true)}>
+          <Settings2 size={15} />
+          Изменить
         </button>
       </div>
+      {editing && (
+        <UserEditModal
+          title="Участник"
+          draft={draft}
+          setDraft={setDraft}
+          onClose={() => {
+            setDraft(user);
+            setEditing(false);
+          }}
+          onSave={(nextUser) => onSave(nextUser as User).then((nextState) => {
+            setEditing(false);
+            return nextState;
+          })}
+        />
+      )}
     </article>
+  );
+}
+
+function UserEditModal({
+  title,
+  draft,
+  setDraft,
+  onSave,
+  onClose
+}: {
+  title: string;
+  draft: User | typeof blankUser;
+  setDraft: (value: any) => void;
+  onSave: (user: User | typeof blankUser) => Promise<AppState>;
+  onClose: () => void;
+}) {
+  return (
+    <ModalShell
+      title={title}
+      onClose={onClose}
+      footer={
+        <>
+          <button className="ghost" type="button" onClick={onClose}>
+            Отмена
+          </button>
+          <button className="primary" type="button" onClick={() => onSave(draft)}>
+            <Check size={16} />
+            Сохранить
+          </button>
+        </>
+      }
+    >
+      <div className="person-modal-head">
+        <UserAvatar user={draft} size="large" />
+        <div>
+          <strong>{draft.name || "Новый участник"}</strong>
+          <small>{draft.telegramUsername ? `@${draft.telegramUsername}` : draft.telegramId || "Telegram не задан"}</small>
+        </div>
+      </div>
+      <div className="form-grid modal-form">
+        <label>
+          Имя
+          <input autoFocus value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} />
+        </label>
+        <label>
+          Баланс, RUB
+          <input type="number" step="0.01" value={draft.balance} onChange={(event) => setDraft({ ...draft, balance: Number(event.target.value) })} />
+        </label>
+        <label>
+          Telegram ID
+          <input value={draft.telegramId} onChange={(event) => setDraft({ ...draft, telegramId: event.target.value })} />
+        </label>
+        <label>
+          Username
+          <input value={draft.telegramUsername} onChange={(event) => setDraft({ ...draft, telegramUsername: event.target.value })} />
+        </label>
+        <label className="toggle-row">
+          <input
+            type="checkbox"
+            checked={draft.commandDepositsBlocked}
+            onChange={(event) => setDraft({ ...draft, commandDepositsBlocked: event.target.checked })}
+          />
+          Запретить пополнение через бота
+        </label>
+        <label className="toggle-row">
+          <input type="checkbox" checked={draft.botAdmin} onChange={(event) => setDraft({ ...draft, botAdmin: event.target.checked })} />
+          Администратор бота
+        </label>
+        <label className="wide-field">
+          Заметка
+          <textarea value={draft.notes} onChange={(event) => setDraft({ ...draft, notes: event.target.value })} />
+        </label>
+      </div>
+    </ModalShell>
   );
 }
 
@@ -2010,6 +2490,7 @@ function LedgerView({
   const members = state.memberships.filter((membership) => membership.serviceId === depositForm.serviceId && membership.active);
   const selectedUserIsMember = members.some((membership) => membership.userId === depositForm.userId);
   const depositUserId = selectedUserIsMember ? depositForm.userId : members[0]?.userId ?? "";
+  const [depositOpen, setDepositOpen] = useState(false);
 
   useEffect(() => {
     if (!depositForm.serviceId && state.services[0]) {
@@ -2024,11 +2505,6 @@ function LedgerView({
     }
   }, [depositForm.serviceId, depositForm.userId, depositUserId, selectedService?.currency, state.memberships, state.services]);
 
-  const submitDeposit = () =>
-    mutate("/api/deposits", { ...depositForm, userId: depositUserId }).then(() =>
-      setDepositForm({ ...depositForm, userId: depositUserId, amount: 0, comment: "", currency: selectedService?.currency ?? depositForm.currency })
-    );
-
   return (
     <section className="page-grid">
       <div className="panel wide">
@@ -2037,14 +2513,14 @@ function LedgerView({
           <button
             className="primary"
             type="button"
-            disabled={!depositUserId || depositForm.amount <= 0}
-            onClick={submitDeposit}
+            disabled={!depositUserId}
+            onClick={() => setDepositOpen(true)}
           >
             <Plus size={16} />
-            Зачислить
+            Добавить
           </button>
         </div>
-        <div className="form-grid deposit-form">
+        <div className="form-grid deposit-form service-edit-hidden" aria-hidden="true">
           <label>
             Сервис
             <select
@@ -2102,6 +2578,18 @@ function LedgerView({
             <input value={depositForm.comment} onChange={(event) => setDepositForm({ ...depositForm, comment: event.target.value })} />
           </label>
         </div>
+        {depositOpen && (
+          <DepositModal
+            state={state}
+            depositForm={depositForm}
+            setDepositForm={setDepositForm}
+            mutate={mutate}
+            serviceById={serviceById}
+            userById={userById}
+            showTargets
+            onClose={() => setDepositOpen(false)}
+          />
+        )}
       </div>
 
       <HistoryTable
@@ -2242,6 +2730,8 @@ function BotView({
   updateApplication: () => Promise<SystemUpdateResult>;
 }) {
   const [telegram, setTelegram] = useState(state.settings.telegram);
+  const [telegramOpen, setTelegramOpen] = useState(false);
+  const [currencyOpen, setCurrencyOpen] = useState(false);
   const [updating, setUpdating] = useState(false);
   const webhookUrl = `${window.location.origin.replace(/\/$/, "")}/api/telegram/webhook/${telegram.webhookSecret}`;
   const [publicWebhookUrl, setPublicWebhookUrl] = useState(webhookUrl);
@@ -2271,9 +2761,9 @@ function BotView({
       <div className="panel wide">
         <div className="panel-head">
           <h2>Настройки бота</h2>
-          <button className="primary" type="button" onClick={() => saveTelegram(telegram)}>
-            <Send size={16} />
-            Сохранить
+          <button className="primary" type="button" onClick={() => setTelegramOpen(true)}>
+            <Settings2 size={16} />
+            Настройки
           </button>
         </div>
         <div className="bot-quick-actions">
@@ -2290,7 +2780,7 @@ function BotView({
             {telegram.pollingEnabled ? "Stop polling" : "Polling"}
           </button>
         </div>
-        <div className="form-grid bot-form">
+        <div className="form-grid bot-form service-edit-hidden" aria-hidden="true">
           <label className="toggle-row">
             <input checked={telegram.enabled} type="checkbox" onChange={(event) => setTelegram({ ...telegram, enabled: event.target.checked })} />
             Включён
@@ -2339,6 +2829,16 @@ function BotView({
             {telegram.lastError && <span className="text-danger">{telegram.lastError}</span>}
           </div>
         </div>
+        {telegramOpen && (
+          <TelegramSettingsModal
+            telegram={telegram}
+            setTelegram={setTelegram}
+            publicWebhookUrl={publicWebhookUrl}
+            setPublicWebhookUrl={setPublicWebhookUrl}
+            onClose={() => setTelegramOpen(false)}
+            onSave={() => saveTelegram(telegram).then(() => setTelegramOpen(false))}
+          />
+        )}
       </div>
 
       <div className="panel wide">
@@ -2379,15 +2879,13 @@ function BotView({
           <button
             className="primary"
             type="button"
-            onClick={() => {
-              mutate("/api/currencies", currencyForm).then(() => setCurrencyForm({ code: "", name: "", symbol: "", rateToRub: 1 }));
-            }}
+            onClick={() => setCurrencyOpen(true)}
           >
             <Plus size={16} />
             Добавить
           </button>
         </div>
-        <div className="form-grid currency-form">
+        <div className="form-grid currency-form service-edit-hidden" aria-hidden="true">
           <label>
             Код
             <input value={currencyForm.code} onChange={(event) => setCurrencyForm({ ...currencyForm, code: event.target.value })} />
@@ -2416,6 +2914,21 @@ function BotView({
             <CurrencyRow key={currency.code} currency={currency} onSave={saveCurrency} />
           ))}
         </div>
+        {currencyOpen && (
+          <CurrencyModal
+            title="Новая валюта"
+            currency={currencyForm}
+            setCurrency={setCurrencyForm}
+            onClose={() => setCurrencyOpen(false)}
+            onSave={() =>
+              mutate("/api/currencies", currencyForm).then((nextState) => {
+                setCurrencyForm({ code: "", name: "", symbol: "", rateToRub: 1 });
+                setCurrencyOpen(false);
+                return nextState;
+              })
+            }
+          />
+        )}
       </div>
 
       <div className="panel">
@@ -2450,26 +2963,177 @@ function BotView({
   );
 }
 
+function TelegramSettingsModal({
+  telegram,
+  setTelegram,
+  publicWebhookUrl,
+  setPublicWebhookUrl,
+  onSave,
+  onClose
+}: {
+  telegram: TelegramSettings;
+  setTelegram: (value: TelegramSettings) => void;
+  publicWebhookUrl: string;
+  setPublicWebhookUrl: (value: string) => void;
+  onSave: () => Promise<unknown>;
+  onClose: () => void;
+}) {
+  return (
+    <ModalShell
+      title="Настройки бота"
+      wide
+      onClose={onClose}
+      footer={
+        <>
+          <button className="ghost" type="button" onClick={onClose}>
+            Отмена
+          </button>
+          <button className="primary" type="button" onClick={() => onSave()}>
+            <Check size={16} />
+            Сохранить
+          </button>
+        </>
+      }
+    >
+      <div className="form-grid modal-form">
+        <label className="toggle-row">
+          <input checked={telegram.enabled} type="checkbox" onChange={(event) => setTelegram({ ...telegram, enabled: event.target.checked })} />
+          Включён
+        </label>
+        <label className="toggle-row">
+          <input
+            checked={telegram.lowBalanceNotifications}
+            type="checkbox"
+            onChange={(event) => setTelegram({ ...telegram, lowBalanceNotifications: event.target.checked })}
+          />
+          Малый остаток
+        </label>
+        <label>
+          Chat ID
+          <input autoFocus value={telegram.chatId} onChange={(event) => setTelegram({ ...telegram, chatId: event.target.value })} />
+        </label>
+        <label>
+          Topic ID
+          <input value={telegram.notificationTopicId} onChange={(event) => setTelegram({ ...telegram, notificationTopicId: event.target.value })} />
+        </label>
+        <label className="wide-field">
+          Bot token
+          <input type="password" value={telegram.botToken} onChange={(event) => setTelegram({ ...telegram, botToken: event.target.value })} />
+        </label>
+        <label className="wide-field">
+          Webhook secret
+          <input value={telegram.webhookSecret} onChange={(event) => setTelegram({ ...telegram, webhookSecret: event.target.value })} />
+        </label>
+        <label className="wide-field">
+          Webhook URL
+          <input value={publicWebhookUrl} onChange={(event) => setPublicWebhookUrl(event.target.value)} />
+        </label>
+        <div className="bot-diagnostics wide-field">
+          <span className={classNames("status-pill", telegram.pollingEnabled && "reversal")}>
+            {telegram.pollingEnabled ? "Polling включён" : "Polling выключен"}
+          </span>
+          <span>Топик уведомлений: {telegram.notificationTopicId || "не задан"}</span>
+          <span>Последний update: {dateTime(telegram.lastUpdateAt)}</span>
+          {telegram.lastError && <span className="text-danger">{telegram.lastError}</span>}
+        </div>
+      </div>
+    </ModalShell>
+  );
+}
+
+function CurrencyModal({
+  title,
+  currency,
+  setCurrency,
+  onSave,
+  onClose,
+  codeReadOnly = false
+}: {
+  title: string;
+  currency: CurrencyDraft;
+  setCurrency: (value: any) => void;
+  onSave: () => Promise<unknown>;
+  onClose: () => void;
+  codeReadOnly?: boolean;
+}) {
+  return (
+    <ModalShell
+      title={title}
+      onClose={onClose}
+      footer={
+        <>
+          <button className="ghost" type="button" onClick={onClose}>
+            Отмена
+          </button>
+          <button className="primary" type="button" disabled={!currency.code.trim() || !currency.name.trim()} onClick={() => onSave()}>
+            <Check size={16} />
+            Сохранить
+          </button>
+        </>
+      }
+    >
+      <div className="form-grid modal-form">
+        <label>
+          Код
+          <input autoFocus={!codeReadOnly} readOnly={codeReadOnly} value={currency.code} onChange={(event) => setCurrency({ ...currency, code: event.target.value.toUpperCase() })} />
+        </label>
+        <label>
+          Название
+          <input autoFocus={codeReadOnly} value={currency.name} onChange={(event) => setCurrency({ ...currency, name: event.target.value })} />
+        </label>
+        <label>
+          Символ
+          <input value={currency.symbol} onChange={(event) => setCurrency({ ...currency, symbol: event.target.value })} />
+        </label>
+        <label>
+          Курс к RUB
+          <input
+            type="number"
+            min="0"
+            step="0.0001"
+            value={currency.rateToRub}
+            onChange={(event) => setCurrency({ ...currency, rateToRub: Number(event.target.value) })}
+          />
+        </label>
+      </div>
+    </ModalShell>
+  );
+}
+
 function CurrencyRow({ currency, onSave }: { currency: Currency; onSave: (currency: Currency) => Promise<AppState> }) {
   const [draft, setDraft] = useState(currency);
+  const [editing, setEditing] = useState(false);
 
   useEffect(() => setDraft(currency), [currency]);
 
   return (
     <article className="currency-row">
       <strong>{draft.code}</strong>
-      <input value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} />
-      <input value={draft.symbol} onChange={(event) => setDraft({ ...draft, symbol: event.target.value })} />
-      <input
-        type="number"
-        min="0"
-        step="0.0001"
-        value={draft.rateToRub}
-        onChange={(event) => setDraft({ ...draft, rateToRub: Number(event.target.value) })}
-      />
-      <button className="icon-button" type="button" title="Сохранить" onClick={() => onSave(draft)}>
-        <Check size={15} />
+      <div className="currency-summary">
+        <span>{draft.name}</span>
+        <small>
+          {draft.symbol || "без символа"} · {Number(draft.rateToRub || 0).toLocaleString("ru-RU", { maximumFractionDigits: 4 })} RUB
+        </small>
+      </div>
+      <button className="ghost compact" type="button" onClick={() => setEditing(true)}>
+        Изменить
       </button>
+      {editing && (
+        <CurrencyModal
+          title={`Валюта ${draft.code}`}
+          currency={draft}
+          setCurrency={setDraft}
+          codeReadOnly
+          onClose={() => {
+            setDraft(currency);
+            setEditing(false);
+          }}
+          onSave={() => onSave(draft).then((nextState) => {
+            setEditing(false);
+            return nextState;
+          })}
+        />
+      )}
     </article>
   );
 }

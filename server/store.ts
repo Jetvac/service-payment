@@ -136,6 +136,7 @@ export class Store {
       user.botAdmin ??= false;
       user.telegramId ??= "";
       user.telegramUsername ??= "";
+      user.avatarUrl ??= "";
       const legacyBalances = (data.memberships ?? []).filter(
         (membership) => membership.userId === user.id && typeof membership.balance === "number"
       );

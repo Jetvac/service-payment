@@ -185,6 +185,58 @@ function normalizeHealthStatus(value: unknown): ServiceHealthStatus {
   return value === "online" || value === "offline" || value === "unknown" || value === "maintenance" ? value : "unknown";
 }
 
+async function telegramJson(token: string, method: string, body: Record<string, unknown>) {
+  const response = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  });
+  return (await response.json().catch(() => null)) as {
+    ok?: boolean;
+    result?: {
+      photos?: Array<Array<{ file_id: string; file_size?: number }>>;
+      file_path?: string;
+    };
+  } | null;
+}
+
+async function tryFetchTelegramAvatar(data: AppData, user: User) {
+  const token = data.settings.telegram.botToken;
+  const telegramId = user.telegramId.trim();
+  if (!token || !telegramId) return user.avatarUrl ?? "";
+
+  try {
+    const photos = await telegramJson(token, "getUserProfilePhotos", { user_id: telegramId, limit: 1 });
+    const sizes = photos?.ok ? photos.result?.photos?.[0] ?? [] : [];
+    const photo = sizes.sort((a, b) => (a.file_size ?? 0) - (b.file_size ?? 0)).at(-1);
+    if (!photo?.file_id) return user.avatarUrl ?? "";
+
+    const file = await telegramJson(token, "getFile", { file_id: photo.file_id });
+    const filePath = file?.ok ? file.result?.file_path : "";
+    if (!filePath) return user.avatarUrl ?? "";
+
+    const image = await fetch(`https://api.telegram.org/file/bot${token}/${filePath}`);
+    if (!image.ok) return user.avatarUrl ?? "";
+    const contentType = image.headers.get("content-type") || "image/jpeg";
+    const bytes = Buffer.from(await image.arrayBuffer());
+    if (!bytes.length || bytes.length > 1024 * 1024) return user.avatarUrl ?? "";
+    return `data:${contentType};base64,${bytes.toString("base64")}`;
+  } catch {
+    return user.avatarUrl ?? "";
+  }
+}
+
+function applyUserInput(user: User, body: Partial<User>) {
+  user.name = String(body.name ?? user.name).trim() || user.name;
+  user.balance = roundMoney(normalizeNumber(body.balance, user.balance));
+  user.telegramId = String(body.telegramId ?? user.telegramId).trim();
+  user.telegramUsername = String(body.telegramUsername ?? user.telegramUsername).trim().replace(/^@/, "");
+  user.avatarUrl = String(body.avatarUrl ?? user.avatarUrl ?? "");
+  user.commandDepositsBlocked = Boolean(body.commandDepositsBlocked);
+  user.botAdmin = Boolean(body.botAdmin);
+  user.notes = String(body.notes ?? user.notes);
+}
+
 const echoServerRepoUrl = "https://github.com/LazyDoomSlayer/rust-websocket-server.git";
 const echoServerServiceName = "rust-websocket-echo-server";
 
@@ -409,7 +461,7 @@ app.post("/api/system/update", async (_req, res) => {
   }
 });
 
-app.post("/api/users", (req, res) => {
+app.post("/api/users", async (req, res) => {
   try {
     const body = req.body as Partial<User>;
     const user: User = {
@@ -418,15 +470,17 @@ app.post("/api/users", (req, res) => {
       balance: roundMoney(normalizeNumber(body.balance, 0)),
       telegramId: String(body.telegramId ?? "").trim(),
       telegramUsername: String(body.telegramUsername ?? "").trim().replace(/^@/, ""),
+      avatarUrl: String(body.avatarUrl ?? ""),
       commandDepositsBlocked: Boolean(body.commandDepositsBlocked),
       botAdmin: Boolean(body.botAdmin),
       notes: String(body.notes ?? ""),
       createdAt: nowIso()
     };
 
-    store.write((data) => {
-      data.users.push(user);
-    });
+    const data = store.read();
+    user.avatarUrl = await tryFetchTelegramAvatar(data, user);
+    data.users.push(user);
+    store.persist();
 
     res.json(ok(apiState()));
   } catch (error) {
@@ -434,20 +488,15 @@ app.post("/api/users", (req, res) => {
   }
 });
 
-app.put("/api/users/:id", (req, res) => {
+app.put("/api/users/:id", async (req, res) => {
   try {
-    store.write((data) => {
-      const user = data.users.find((item) => item.id === req.params.id);
-      if (!user) throw new Error("Пользователь не найден");
+    const data = store.read();
+    const user = data.users.find((item) => item.id === req.params.id);
+    if (!user) throw new Error("Пользователь не найден");
 
-      user.name = String(req.body.name ?? user.name).trim() || user.name;
-      user.balance = roundMoney(normalizeNumber(req.body.balance, user.balance));
-      user.telegramId = String(req.body.telegramId ?? user.telegramId).trim();
-      user.telegramUsername = String(req.body.telegramUsername ?? user.telegramUsername).trim().replace(/^@/, "");
-      user.commandDepositsBlocked = Boolean(req.body.commandDepositsBlocked);
-      user.botAdmin = Boolean(req.body.botAdmin);
-      user.notes = String(req.body.notes ?? user.notes);
-    });
+    applyUserInput(user, req.body);
+    user.avatarUrl = await tryFetchTelegramAvatar(data, user);
+    store.persist();
 
     res.json(ok(apiState()));
   } catch (error) {
