@@ -1426,6 +1426,12 @@ td small {
   font-size: 12px;
 }
 
+.comment-meta-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
 .comment-body p {
   margin: 0;
   overflow-wrap: anywhere;
@@ -1475,6 +1481,14 @@ td small {
 
 .comment-reply-button:hover {
   color: #c8d8ff;
+}
+
+.comment-reply-button.danger {
+  color: #b96d68;
+}
+
+.comment-reply-button.danger:hover {
+  color: #ff8b82;
 }
 
 .show-more-replies {

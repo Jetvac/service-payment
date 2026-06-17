@@ -207,6 +207,14 @@ function canManageWallPost(actor: User, post: WallPost) {
   return actor.botAdmin || post.authorId === actor.id;
 }
 
+function canManageWallComment(actor: User, comment: WallComment) {
+  return actor.botAdmin || comment.authorId === actor.id;
+}
+
+function getRequestActor(req: Request, data: AppData, fallbackUserId: unknown) {
+  return authUserFromRequest(req) ?? getActor(data, fallbackUserId);
+}
+
 function publicUser(user: User) {
   return {
     ...user,
@@ -321,6 +329,37 @@ function wallCommentsForPost(data: AppData, postId: string) {
   return data.wallComments
     .filter((comment) => comment.postId === postId)
     .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
+}
+
+function wallCommentBranchIds(data: AppData, commentId: string) {
+  const ids = new Set([commentId]);
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const comment of data.wallComments) {
+      if (comment.parentId && ids.has(comment.parentId) && !ids.has(comment.id)) {
+        ids.add(comment.id);
+        changed = true;
+      }
+    }
+  }
+  return ids;
+}
+
+function wallCommentFileIds(data: AppData, commentIds: Iterable<string>) {
+  const ids = new Set(commentIds);
+  const fileIds = new Set<string>();
+  for (const comment of data.wallComments) {
+    if (!ids.has(comment.id)) continue;
+    for (const fileId of comment.fileIds) fileIds.add(fileId);
+  }
+  return fileIds;
+}
+
+function broadcastWallCommentsChanged(postId: string) {
+  const comments = wallCommentsForPost(store.read(), postId);
+  broadcastRealtime({ type: "wall-comments-changed", postId, comments });
+  return comments;
 }
 
 function normalizeWallCommentInput(data: AppData, postId: string, body: Partial<WallComment>) {
@@ -950,7 +989,7 @@ app.post("/api/wall/posts/:id/comments", (req, res) => {
   try {
     let comment: WallComment | undefined;
     store.write((data) => {
-      const actor = getActor(data, req.body.authorId);
+      const actor = getRequestActor(req, data, req.body.authorId);
       const input = normalizeWallCommentInput(data, req.params.id, req.body);
       const createdAt = nowIso();
       comment = {
@@ -966,8 +1005,54 @@ app.post("/api/wall/posts/:id/comments", (req, res) => {
       data.wallComments.push(comment);
     });
 
-    const comments = wallCommentsForPost(store.read(), req.params.id);
-    broadcastRealtime({ type: "wall-comment-created", postId: req.params.id, comment, comments });
+    const comments = broadcastWallCommentsChanged(req.params.id);
+    res.json(ok(comments));
+  } catch (error) {
+    res.status(400).json(fail(error));
+  }
+});
+
+app.put("/api/wall/posts/:postId/comments/:commentId", (req, res) => {
+  try {
+    store.write((data) => {
+      const actor = getRequestActor(req, data, req.body.authorId ?? req.body.userId);
+      const comment = data.wallComments.find((item) => item.id === req.params.commentId && item.postId === req.params.postId);
+      if (!comment) throw new Error("Комментарий не найден");
+      if (!canManageWallComment(actor, comment)) throw new Error("Нет прав на редактирование комментария");
+
+      const previousFileIds = new Set(comment.fileIds);
+      const input = normalizeWallCommentInput(data, req.params.postId, {
+        ...req.body,
+        parentId: comment.parentId
+      });
+      comment.content = input.content;
+      comment.fileIds = input.fileIds;
+      comment.updatedAt = nowIso();
+      cleanupUnusedWallFiles(data, previousFileIds);
+    });
+
+    const comments = broadcastWallCommentsChanged(req.params.postId);
+    res.json(ok(comments));
+  } catch (error) {
+    res.status(400).json(fail(error));
+  }
+});
+
+app.delete("/api/wall/posts/:postId/comments/:commentId", (req, res) => {
+  try {
+    store.write((data) => {
+      const actor = getRequestActor(req, data, req.query.userId);
+      const comment = data.wallComments.find((item) => item.id === req.params.commentId && item.postId === req.params.postId);
+      if (!comment) throw new Error("Комментарий не найден");
+      if (!canManageWallComment(actor, comment)) throw new Error("Нет прав на удаление комментария");
+
+      const branchIds = wallCommentBranchIds(data, comment.id);
+      const fileIds = wallCommentFileIds(data, branchIds);
+      data.wallComments = data.wallComments.filter((item) => !branchIds.has(item.id));
+      cleanupUnusedWallFiles(data, fileIds);
+    });
+
+    const comments = broadcastWallCommentsChanged(req.params.postId);
     res.json(ok(comments));
   } catch (error) {
     res.status(400).json(fail(error));
