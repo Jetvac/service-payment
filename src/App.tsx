@@ -141,6 +141,14 @@ type WallListData = {
   files: WallFile[];
 };
 
+type AuthUser = Pick<User, "id" | "name" | "avatarUrl" | "botAdmin" | "passwordSet">;
+
+type AuthLoginResult = {
+  token: string;
+  userId: string;
+  state: AppState;
+};
+
 type WallPostDraft = {
   id?: string;
   title: string;
@@ -152,6 +160,7 @@ type WallPostDraft = {
 };
 
 const authStorageKey = "vpn-payment-current-user-id";
+const authTokenStorageKey = "vpn-payment-auth-token";
 const ledgerPageLimit = 20;
 const wallPageLimit = 20;
 
@@ -227,7 +236,9 @@ const blankUser = {
   avatarUrl: "",
   notes: "",
   commandDepositsBlocked: false,
-  botAdmin: false
+  botAdmin: false,
+  password: "",
+  passwordSet: false
 };
 
 const blankAutoDeposit = {
@@ -450,13 +461,18 @@ function autoDepositDefaults(state: AppState, preferredUserId = ""): AutoDeposit
 }
 
 async function api<T = AppState>(path: string, options: RequestInit = {}) {
+  const token = window.localStorage.getItem(authTokenStorageKey);
   const response = await fetch(path, {
     ...options,
     headers: {
       "Content-Type": "application/json",
+      ...(token ? { "x-auth-token": token } : {}),
       ...(options.headers ?? {})
     }
   });
+  if (response.status === 401 && !path.startsWith("/api/auth/login")) {
+    throw new Error("AUTH_REQUIRED");
+  }
   const result = (await response.json()) as ApiResult;
 
   if (!result.ok) {
@@ -576,9 +592,29 @@ function ModalShell({
   );
 }
 
-function AuthScreen({ state, onLogin }: { state: AppState; onLogin: (userId: string) => void }) {
-  const [selectedUserId, setSelectedUserId] = useState(state.users[0]?.id ?? "");
-  const selectedUser = state.users.find((user) => user.id === selectedUserId) ?? state.users[0];
+function AuthScreen({ users, onLogin }: { users: AuthUser[]; onLogin: (userId: string, password: string) => Promise<void> }) {
+  const [selectedUserId, setSelectedUserId] = useState(users[0]?.id ?? "");
+  const [password, setPassword] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState("");
+  const selectedUser = users.find((user) => user.id === selectedUserId) ?? users[0];
+
+  useEffect(() => {
+    if (!selectedUserId && users[0]?.id) setSelectedUserId(users[0].id);
+  }, [selectedUserId, users]);
+
+  const submit = async () => {
+    if (!selectedUser || !password) return;
+    try {
+      setSubmitting(true);
+      setError("");
+      await onLogin(selectedUser.id, password);
+    } catch (error) {
+      setError(error instanceof Error && error.message !== "AUTH_REQUIRED" ? error.message : "Не удалось войти");
+    } finally {
+      setSubmitting(false);
+    }
+  };
 
   return (
     <main className="auth-screen">
@@ -603,7 +639,7 @@ function AuthScreen({ state, onLogin }: { state: AppState; onLogin: (userId: str
               <div className="auth-combobox-control">
                 <UserAvatar user={selectedUser} />
                 <select value={selectedUser.id} onChange={(event) => setSelectedUserId(event.target.value)}>
-                  {state.users.map((user) => (
+                  {users.map((user) => (
                     <option key={user.id} value={user.id}>
                       {user.name}
                     </option>
@@ -615,13 +651,26 @@ function AuthScreen({ state, onLogin }: { state: AppState; onLogin: (userId: str
               <UserAvatar user={selectedUser} size="large" />
               <div>
                 <strong>{selectedUser.name}</strong>
-                <small>{money(selectedUser.balance, "RUB")}</small>
+                <small>{selectedUser.passwordSet ? "Пароль настроен" : "Пароль не задан"}</small>
               </div>
               {selectedUser.botAdmin && <span className="status-pill reversal">админ</span>}
             </div>
-            <button className="primary auth-login" type="button" onClick={() => onLogin(selectedUser.id)}>
+            <label>
+              Пароль
+              <input
+                autoComplete="current-password"
+                type="password"
+                value={password}
+                onChange={(event) => setPassword(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") void submit();
+                }}
+              />
+            </label>
+            {error && <div className="auth-error">{error}</div>}
+            <button className="primary auth-login" type="button" disabled={!password || submitting || !selectedUser.passwordSet} onClick={() => void submit()}>
               <Shield size={16} />
-              Войти
+              {submitting ? "Проверка..." : "Войти"}
             </button>
           </>
         ) : (
@@ -634,6 +683,7 @@ function AuthScreen({ state, onLogin }: { state: AppState; onLogin: (userId: str
 
 export default function App() {
   const [state, setState] = useState<AppState | null>(null);
+  const [authUsers, setAuthUsers] = useState<AuthUser[]>([]);
   const [view, setView] = useState<View>("dashboard");
   const [currentUserId, setCurrentUserId] = useState(() => window.localStorage.getItem(authStorageKey) ?? "");
   const [selectedServiceId, setSelectedServiceId] = useState("");
@@ -661,6 +711,19 @@ export default function App() {
   const currentUser = useMemo(() => state?.users.find((user) => user.id === currentUserId), [currentUserId, state?.users]);
   const isAdmin = Boolean(currentUser?.botAdmin);
   const visibleNavItems = useMemo(() => navItems.filter((item) => isAdmin || item.id !== "bot"), [isAdmin]);
+
+  const clearAuth = () => {
+    window.localStorage.removeItem(authStorageKey);
+    window.localStorage.removeItem(authTokenStorageKey);
+    setCurrentUserId("");
+    setState(null);
+  };
+
+  const loadAuthUsers = async () => {
+    const users = await api<AuthUser[]>("/api/auth/users");
+    setAuthUsers(users);
+    return users;
+  };
 
   const load = async () => {
     const nextState = await api("/api/state");
@@ -725,7 +788,18 @@ export default function App() {
   };
 
   useEffect(() => {
-    load().catch((error) => setToast(error.message));
+    if (window.localStorage.getItem(authTokenStorageKey)) {
+      load().catch((error) => {
+        if (error instanceof Error && error.message === "AUTH_REQUIRED") {
+          clearAuth();
+          loadAuthUsers().catch((authError) => setToast(authError.message));
+          return;
+        }
+        setToast(error instanceof Error ? error.message : "Ошибка загрузки");
+      });
+      return;
+    }
+    loadAuthUsers().catch((error) => setToast(error.message));
   }, []);
 
   useEffect(() => {
@@ -753,8 +827,8 @@ export default function App() {
   useEffect(() => {
     if (!state) return;
     if (currentUserId && !state.users.some((user) => user.id === currentUserId)) {
-      window.localStorage.removeItem(authStorageKey);
-      setCurrentUserId("");
+      clearAuth();
+      loadAuthUsers().catch((error) => setToast(error.message));
     }
   }, [currentUserId, state]);
 
@@ -886,7 +960,10 @@ export default function App() {
 
   const exportDatabase = async () => {
     try {
-      const response = await fetch("/api/database/export");
+      const token = window.localStorage.getItem(authTokenStorageKey);
+      const response = await fetch("/api/database/export", {
+        headers: token ? { "x-auth-token": token } : undefined
+      });
       if (!response.ok) throw new Error("Не удалось выгрузить базу");
 
       const blob = await response.blob();
@@ -976,6 +1053,24 @@ export default function App() {
   }, [dashboardData, state]);
 
   if (!state) {
+    if (!window.localStorage.getItem(authTokenStorageKey)) {
+      return (
+        <AuthScreen
+          users={authUsers}
+          onLogin={async (userId, password) => {
+            const result = await api<AuthLoginResult>("/api/auth/login", {
+              method: "POST",
+              body: JSON.stringify({ userId, password })
+            });
+            window.localStorage.setItem(authStorageKey, result.userId);
+            window.localStorage.setItem(authTokenStorageKey, result.token);
+            setCurrentUserId(result.userId);
+            setState(result.state);
+            setAuthUsers([]);
+          }}
+        />
+      );
+    }
     return (
       <main className="loading-screen">
         <Shield size={34} />
@@ -987,10 +1082,23 @@ export default function App() {
   if (!currentUser) {
     return (
       <AuthScreen
-        state={state}
-        onLogin={(userId) => {
-          window.localStorage.setItem(authStorageKey, userId);
-          setCurrentUserId(userId);
+        users={authUsers.length ? authUsers : state.users.map((user) => ({
+          id: user.id,
+          name: user.name,
+          avatarUrl: user.avatarUrl,
+          botAdmin: user.botAdmin,
+          passwordSet: user.passwordSet
+        }))}
+        onLogin={async (userId, password) => {
+          const result = await api<AuthLoginResult>("/api/auth/login", {
+            method: "POST",
+            body: JSON.stringify({ userId, password })
+          });
+          window.localStorage.setItem(authStorageKey, result.userId);
+          window.localStorage.setItem(authTokenStorageKey, result.token);
+          setCurrentUserId(result.userId);
+          setState(result.state);
+          setAuthUsers([]);
         }}
       />
     );
@@ -1103,6 +1211,7 @@ export default function App() {
         serviceById={serviceById}
         mutate={mutate}
         saveUser={saveUser}
+        isAdmin={isAdmin}
       />
     ),
     ledger: (
@@ -1186,8 +1295,9 @@ export default function App() {
             type="button"
             title="Выйти"
             onClick={() => {
-              window.localStorage.removeItem(authStorageKey);
-              setCurrentUserId("");
+              api("/api/auth/logout", { method: "POST", body: JSON.stringify({}) }).catch(() => undefined);
+              clearAuth();
+              loadAuthUsers().catch((error) => setToast(error.message));
             }}
           >
             <LogOut size={15} />
@@ -1621,6 +1731,7 @@ function WallView({
       method: "POST",
       headers: {
         "Content-Type": file.type || "application/octet-stream",
+        ...(window.localStorage.getItem(authTokenStorageKey) ? { "x-auth-token": window.localStorage.getItem(authTokenStorageKey)! } : {}),
         "x-author-id": currentUser.id,
         "x-file-name": encodeURIComponent(file.name)
       },
@@ -1642,18 +1753,20 @@ function WallView({
     setToast("Файл удалён");
   };
 
-  const cleanupWallFiles = async () => {
+  const cleanupWallFiles = async (fileIds: string[] = []) => {
+    if (!fileIds.length) return;
     const next = await api<WallListData>(`/api/wall/files/cleanup?userId=${encodeURIComponent(currentUser.id)}`, {
       method: "POST",
-      body: JSON.stringify({ userId: currentUser.id })
+      body: JSON.stringify({ userId: currentUser.id, fileIds })
     });
     setWallData(next);
   };
 
-  const closeWallPostModal = () => {
+  const closeWallPostModal = (draft?: WallPostDraft) => {
     setCreating(false);
     setEditingPost(null);
-    cleanupWallFiles().catch((error) => setToast(error.message));
+    const draftFileIds = Array.from(new Set([...(draft?.fileIds ?? []), draft?.previewFileId ?? ""].filter(Boolean)));
+    cleanupWallFiles(draftFileIds).catch((error) => setToast(error.message));
   };
 
   return (
@@ -2028,7 +2141,7 @@ function WallPostModal({
   files: WallFile[];
   onUpload: (file: File) => Promise<WallFile>;
   onDeleteFile: (file: WallFile) => Promise<void>;
-  onClose: () => void;
+  onClose: (draft?: WallPostDraft) => void;
   onSave: (draft: WallPostDraft) => Promise<void>;
   setToast: (value: string) => void;
 }) {
@@ -2142,10 +2255,10 @@ function WallPostModal({
       title={post ? "Редактирование поста" : "Новый пост"}
       subtitle={`Автор: ${currentUser.name}`}
       wide
-      onClose={onClose}
+      onClose={() => onClose(draft)}
       footer={
         <>
-          <button className="ghost" type="button" onClick={onClose}>
+          <button className="ghost" type="button" onClick={() => onClose(draft)}>
             Отмена
           </button>
           <button className="primary" type="button" disabled={!draft.title.trim()} onClick={() => onSave(draft)}>
@@ -3328,7 +3441,8 @@ function PeopleView({
   userById,
   serviceById,
   mutate,
-  saveUser
+  saveUser,
+  isAdmin
 }: {
   state: AppState;
   userForm: typeof blankUser;
@@ -3337,6 +3451,7 @@ function PeopleView({
   serviceById: (id: string) => Service | undefined;
   mutate: (path: string, body?: unknown, method?: string) => Promise<AppState>;
   saveUser: (user: User & { adminPassword?: string }) => Promise<AppState>;
+  isAdmin: boolean;
 }) {
   const [createOpen, setCreateOpen] = useState(false);
 
@@ -3383,6 +3498,7 @@ function PeopleView({
           draft={userForm}
           setDraft={setUserForm}
           wasAdmin={false}
+          canEditPassword={isAdmin}
           onClose={() => setCreateOpen(false)}
           onSave={(nextUser) =>
             mutate("/api/users", nextUser).then((nextState) => {
@@ -3407,6 +3523,7 @@ function PeopleView({
               state={state}
               serviceById={serviceById}
               onSave={saveUser}
+              canEditPassword={isAdmin}
               onDelete={() => {
                 if (!window.confirm(`Удалить участника "${user.name}" и его историю замеров пинга?`)) return Promise.resolve(state);
                 return mutate(`/api/users/${user.id}`, undefined, "DELETE");
@@ -3743,12 +3860,14 @@ function UserCard({
   state,
   serviceById,
   onSave,
+  canEditPassword,
   onDelete
 }: {
   user: User;
   state: AppState;
   serviceById: (id: string) => Service | undefined;
   onSave: (user: User) => Promise<AppState>;
+  canEditPassword: boolean;
   onDelete: () => Promise<AppState>;
 }) {
   const [draft, setDraft] = useState(user);
@@ -3803,6 +3922,7 @@ function UserCard({
           draft={draft}
           setDraft={setDraft}
           wasAdmin={user.botAdmin}
+          canEditPassword={canEditPassword}
           onClose={() => {
             setDraft(user);
             setEditing(false);
@@ -3822,6 +3942,7 @@ function UserEditModal({
   draft,
   setDraft,
   wasAdmin,
+  canEditPassword,
   onSave,
   onClose
 }: {
@@ -3829,10 +3950,12 @@ function UserEditModal({
   draft: User | typeof blankUser;
   setDraft: (value: any) => void;
   wasAdmin: boolean;
+  canEditPassword: boolean;
   onSave: (user: (User | typeof blankUser) & { adminPassword?: string }) => Promise<AppState>;
   onClose: () => void;
 }) {
   const [adminPassword, setAdminPassword] = useState("");
+  const [participantPassword, setParticipantPassword] = useState("");
   const needsAdminPassword = draft.botAdmin && !wasAdmin;
 
   return (
@@ -3848,7 +3971,7 @@ function UserEditModal({
             className="primary"
             type="button"
             disabled={needsAdminPassword && !adminPassword}
-            onClick={() => onSave({ ...draft, adminPassword })}
+            onClick={() => onSave({ ...draft, password: participantPassword, adminPassword })}
           >
             <Check size={16} />
             Сохранить
@@ -3880,6 +4003,18 @@ function UserEditModal({
           Username
           <input value={draft.telegramUsername} onChange={(event) => setDraft({ ...draft, telegramUsername: event.target.value })} />
         </label>
+        {canEditPassword && (
+          <label>
+            Пароль входа
+            <input
+              autoComplete="new-password"
+              placeholder={draft.passwordSet ? "оставьте пустым, чтобы не менять" : "задайте пароль"}
+              type="password"
+              value={participantPassword}
+              onChange={(event) => setParticipantPassword(event.target.value)}
+            />
+          </label>
+        )}
         <label className="toggle-row">
           <input
             type="checkbox"

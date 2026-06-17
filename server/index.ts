@@ -1,4 +1,5 @@
-import express from "express";
+import crypto from "node:crypto";
+import express, { type NextFunction, type Request, type Response } from "express";
 import { execFile, spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
@@ -97,23 +98,32 @@ function removeWallFileFromDisk(file: Pick<WallFile, "storageName">) {
   fs.rmSync(path.join(wallFilesDir, file.storageName), { force: true });
 }
 
-function cleanupUnusedWallFiles(data: AppData) {
-  const usedFileIds = new Set<string>();
-  for (const post of data.wallPosts) {
-    if (post.previewFileId) usedFileIds.add(post.previewFileId);
-    for (const fileId of post.fileIds) usedFileIds.add(fileId);
-    for (const file of data.wallFiles) {
-      if (post.content.includes(wallFileUrl(file.id)) || post.content.includes(file.url)) usedFileIds.add(file.id);
-    }
+function wallPostFileIds(data: AppData, post: WallPost) {
+  const ids = new Set<string>();
+  if (post.previewFileId) ids.add(post.previewFileId);
+  for (const fileId of post.fileIds) ids.add(fileId);
+  for (const file of data.wallFiles) {
+    if (post.content.includes(wallFileUrl(file.id)) || post.content.includes(file.url)) ids.add(file.id);
   }
+  return ids;
+}
 
-  const unusedFiles = data.wallFiles.filter((file) => !usedFileIds.has(file.id));
+function isWallFileUsed(data: AppData, fileId: string) {
+  return data.wallPosts.some((post) => wallPostFileIds(data, post).has(fileId));
+}
+
+function cleanupUnusedWallFiles(data: AppData, candidateIds: Iterable<string>) {
+  const candidates = new Set(Array.from(candidateIds).filter(Boolean));
+  if (!candidates.size) return 0;
+
+  const unusedFiles = data.wallFiles.filter((file) => candidates.has(file.id) && !isWallFileUsed(data, file.id));
   if (!unusedFiles.length) return 0;
 
-  data.wallFiles = data.wallFiles.filter((file) => usedFileIds.has(file.id));
+  const unusedIds = new Set(unusedFiles.map((file) => file.id));
+  data.wallFiles = data.wallFiles.filter((file) => !unusedIds.has(file.id));
   for (const post of data.wallPosts) {
-    post.fileIds = post.fileIds.filter((fileId) => usedFileIds.has(fileId));
-    if (post.previewFileId && !usedFileIds.has(post.previewFileId)) post.previewFileId = null;
+    post.fileIds = post.fileIds.filter((fileId) => !unusedIds.has(fileId));
+    if (post.previewFileId && unusedIds.has(post.previewFileId)) post.previewFileId = null;
   }
   for (const file of unusedFiles) removeWallFileFromDisk(file);
   return unusedFiles.length;
@@ -141,6 +151,54 @@ function getActor(data: AppData, userId: unknown) {
 
 function canManageWallPost(actor: User, post: WallPost) {
   return actor.botAdmin || post.authorId === actor.id;
+}
+
+function publicUser(user: User) {
+  return {
+    ...user,
+    password: "",
+    passwordSet: Boolean(user.password)
+  };
+}
+
+function authUsers(data: AppData) {
+  return data.users.map((user) => ({
+    id: user.id,
+    name: user.name,
+    avatarUrl: user.avatarUrl,
+    botAdmin: user.botAdmin,
+    passwordSet: Boolean(user.password)
+  }));
+}
+
+function issueAuthToken(data: AppData, user: User) {
+  const token = `sess_${crypto.randomBytes(24).toString("hex")}`;
+  data.settings.security.sessions ??= {};
+  data.settings.security.sessions[token] = { userId: user.id, createdAt: nowIso() };
+  return token;
+}
+
+function authUserFromRequest(req: Request) {
+  return (req as Request & { authUser?: User }).authUser;
+}
+
+function authMiddleware(req: Request, res: Response, next: NextFunction) {
+  if (req.path.startsWith("/auth/")) return next();
+  if (req.method === "GET" && /^\/wall\/files\/[^/]+\/download$/.test(req.path)) return next();
+  if (req.path.startsWith("/telegram/webhook/")) return next();
+
+  const token = String(req.header("x-auth-token") ?? "");
+  const data = store.read();
+  const session = token ? data.settings.security.sessions?.[token] : undefined;
+  const user = session ? data.users.find((item) => item.id === session.userId) : undefined;
+
+  if (!user) {
+    res.status(401).json(fail(new Error("Требуется вход")));
+    return;
+  }
+
+  (req as Request & { authUser?: User }).authUser = user;
+  next();
 }
 
 function normalizeStringList(value: unknown) {
@@ -323,7 +381,7 @@ function publicData(data: AppData) {
 
   return {
     currencies: data.currencies,
-    users: data.users,
+    users: data.users.map(publicUser),
     services,
     memberships: data.memberships,
     autoDeposits: data.autoDeposits,
@@ -335,7 +393,8 @@ function publicData(data: AppData) {
       telegram: data.settings.telegram,
       security: {
         adminPassword: "",
-        adminPasswordSet: Boolean(data.settings.security?.adminPassword)
+        adminPasswordSet: Boolean(data.settings.security?.adminPassword),
+        sessions: {}
       }
     }
   };
@@ -514,10 +573,17 @@ function validateAdminPassword(data: AppData, password: unknown) {
   }
 }
 
-function applyUserInput(data: AppData, user: User, body: Partial<User> & { adminPassword?: string }) {
+function applyUserInput(data: AppData, user: User, body: Partial<User> & { adminPassword?: string }, actor?: User) {
   const nextBotAdmin = Boolean(body.botAdmin);
   if (nextBotAdmin && !user.botAdmin) {
     validateAdminPassword(data, body.adminPassword);
+  }
+
+  const passwordInput = typeof body.password === "string" ? body.password.trim() : "";
+  if (passwordInput) {
+    if (!actor?.botAdmin) throw new Error("Только администратор может менять пароль участника");
+    user.password = passwordInput;
+    user.passwordSet = true;
   }
 
   user.name = String(body.name ?? user.name).trim() || user.name;
@@ -702,6 +768,36 @@ function normalizeAutoDepositInput(data: AppData, body: Partial<AutoDeposit>, fa
   };
 }
 
+app.get("/api/auth/users", (_req, res) => {
+  res.json(ok(authUsers(store.read())));
+});
+
+app.post("/api/auth/login", (req, res) => {
+  try {
+    const data = store.read();
+    const user = data.users.find((item) => item.id === String(req.body.userId ?? ""));
+    if (!user) throw new Error("Пользователь не найден");
+    if (!user.password) throw new Error("Пароль не задан");
+    if (String(req.body.password ?? "") !== user.password) throw new Error("Неверный пароль");
+
+    const token = issueAuthToken(data, user);
+    store.persist();
+    res.json(ok({ token, userId: user.id, state: apiState() }));
+  } catch (error) {
+    res.status(401).json(fail(error));
+  }
+});
+
+app.post("/api/auth/logout", (req, res) => {
+  const token = String(req.header("x-auth-token") ?? "");
+  store.write((data) => {
+    if (token && data.settings.security.sessions) delete data.settings.security.sessions[token];
+  });
+  res.json(ok({ loggedOut: true }));
+});
+
+app.use("/api", authMiddleware);
+
 app.get("/api/state", (_req, res) => {
   res.json(ok(apiState()));
 });
@@ -778,7 +874,6 @@ app.post("/api/wall/posts", (req, res) => {
         createdAt,
         updatedAt: createdAt
       });
-      cleanupUnusedWallFiles(data);
     });
 
     res.json(ok(wallListData(store.read(), req.query as Record<string, unknown>)));
@@ -794,8 +889,9 @@ app.put("/api/wall/posts/:id", (req, res) => {
       if (!post) throw new Error("Пост не найден");
       const actor = getActor(data, req.body.authorId);
       if (!canManageWallPost(actor, post)) throw new Error("Нет прав на изменение поста");
+      const previousFileIds = wallPostFileIds(data, post);
       Object.assign(post, normalizeWallPostInput(data, req.body, post), { updatedAt: nowIso() });
-      cleanupUnusedWallFiles(data);
+      cleanupUnusedWallFiles(data, previousFileIds);
     });
 
     res.json(ok(wallListData(store.read(), req.query as Record<string, unknown>)));
@@ -811,8 +907,9 @@ app.delete("/api/wall/posts/:id", (req, res) => {
       if (!post) throw new Error("Пост не найден");
       const actor = getActor(data, req.query.userId);
       if (!canManageWallPost(actor, post)) throw new Error("Нет прав на удаление поста");
+      const previousFileIds = wallPostFileIds(data, post);
       data.wallPosts = data.wallPosts.filter((item) => item.id !== post.id);
-      cleanupUnusedWallFiles(data);
+      cleanupUnusedWallFiles(data, previousFileIds);
     });
 
     res.json(ok(wallListData(store.read(), req.query as Record<string, unknown>)));
@@ -947,7 +1044,7 @@ app.post("/api/wall/files/cleanup", (req, res) => {
   try {
     store.write((data) => {
       getActor(data, req.query.userId ?? req.body?.userId);
-      cleanupUnusedWallFiles(data);
+      cleanupUnusedWallFiles(data, normalizeStringList(req.body?.fileIds));
     });
     res.json(ok(wallListData(store.read(), req.query as Record<string, unknown>)));
   } catch (error) {
@@ -1058,12 +1155,14 @@ app.post("/api/users", async (req, res) => {
       avatarUrl: "",
       commandDepositsBlocked: false,
       botAdmin: false,
+      password: "",
+      passwordSet: false,
       notes: "",
       createdAt: nowIso()
     };
 
     const data = store.read();
-    applyUserInput(data, user, body);
+    applyUserInput(data, user, body, authUserFromRequest(req));
     user.avatarUrl = await tryFetchTelegramAvatar(data, user);
     data.users.push(user);
     store.persist();
@@ -1080,7 +1179,7 @@ app.put("/api/users/:id", async (req, res) => {
     const user = data.users.find((item) => item.id === req.params.id);
     if (!user) throw new Error("Пользователь не найден");
 
-    applyUserInput(data, user, req.body);
+    applyUserInput(data, user, req.body, authUserFromRequest(req));
     user.avatarUrl = await tryFetchTelegramAvatar(data, user);
     store.persist();
 

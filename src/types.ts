@@ -17,6 +17,8 @@ export type User = {
   avatarUrl: string;
   commandDepositsBlocked: boolean;
   botAdmin: boolean;
+  password: string;
+  passwordSet?: boolean;
   notes: string;
   createdAt: string;
 };
@@ -215,6 +217,7 @@ export type TelegramSettings = {
 export type SecuritySettings = {
   adminPassword: string;
   adminPasswordSet?: boolean;
+  sessions?: Record<string, { userId: string; createdAt: string }>;
 };
 
 export type AppCounts = {

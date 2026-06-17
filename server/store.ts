@@ -154,6 +154,8 @@ export class Store {
       user.telegramId ??= "";
       user.telegramUsername ??= "";
       user.avatarUrl ??= "";
+      user.password = String(user.password || "admin");
+      user.passwordSet = Boolean(user.password);
       const legacyBalances = (data.memberships ?? []).filter(
         (membership) => membership.userId === user.id && typeof membership.balance === "number"
       );
@@ -189,6 +191,7 @@ export class Store {
     data.settings.security ??= { adminPassword: "admin", adminPasswordSet: true };
     data.settings.security.adminPassword = String(data.settings.security.adminPassword || "admin");
     data.settings.security.adminPasswordSet = Boolean(data.settings.security.adminPassword);
+    data.settings.security.sessions ??= {};
     data.settings.telegram.pollingEnabled ??= false;
     data.settings.telegram.notificationTopicId ??= "";
     data.settings.telegram.updateOffset ??= 0;

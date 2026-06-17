@@ -70,6 +70,8 @@ export function seedData(): AppData {
         avatarUrl: "",
         commandDepositsBlocked: false,
         botAdmin: true,
+        password: "admin",
+        passwordSet: true,
         notes: "",
         createdAt
       },
@@ -82,6 +84,8 @@ export function seedData(): AppData {
         avatarUrl: "",
         commandDepositsBlocked: false,
         botAdmin: false,
+        password: "admin",
+        passwordSet: true,
         notes: "",
         createdAt
       }

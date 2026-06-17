@@ -263,6 +263,15 @@ nav {
   min-height: 40px;
 }
 
+.auth-error {
+  border: 1px solid rgba(255, 111, 97, 0.2);
+  border-radius: 8px;
+  color: #ffaba4;
+  background: rgba(255, 111, 97, 0.08);
+  padding: 10px 12px;
+  font-size: 13px;
+}
+
 .topbar {
   display: flex;
   align-items: center;
