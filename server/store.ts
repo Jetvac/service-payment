@@ -285,7 +285,7 @@ export class Store {
       file.storageName = String(file.storageName ?? "");
       file.mimeType = String(file.mimeType ?? "application/octet-stream");
       file.size = Math.max(0, normalizeNumber(file.size, 0));
-      file.url = String(file.url ?? `/api/wall/files/${file.id}/download`);
+      file.url = `/api/wall/files/${encodeURIComponent(file.id)}/download`;
       file.uploadedBy = String(file.uploadedBy ?? "");
       file.createdAt = String(file.createdAt ?? new Date().toISOString());
     }

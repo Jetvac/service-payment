@@ -353,7 +353,7 @@ h2 {
   justify-content: space-between;
   gap: 12px;
   min-height: 56px;
-  padding: 14px 16px;
+  padding: 16px 18px;
   border-bottom: 1px solid rgba(255, 255, 255, 0.08);
 }
 
@@ -705,9 +705,9 @@ label {
 
 .service-strip {
   display: flex;
-  gap: 8px;
+  gap: 10px;
   overflow-x: auto;
-  padding: 0 16px 16px;
+  padding: 18px;
 }
 
 .service-pill {
@@ -873,18 +873,23 @@ td small {
   gap: 8px;
 }
 
+.wall-toolbar {
+  justify-content: flex-end;
+  min-height: 60px;
+}
+
 .wall-filters {
   display: grid;
   grid-template-columns: minmax(220px, 1fr) 180px 190px auto;
   gap: 10px;
-  padding: 14px 16px;
+  padding: 16px 18px;
   border-bottom: 1px solid rgba(255, 255, 255, 0.08);
 }
 
 .wall-rows {
   display: grid;
   gap: 10px;
-  padding: 14px;
+  padding: 16px 18px 18px;
 }
 
 .wall-row {
@@ -1093,7 +1098,8 @@ td small {
 }
 
 .wall-file-link span,
-.wall-file-chip span {
+.wall-file-chip span,
+.wall-file-chip-main span {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -1101,8 +1107,28 @@ td small {
 }
 
 .wall-file-chip {
-  grid-template-columns: 18px minmax(0, 1fr) auto auto auto auto;
+  grid-template-columns: 1fr;
+  align-items: stretch;
   cursor: grab;
+}
+
+.wall-file-chip-main {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.wall-file-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  min-width: 0;
+}
+
+.wall-file-actions .ghost.compact {
+  flex: 0 0 auto;
 }
 
 .wall-file-chip.attached {
@@ -1236,6 +1262,7 @@ td small {
   gap: 8px;
   max-height: 390px;
   overflow: auto;
+  padding-right: 2px;
 }
 
 .wall-attached-summary {
@@ -1541,7 +1568,7 @@ td small {
 }
 
 .modal-panel.wide-modal {
-  width: min(880px, 100%);
+  width: min(1080px, 100%);
 }
 
 .modal-head,
@@ -1568,6 +1595,20 @@ td small {
 
 .modal-form {
   grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+@media (min-width: 761px) {
+  .modal-panel {
+    min-width: 480px;
+    min-height: 360px;
+    max-width: calc(100vw - 36px);
+    resize: both;
+  }
+
+  .modal-panel.wide-modal {
+    min-width: min(760px, calc(100vw - 36px));
+    min-height: min(560px, calc(100vh - 36px));
+  }
 }
 
 .service-settings-form {

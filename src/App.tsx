@@ -1633,14 +1633,33 @@ function WallView({
     return uploaded;
   };
 
+  const deleteWallFile = async (file: WallFile) => {
+    if (!window.confirm(`Удалить файл "${file.originalName}"?`)) return;
+    const next = await api<WallListData>(`/api/wall/files/${file.id}?userId=${encodeURIComponent(currentUser.id)}`, {
+      method: "DELETE"
+    });
+    setWallData(next);
+    setToast("Файл удалён");
+  };
+
+  const cleanupWallFiles = async () => {
+    const next = await api<WallListData>(`/api/wall/files/cleanup?userId=${encodeURIComponent(currentUser.id)}`, {
+      method: "POST",
+      body: JSON.stringify({ userId: currentUser.id })
+    });
+    setWallData(next);
+  };
+
+  const closeWallPostModal = () => {
+    setCreating(false);
+    setEditingPost(null);
+    cleanupWallFiles().catch((error) => setToast(error.message));
+  };
+
   return (
     <section className="wall-layout">
       <div className="panel wall-list-panel">
-        <div className="panel-head">
-          <div>
-            <h2>Стена</h2>
-            <small>Гайды, конфиги, ссылки и файлы по сервисам</small>
-          </div>
+        <div className="panel-head wall-toolbar">
           <div className="wall-head-actions">
             <button className="ghost" type="button" onClick={() => setTagsOpen(true)}>
               <Tag size={16} />
@@ -1719,10 +1738,8 @@ function WallView({
           tags={wallData.tags}
           files={wallData.files}
           onUpload={uploadWallFile}
-          onClose={() => {
-            setCreating(false);
-            setEditingPost(null);
-          }}
+          onDeleteFile={deleteWallFile}
+          onClose={closeWallPostModal}
           onSave={savePost}
           setToast={setToast}
         />
@@ -1999,6 +2016,7 @@ function WallPostModal({
   tags,
   files,
   onUpload,
+  onDeleteFile,
   onClose,
   onSave,
   setToast
@@ -2009,6 +2027,7 @@ function WallPostModal({
   tags: WallTag[];
   files: WallFile[];
   onUpload: (file: File) => Promise<WallFile>;
+  onDeleteFile: (file: WallFile) => Promise<void>;
   onClose: () => void;
   onSave: (draft: WallPostDraft) => Promise<void>;
   setToast: (value: string) => void;
@@ -2030,9 +2049,11 @@ function WallPostModal({
   const [uploading, setUploading] = useState(false);
   const [dragActive, setDragActive] = useState(false);
   const [imageWidth, setImageWidth] = useState(720);
+  const [brokenPreviewIds, setBrokenPreviewIds] = useState<Set<string>>(() => new Set());
 
   const attachedFiles = files.filter((file) => draft.fileIds.includes(file.id));
   const previewFile = draft.previewFileId ? files.find((file) => file.id === draft.previewFileId) : undefined;
+  const previewVisible = Boolean(previewFile && !brokenPreviewIds.has(previewFile.id));
 
   const insertText = (value: string, fileId?: string) => {
     const textarea = textRef.current;
@@ -2052,6 +2073,12 @@ function WallPostModal({
 
   const insertFileLink = (file: WallFile) => insertText(`[${file.originalName}](${file.url})`, file.id);
   const insertImage = (file: WallFile) => insertText(`![${file.originalName}|${imageWidth}](${file.url})`, file.id);
+  const removeFileFromDraft = (fileId: string) =>
+    setDraft((current) => ({
+      ...current,
+      previewFileId: current.previewFileId === fileId ? null : current.previewFileId,
+      fileIds: current.fileIds.filter((item) => item !== fileId)
+    }));
 
   const uploadFiles = async (fileList: FileList | null) => {
     if (!fileList?.length) return;
@@ -2105,6 +2132,11 @@ function WallPostModal({
     if (file) insertFileLink(file);
   };
 
+  const deleteFile = async (file: WallFile) => {
+    await onDeleteFile(file);
+    removeFileFromDraft(file.id);
+  };
+
   return (
     <ModalShell
       title={post ? "Редактирование поста" : "Новый пост"}
@@ -2143,19 +2175,23 @@ function WallPostModal({
           <div className="wall-preview-picker wide-field">
             Превью
             <label
-              className={classNames("wall-preview-drop", previewFile && "has-image")}
+              className={classNames("wall-preview-drop", previewVisible && "has-image")}
               onDragOver={(event) => event.preventDefault()}
               onDrop={(event) => {
                 event.preventDefault();
                 void uploadPreview(event.dataTransfer.files);
               }}
             >
-              {previewFile ? (
-                <img src={previewFile.url} alt="" />
+              {previewFile && previewVisible ? (
+                <img
+                  src={`${previewFile.url}?v=${encodeURIComponent(previewFile.createdAt)}`}
+                  alt=""
+                  onError={() => setBrokenPreviewIds((current) => new Set(current).add(previewFile.id))}
+                />
               ) : (
                 <span>
                   <Image size={18} />
-                  Обложка поста
+                  {previewFile ? "Файл недоступен" : "Обложка поста"}
                 </span>
               )}
               <input accept="image/*" type="file" disabled={uploading} onChange={(event) => uploadPreview(event.target.files)} />
@@ -2239,34 +2275,41 @@ function WallPostModal({
                 const isImage = file.mimeType.startsWith("image/");
                 return (
                   <div key={file.id} className={classNames("wall-file-chip", attached && "attached")} draggable onDragStart={(event) => event.dataTransfer.setData("text/plain", `wall-file:${file.id}`)}>
-                    <Paperclip size={14} />
-                    <span>{file.originalName}</span>
-                    <small>{fileSize(file.size)}</small>
-                    <button className="ghost compact" type="button" onClick={() => insertFileLink(file)}>
-                      <Link size={13} />
-                    </button>
-                    {isImage && (
-                      <button className="ghost compact" type="button" onClick={() => insertImage(file)}>
-                        <Image size={13} />
+                    <div className="wall-file-chip-main">
+                      <Paperclip size={14} />
+                      <span>{file.originalName}</span>
+                      <small>{fileSize(file.size)}</small>
+                    </div>
+                    <div className="wall-file-actions">
+                      <button className="ghost compact" type="button" title="Вставить ссылку" onClick={() => insertFileLink(file)}>
+                        <Link size={13} />
                       </button>
-                    )}
-                    {isImage && (
-                      <button className="ghost compact" type="button" onClick={() => setDraft((current) => ({ ...current, previewFileId: file.id }))}>
-                        Превью
+                      {isImage && (
+                        <button className="ghost compact" type="button" title="Вставить изображение" onClick={() => insertImage(file)}>
+                          <Image size={13} />
+                        </button>
+                      )}
+                      {isImage && (
+                        <button className="ghost compact" type="button" onClick={() => setDraft((current) => ({ ...current, previewFileId: file.id }))}>
+                          Превью
+                        </button>
+                      )}
+                      <button
+                        className="ghost compact"
+                        type="button"
+                        onClick={() =>
+                          setDraft((current) => ({
+                            ...current,
+                            fileIds: attached ? current.fileIds.filter((item) => item !== file.id) : [...current.fileIds, file.id]
+                          }))
+                        }
+                      >
+                        {attached ? "Убрать" : "Прикрепить"}
                       </button>
-                    )}
-                    <button
-                      className="ghost compact"
-                      type="button"
-                      onClick={() =>
-                        setDraft((current) => ({
-                          ...current,
-                          fileIds: attached ? current.fileIds.filter((item) => item !== file.id) : [...current.fileIds, file.id]
-                        }))
-                      }
-                    >
-                      {attached ? "Убрать" : "Прикрепить"}
-                    </button>
+                      <button className="ghost compact danger" type="button" title="Удалить файл" onClick={() => deleteFile(file).catch((error) => setToast(error.message))}>
+                        <Trash2 size={13} />
+                      </button>
+                    </div>
                   </div>
                 );
               })}

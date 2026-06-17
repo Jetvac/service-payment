@@ -88,6 +88,37 @@ function wallFileUrl(fileId: string) {
   return `/api/wall/files/${encodeURIComponent(fileId)}/download`;
 }
 
+function publicWallFile(file: WallFile) {
+  return { ...file, url: wallFileUrl(file.id) };
+}
+
+function removeWallFileFromDisk(file: Pick<WallFile, "storageName">) {
+  if (!file.storageName) return;
+  fs.rmSync(path.join(wallFilesDir, file.storageName), { force: true });
+}
+
+function cleanupUnusedWallFiles(data: AppData) {
+  const usedFileIds = new Set<string>();
+  for (const post of data.wallPosts) {
+    if (post.previewFileId) usedFileIds.add(post.previewFileId);
+    for (const fileId of post.fileIds) usedFileIds.add(fileId);
+    for (const file of data.wallFiles) {
+      if (post.content.includes(wallFileUrl(file.id)) || post.content.includes(file.url)) usedFileIds.add(file.id);
+    }
+  }
+
+  const unusedFiles = data.wallFiles.filter((file) => !usedFileIds.has(file.id));
+  if (!unusedFiles.length) return 0;
+
+  data.wallFiles = data.wallFiles.filter((file) => usedFileIds.has(file.id));
+  for (const post of data.wallPosts) {
+    post.fileIds = post.fileIds.filter((fileId) => usedFileIds.has(fileId));
+    if (post.previewFileId && !usedFileIds.has(post.previewFileId)) post.previewFileId = null;
+  }
+  for (const file of unusedFiles) removeWallFileFromDisk(file);
+  return unusedFiles.length;
+}
+
 function safeFileName(value: string) {
   const normalized = value.replace(/[<>:"/\\|?*\u0000-\u001f]/g, "_").trim();
   return normalized.slice(0, 180) || "file";
@@ -170,7 +201,7 @@ function wallListData(data: AppData, query: Record<string, unknown>) {
   return {
     posts: pageResult(posts, offset, limit),
     tags: data.wallTags,
-    files: data.wallFiles
+    files: data.wallFiles.map(publicWallFile)
   };
 }
 
@@ -747,6 +778,7 @@ app.post("/api/wall/posts", (req, res) => {
         createdAt,
         updatedAt: createdAt
       });
+      cleanupUnusedWallFiles(data);
     });
 
     res.json(ok(wallListData(store.read(), req.query as Record<string, unknown>)));
@@ -763,6 +795,7 @@ app.put("/api/wall/posts/:id", (req, res) => {
       const actor = getActor(data, req.body.authorId);
       if (!canManageWallPost(actor, post)) throw new Error("Нет прав на изменение поста");
       Object.assign(post, normalizeWallPostInput(data, req.body, post), { updatedAt: nowIso() });
+      cleanupUnusedWallFiles(data);
     });
 
     res.json(ok(wallListData(store.read(), req.query as Record<string, unknown>)));
@@ -779,6 +812,7 @@ app.delete("/api/wall/posts/:id", (req, res) => {
       const actor = getActor(data, req.query.userId);
       if (!canManageWallPost(actor, post)) throw new Error("Нет прав на удаление поста");
       data.wallPosts = data.wallPosts.filter((item) => item.id !== post.id);
+      cleanupUnusedWallFiles(data);
     });
 
     res.json(ok(wallListData(store.read(), req.query as Record<string, unknown>)));
@@ -909,6 +943,18 @@ app.post("/api/wall/files", async (req, res) => {
   }
 });
 
+app.post("/api/wall/files/cleanup", (req, res) => {
+  try {
+    store.write((data) => {
+      getActor(data, req.query.userId ?? req.body?.userId);
+      cleanupUnusedWallFiles(data);
+    });
+    res.json(ok(wallListData(store.read(), req.query as Record<string, unknown>)));
+  } catch (error) {
+    res.status(400).json(fail(error));
+  }
+});
+
 app.get("/api/wall/files/:id/download", (req, res) => {
   try {
     const file = store.read().wallFiles.find((item) => item.id === req.params.id);
@@ -941,10 +987,11 @@ app.delete("/api/wall/files/:id", (req, res) => {
       data.wallFiles = data.wallFiles.filter((item) => item.id !== file.id);
       for (const post of data.wallPosts) {
         post.fileIds = post.fileIds.filter((fileId) => fileId !== file.id);
+        if (post.previewFileId === file.id) post.previewFileId = null;
       }
     });
 
-    if (storageName) fs.rmSync(path.join(wallFilesDir, storageName), { force: true });
+    if (storageName) removeWallFileFromDisk({ storageName });
     res.json(ok(wallListData(store.read(), req.query as Record<string, unknown>)));
   } catch (error) {
     res.status(400).json(fail(error));
