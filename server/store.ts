@@ -322,6 +322,7 @@ export class Store {
       comment.authorId = String(comment.authorId ?? data.users[0]?.id ?? "");
       comment.content = String(comment.content ?? "");
       comment.fileIds = Array.isArray(comment.fileIds) ? comment.fileIds.map(String) : [];
+      comment.deletedAt = comment.deletedAt ? String(comment.deletedAt) : null;
       comment.createdAt = String(comment.createdAt ?? new Date().toISOString());
       comment.updatedAt = String(comment.updatedAt ?? comment.createdAt);
     }

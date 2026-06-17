@@ -188,6 +188,7 @@ export type WallPost = {
   tagIds: string[];
   fileIds: string[];
   views: number;
+  commentCount?: number;
   createdAt: string;
   updatedAt: string;
 };
@@ -199,6 +200,7 @@ export type WallComment = {
   authorId: string;
   content: string;
   fileIds: string[];
+  deletedAt: string | null;
   createdAt: string;
   updatedAt: string;
 };

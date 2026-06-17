@@ -1404,6 +1404,16 @@ td small {
   min-width: 0;
 }
 
+.comment-card.deleted .comment-body {
+  border-color: rgba(255, 255, 255, 0.06);
+  background: rgba(255, 255, 255, 0.025);
+}
+
+.comment-card.deleted .comment-body p {
+  color: #8a8f98;
+  font-style: italic;
+}
+
 .comment-body {
   display: grid;
   gap: 8px;
@@ -1467,7 +1477,16 @@ td small {
   margin-top: 8px;
 }
 
+.comment-inline-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
 .comment-reply-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
   justify-self: start;
   min-height: 20px;
   border: 0;

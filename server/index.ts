@@ -208,7 +208,7 @@ function canManageWallPost(actor: User, post: WallPost) {
 }
 
 function canManageWallComment(actor: User, comment: WallComment) {
-  return actor.botAdmin || comment.authorId === actor.id;
+  return comment.authorId === actor.id;
 }
 
 function getRequestActor(req: Request, data: AppData, fallbackUserId: unknown) {
@@ -316,7 +316,8 @@ function wallListData(data: AppData, query: Record<string, unknown>) {
       const aFlags = wallPostFlags(a, data.wallTags);
       const bFlags = wallPostFlags(b, data.wallTags);
       return Number(bFlags.pinned) - Number(aFlags.pinned) || new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime();
-    });
+    })
+    .map((post) => publicWallPost(data, post));
 
   return {
     posts: pageResult(posts, offset, limit),
@@ -325,35 +326,21 @@ function wallListData(data: AppData, query: Record<string, unknown>) {
   };
 }
 
+function wallPostCommentCount(data: AppData, postId: string) {
+  return data.wallComments.filter((comment) => comment.postId === postId && !comment.deletedAt).length;
+}
+
+function publicWallPost(data: AppData, post: WallPost) {
+  return {
+    ...post,
+    commentCount: wallPostCommentCount(data, post.id)
+  };
+}
+
 function wallCommentsForPost(data: AppData, postId: string) {
   return data.wallComments
     .filter((comment) => comment.postId === postId)
     .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
-}
-
-function wallCommentBranchIds(data: AppData, commentId: string) {
-  const ids = new Set([commentId]);
-  let changed = true;
-  while (changed) {
-    changed = false;
-    for (const comment of data.wallComments) {
-      if (comment.parentId && ids.has(comment.parentId) && !ids.has(comment.id)) {
-        ids.add(comment.id);
-        changed = true;
-      }
-    }
-  }
-  return ids;
-}
-
-function wallCommentFileIds(data: AppData, commentIds: Iterable<string>) {
-  const ids = new Set(commentIds);
-  const fileIds = new Set<string>();
-  for (const comment of data.wallComments) {
-    if (!ids.has(comment.id)) continue;
-    for (const fileId of comment.fileIds) fileIds.add(fileId);
-  }
-  return fileIds;
 }
 
 function broadcastWallCommentsChanged(postId: string) {
@@ -367,7 +354,7 @@ function normalizeWallCommentInput(data: AppData, postId: string, body: Partial<
   if (!post) throw new Error("Пост не найден");
 
   const parentId = body.parentId ? String(body.parentId) : null;
-  if (parentId && !data.wallComments.some((comment) => comment.id === parentId && comment.postId === postId)) {
+  if (parentId && !data.wallComments.some((comment) => comment.id === parentId && comment.postId === postId && !comment.deletedAt)) {
     throw new Error("Комментарий для ответа не найден");
   }
 
@@ -953,9 +940,10 @@ app.get("/api/wall", (req, res) => {
 
 app.get("/api/wall/posts/:id", (req, res) => {
   try {
-    const post = store.read().wallPosts.find((item) => item.id === req.params.id);
+    const data = store.read();
+    const post = data.wallPosts.find((item) => item.id === req.params.id);
     if (!post) throw new Error("Пост не найден");
-    res.json(ok(post));
+    res.json(ok(publicWallPost(data, post)));
   } catch (error) {
     res.status(404).json(fail(error));
   }
@@ -969,7 +957,8 @@ app.post("/api/wall/posts/:id/view", (req, res) => {
       if (!post) throw new Error("Пост не найден");
       post.views += 1;
     });
-    res.json(ok(post));
+    const data = store.read();
+    res.json(ok(post ? publicWallPost(data, post) : post));
   } catch (error) {
     res.status(404).json(fail(error));
   }
@@ -999,6 +988,7 @@ app.post("/api/wall/posts/:id/comments", (req, res) => {
         authorId: actor.id,
         content: input.content,
         fileIds: input.fileIds,
+        deletedAt: null,
         createdAt,
         updatedAt: createdAt
       };
@@ -1018,6 +1008,7 @@ app.put("/api/wall/posts/:postId/comments/:commentId", (req, res) => {
       const actor = getRequestActor(req, data, req.body.authorId ?? req.body.userId);
       const comment = data.wallComments.find((item) => item.id === req.params.commentId && item.postId === req.params.postId);
       if (!comment) throw new Error("Комментарий не найден");
+      if (comment.deletedAt) throw new Error("Удалённый комментарий нельзя редактировать");
       if (!canManageWallComment(actor, comment)) throw new Error("Нет прав на редактирование комментария");
 
       const previousFileIds = new Set(comment.fileIds);
@@ -1044,11 +1035,19 @@ app.delete("/api/wall/posts/:postId/comments/:commentId", (req, res) => {
       const actor = getRequestActor(req, data, req.query.userId);
       const comment = data.wallComments.find((item) => item.id === req.params.commentId && item.postId === req.params.postId);
       if (!comment) throw new Error("Комментарий не найден");
+      if (comment.deletedAt) throw new Error("Комментарий уже удалён");
       if (!canManageWallComment(actor, comment)) throw new Error("Нет прав на удаление комментария");
 
-      const branchIds = wallCommentBranchIds(data, comment.id);
-      const fileIds = wallCommentFileIds(data, branchIds);
-      data.wallComments = data.wallComments.filter((item) => !branchIds.has(item.id));
+      const hasReplies = data.wallComments.some((item) => item.parentId === comment.id);
+      const fileIds = new Set(comment.fileIds);
+      if (hasReplies) {
+        comment.content = "Комментарий удалён";
+        comment.fileIds = [];
+        comment.deletedAt = nowIso();
+        comment.updatedAt = comment.deletedAt;
+      } else {
+        data.wallComments = data.wallComments.filter((item) => item.id !== comment.id);
+      }
       cleanupUnusedWallFiles(data, fileIds);
     });
 

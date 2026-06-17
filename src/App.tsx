@@ -10,6 +10,8 @@ import {
   CalendarClock,
   CalendarPlus,
   Check,
+  ChevronDown,
+  ChevronRight,
   CircleDollarSign,
   Clock3,
   Coins,
@@ -22,6 +24,7 @@ import {
   Image,
   Link,
   LogOut,
+  MessageCircle,
   Paperclip,
   Pencil,
   Pin,
@@ -1715,10 +1718,18 @@ function WallView({
         const message = JSON.parse(event.data) as { type?: string; postId?: string; comments?: WallComment[] };
         if (
           (message.type === "wall-comment-created" || message.type === "wall-comments-changed") &&
-          message.postId === selectedPostId &&
+          message.postId &&
           Array.isArray(message.comments)
         ) {
-          setComments(message.comments);
+          const commentCount = message.comments.filter((comment) => !comment.deletedAt).length;
+          setWallData((current) => ({
+            ...current,
+            posts: {
+              ...current.posts,
+              rows: current.posts.rows.map((post) => (post.id === message.postId ? { ...post, commentCount } : post))
+            }
+          }));
+          if (message.postId === selectedPostId) setComments(message.comments);
         }
       } catch {
         // Ignore malformed realtime events.
@@ -1754,7 +1765,7 @@ function WallView({
   };
 
   const deleteComment = async (postId: string, comment: WallComment) => {
-    if (!window.confirm("Удалить комментарий? Ответы к нему тоже будут удалены.")) return comments;
+    if (!window.confirm("Удалить комментарий? Если на него уже ответили, вместо текста останется пометка об удалении.")) return comments;
     const next = await api<WallComment[]>(`/api/wall/posts/${postId}/comments/${comment.id}?userId=${encodeURIComponent(currentUser.id)}`, {
       method: "DELETE"
     });
@@ -1869,7 +1880,6 @@ function WallView({
           onSaveComment={saveComment}
           onUpdateComment={updateComment}
           onDeleteComment={deleteComment}
-          onReloadComments={() => loadComments(selectedPost.id)}
           setToast={setToast}
         />
       ) : (
@@ -2049,6 +2059,10 @@ function WallPostRow({
             <Eye size={13} />
             {post.views}
           </span>
+          <span>
+            <MessageCircle size={13} />
+            {post.commentCount ?? 0}
+          </span>
           {service && <span>{service.name}</span>}
         </div>
       </div>
@@ -2090,7 +2104,6 @@ function WallPostDetail({
   onSaveComment,
   onUpdateComment,
   onDeleteComment,
-  onReloadComments,
   setToast
 }: {
   post: WallPost;
@@ -2109,7 +2122,6 @@ function WallPostDetail({
   onSaveComment: (postId: string, content: string, fileIds: string[], parentId: string | null) => Promise<WallComment[]>;
   onUpdateComment: (postId: string, commentId: string, content: string, fileIds: string[]) => Promise<WallComment[]>;
   onDeleteComment: (postId: string, comment: WallComment) => Promise<WallComment[]>;
-  onReloadComments: () => Promise<WallComment[]>;
   setToast: (value: string) => void;
 }) {
   const postTags = tags.filter((tag) => post.tagIds.includes(tag.id));
@@ -2184,10 +2196,6 @@ function WallPostDetail({
       <section className="comments-panel">
         <div className="comments-head">
           <h2>Комментарии</h2>
-          <button className="ghost compact" type="button" onClick={() => onReloadComments().catch((error) => setToast(error.message))}>
-            <RefreshCcw size={14} />
-            Обновить
-          </button>
         </div>
         <CommentComposer
           currentUser={currentUser}
@@ -2260,6 +2268,7 @@ function CommentTree({
   setToast: (value: string) => void;
 }) {
   const [expanded, setExpanded] = useState<Set<string>>(() => new Set());
+  const [collapsed, setCollapsed] = useState<Set<string>>(() => new Set());
   const byParent = useMemo(() => {
     const map = new Map<string, WallComment[]>();
     for (const comment of comments) {
@@ -2270,8 +2279,10 @@ function CommentTree({
   }, [comments]);
 
   const renderBranch = (parentId: string | null, depth = 0): ReactNode => {
-    const children = byParent.get(parentId ?? "root") ?? [];
-    const visible = expanded.has(parentId ?? "root") || children.length <= 3 ? children : children.slice(0, 3);
+    const branchKey = parentId ?? "root";
+    const children = byParent.get(branchKey) ?? [];
+    const branchCollapsed = collapsed.has(branchKey);
+    const visible = branchCollapsed ? [] : expanded.has(branchKey) || children.length <= 3 ? children : children.slice(0, 3);
     return (
       <div className={classNames("comment-branch", depth > 0 && "nested")}>
         {visible.map((comment) => (
@@ -2286,13 +2297,23 @@ function CommentTree({
             onReply={(content, fileIds) => onSaveComment(postId, content, fileIds, comment.id)}
             onEdit={(content, fileIds) => onUpdateComment(postId, comment.id, content, fileIds)}
             onDelete={() => onDeleteComment(postId, comment)}
+            replyCount={byParent.get(comment.id)?.length ?? 0}
+            repliesCollapsed={collapsed.has(comment.id)}
+            onToggleReplies={() => {
+              setCollapsed((current) => {
+                const next = new Set(current);
+                if (next.has(comment.id)) next.delete(comment.id);
+                else next.add(comment.id);
+                return next;
+              });
+            }}
             setToast={setToast}
           >
-            {renderBranch(comment.id, depth + 1)}
+            {collapsed.has(comment.id) ? null : renderBranch(comment.id, depth + 1)}
           </CommentItem>
         ))}
-        {children.length > 3 && !expanded.has(parentId ?? "root") && (
-          <button className="ghost compact show-more-replies" type="button" onClick={() => setExpanded((current) => new Set(current).add(parentId ?? "root"))}>
+        {children.length > 3 && !branchCollapsed && !expanded.has(branchKey) && (
+          <button className="ghost compact show-more-replies" type="button" onClick={() => setExpanded((current) => new Set(current).add(branchKey))}>
             Показать ещё {children.length - 3}
           </button>
         )}
@@ -2313,6 +2334,9 @@ function CommentItem({
   onReply,
   onEdit,
   onDelete,
+  replyCount,
+  repliesCollapsed,
+  onToggleReplies,
   setToast,
   children
 }: {
@@ -2325,19 +2349,23 @@ function CommentItem({
   onReply: (content: string, fileIds: string[]) => Promise<WallComment[]>;
   onEdit: (content: string, fileIds: string[]) => Promise<WallComment[]>;
   onDelete: () => Promise<WallComment[]>;
+  replyCount: number;
+  repliesCollapsed: boolean;
+  onToggleReplies: () => void;
   setToast: (value: string) => void;
   children: ReactNode;
 }) {
   const [replying, setReplying] = useState(false);
   const [editing, setEditing] = useState(false);
-  const attached = files.filter((file) => comment.fileIds.includes(file.id));
+  const deleted = Boolean(comment.deletedAt);
+  const attached = deleted ? [] : files.filter((file) => comment.fileIds.includes(file.id));
   const displayAuthor = author ?? { name: "Участник", avatarUrl: "" };
-  const canManage = currentUser.botAdmin || comment.authorId === currentUser.id;
-  const edited = comment.updatedAt !== comment.createdAt;
+  const canManage = !deleted && comment.authorId === currentUser.id;
+  const edited = !deleted && comment.updatedAt !== comment.createdAt;
 
   return (
     <div className="comment-item">
-      <div className="comment-card">
+      <div className={classNames("comment-card", deleted && "deleted")}>
         <UserAvatar user={displayAuthor} />
         <div className="comment-body">
           <div className="comment-meta">
@@ -2385,9 +2413,19 @@ function CommentItem({
                   ))}
                 </div>
               )}
-              <button className="comment-reply-button" type="button" onClick={() => setReplying((value) => !value)}>
-                Ответить
-              </button>
+              <div className="comment-inline-actions">
+                {!deleted && (
+                  <button className="comment-reply-button" type="button" onClick={() => setReplying((value) => !value)}>
+                    Ответить
+                  </button>
+                )}
+                {replyCount > 0 && (
+                  <button className="comment-reply-button" type="button" onClick={onToggleReplies}>
+                    {repliesCollapsed ? <ChevronRight size={13} /> : <ChevronDown size={13} />}
+                    {repliesCollapsed ? `Показать ответы (${replyCount})` : "Свернуть ответы"}
+                  </button>
+                )}
+              </div>
               {replying && (
                 <CommentComposer
                   compact
