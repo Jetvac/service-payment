@@ -4,6 +4,7 @@ import {
   Archive,
   ArchiveRestore,
   BellRing,
+  BookOpen,
   Bot,
   CalendarClock,
   CalendarPlus,
@@ -13,14 +14,22 @@ import {
   Coins,
   CreditCard,
   Download,
+  Eye,
+  FileText,
   Gauge,
   History,
+  Image,
+  Link,
   LogOut,
+  Paperclip,
+  Pencil,
+  Pin,
   Plus,
   RefreshCcw,
   Send,
   Settings2,
   Shield,
+  Tag,
   Trash2,
   Upload,
   Wallet,
@@ -29,7 +38,7 @@ import {
   UserPlus,
   Users
 } from "lucide-react";
-import { type ReactNode, useEffect, useMemo, useState } from "react";
+import { type CSSProperties, type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import {
   Area,
   AreaChart,
@@ -56,11 +65,14 @@ import type {
   ServiceConnectionSettings,
   ServiceHealthStatus,
   TelegramSettings,
-  User
+  User,
+  WallFile,
+  WallPost,
+  WallTag
 } from "./types";
 import type { AutoDeposit } from "./types";
 
-type View = "dashboard" | "services" | "people" | "ledger" | "bot";
+type View = "dashboard" | "wall" | "services" | "people" | "ledger" | "bot";
 
 type DepositForm = {
   serviceId: string;
@@ -123,8 +135,27 @@ type OperationPages = {
   debits: PageResult<Debit>;
 };
 
+type WallListData = {
+  posts: PageResult<WallPost>;
+  tags: WallTag[];
+  files: WallFile[];
+};
+
+type WallPostDraft = {
+  id?: string;
+  title: string;
+  preview: string;
+  content: string;
+  serviceId: string;
+  tagIds: string[];
+  fileIds: string[];
+  pinned: boolean;
+  archived: boolean;
+};
+
 const authStorageKey = "vpn-payment-current-user-id";
 const ledgerPageLimit = 20;
+const wallPageLimit = 20;
 
 const periodNames: Record<BillingPeriod, string> = {
   month: "Месяц",
@@ -150,6 +181,7 @@ const healthLabels: Record<ServiceHealthStatus | "checking", string> = {
 
 const navItems = [
   { id: "dashboard", label: "Обзор", icon: Gauge },
+  { id: "wall", label: "Стена", icon: BookOpen },
   { id: "services", label: "Сервисы", icon: Shield },
   { id: "people", label: "Участники", icon: Users },
   { id: "ledger", label: "История", icon: History },
@@ -233,8 +265,41 @@ const emptyOperationPages: OperationPages = {
   debits: emptyPage<Debit>()
 };
 
+const emptyWallData: WallListData = {
+  posts: emptyPage<WallPost>(wallPageLimit),
+  tags: [],
+  files: []
+};
+
+const blankWallPostDraft: WallPostDraft = {
+  title: "",
+  preview: "",
+  content: "",
+  serviceId: "",
+  tagIds: [],
+  fileIds: [],
+  pinned: false,
+  archived: false
+};
+
 function money(value: number, currency: string) {
   return `${Number(value || 0).toLocaleString("ru-RU", { minimumFractionDigits: 2, maximumFractionDigits: 2 })} ${currency}`;
+}
+
+function fileSize(value: number) {
+  if (value >= 1024 ** 3) return `${(value / 1024 ** 3).toLocaleString("ru-RU", { maximumFractionDigits: 2 })} ГБ`;
+  if (value >= 1024 ** 2) return `${(value / 1024 ** 2).toLocaleString("ru-RU", { maximumFractionDigits: 1 })} МБ`;
+  if (value >= 1024) return `${(value / 1024).toLocaleString("ru-RU", { maximumFractionDigits: 1 })} КБ`;
+  return `${value} Б`;
+}
+
+function wallPostIdFromHash() {
+  const match = window.location.hash.match(/^#\/wall\/([^/]+)/);
+  return match ? decodeURIComponent(match[1]) : "";
+}
+
+function setWallHash(postId?: string) {
+  window.location.hash = postId ? `#/wall/${encodeURIComponent(postId)}` : "#/wall";
 }
 
 function currencyRate(state: AppState, code: string) {
@@ -594,6 +659,8 @@ export default function App() {
   const [dashboardLatencyOffset, setDashboardLatencyOffset] = useState(0);
   const [operationPages, setOperationPages] = useState<OperationPages>(emptyOperationPages);
   const [operationOffsets, setOperationOffsets] = useState({ deposits: 0, debits: 0 });
+  const [wallPostId, setWallPostId] = useState(() => wallPostIdFromHash());
+  const [wallRefreshKey, setWallRefreshKey] = useState(0);
 
   const currentUser = useMemo(() => state?.users.find((user) => user.id === currentUserId), [currentUserId, state?.users]);
   const isAdmin = Boolean(currentUser?.botAdmin);
@@ -656,10 +723,25 @@ export default function App() {
     if (view === "ledger") {
       await loadOperationData(reset ? 0 : operationOffsets.deposits, reset ? 0 : operationOffsets.debits);
     }
+    if (view === "wall") {
+      setWallRefreshKey((current) => current + 1);
+    }
   };
 
   useEffect(() => {
     load().catch((error) => setToast(error.message));
+  }, []);
+
+  useEffect(() => {
+    const syncWallHash = () => {
+      const nextPostId = wallPostIdFromHash();
+      setWallPostId(nextPostId);
+      if (window.location.hash.startsWith("#/wall")) setView("wall");
+    };
+
+    syncWallHash();
+    window.addEventListener("hashchange", syncWallHash);
+    return () => window.removeEventListener("hashchange", syncWallHash);
   }, []);
 
   useEffect(() => {
@@ -984,6 +1066,18 @@ export default function App() {
         onNotificationPageChange={(offset) => loadDashboardData(offset, dashboardLatencyOffset).catch((error) => setToast(error.message))}
       />
     ),
+    wall: (
+      <WallView
+        state={state}
+        currentUser={currentUser}
+        isAdmin={isAdmin}
+        selectedPostId={wallPostId}
+        refreshKey={wallRefreshKey}
+        setToast={setToast}
+        userById={userById}
+        serviceById={serviceById}
+      />
+    ),
     services: (
       <ServicesView
         state={state}
@@ -1071,7 +1165,11 @@ export default function App() {
               <button
                 key={item.id}
                 className={classNames("nav-item", view === item.id && "active")}
-                onClick={() => setView(item.id)}
+                onClick={() => {
+                  if (item.id === "wall") setWallHash();
+                  else if (window.location.hash.startsWith("#/wall")) window.history.replaceState(null, "", window.location.pathname);
+                  setView(item.id);
+                }}
                 type="button"
               >
                 <Icon size={17} />
@@ -1420,6 +1518,768 @@ function Dashboard({
         <PaginationControls page={dashboard.notifications} onChange={onNotificationPageChange} />
       </div>
     </section>
+  );
+}
+
+function WallView({
+  state,
+  currentUser,
+  isAdmin,
+  selectedPostId,
+  refreshKey,
+  setToast,
+  userById,
+  serviceById
+}: {
+  state: AppState;
+  currentUser: User;
+  isAdmin: boolean;
+  selectedPostId: string;
+  refreshKey: number;
+  setToast: (value: string) => void;
+  userById: (id: string) => User | undefined;
+  serviceById: (id: string) => Service | undefined;
+}) {
+  const [wallData, setWallData] = useState<WallListData>(emptyWallData);
+  const [search, setSearch] = useState("");
+  const [tagId, setTagId] = useState("");
+  const [serviceId, setServiceId] = useState("");
+  const [archive, setArchive] = useState(false);
+  const [offset, setOffset] = useState(0);
+  const [editingPost, setEditingPost] = useState<WallPost | null>(null);
+  const [creating, setCreating] = useState(false);
+  const [tagsOpen, setTagsOpen] = useState(false);
+  const [selectedPost, setSelectedPost] = useState<WallPost | null>(null);
+
+  const loadWall = async (nextOffset = offset) => {
+    const query = new URLSearchParams({
+      offset: String(nextOffset),
+      limit: String(wallPageLimit),
+      archive: String(archive)
+    });
+    if (search.trim()) query.set("search", search.trim());
+    if (tagId) query.set("tagId", tagId);
+    if (serviceId) query.set("serviceId", serviceId);
+
+    const next = await api<WallListData>(`/api/wall?${query.toString()}`);
+    setWallData(next);
+    setOffset(nextOffset);
+    return next;
+  };
+
+  useEffect(() => {
+    loadWall(0).catch((error) => setToast(error.message));
+  }, [search, tagId, serviceId, archive, refreshKey]);
+
+  useEffect(() => {
+    if (!selectedPostId) {
+      setSelectedPost(null);
+      return;
+    }
+
+    api<WallPost>(`/api/wall/posts/${selectedPostId}`)
+      .then((post) => {
+        setSelectedPost(post);
+        return api<WallPost>(`/api/wall/posts/${selectedPostId}/view`, {
+          method: "POST",
+          body: JSON.stringify({})
+        });
+      })
+      .then((post) => {
+        setSelectedPost(post);
+        setWallData((current) => ({
+          ...current,
+          posts: {
+            ...current.posts,
+            rows: current.posts.rows.map((item) => (item.id === post.id ? post : item))
+          }
+        }));
+      })
+      .catch((error) => setToast(error.message));
+  }, [selectedPostId]);
+
+  const savePost = async (draft: WallPostDraft) => {
+    const body = { ...draft, serviceId: draft.serviceId || null, authorId: currentUser.id };
+    const path = draft.id ? `/api/wall/posts/${draft.id}` : "/api/wall/posts";
+    const method = draft.id ? "PUT" : "POST";
+    const next = await api<WallListData>(path, { method, body: JSON.stringify(body) });
+    setWallData(next);
+    setCreating(false);
+    setEditingPost(null);
+    setToast("Пост сохранён");
+  };
+
+  const archivePost = async (post: WallPost, archived: boolean) => {
+    const next = await api<WallListData>(`/api/wall/posts/${post.id}`, {
+      method: "PUT",
+      body: JSON.stringify({ ...post, authorId: currentUser.id, archived })
+    });
+    setWallData(next);
+    if (selectedPost?.id === post.id) setSelectedPost({ ...post, archived });
+    setToast(archived ? "Пост отправлен в архив" : "Пост возвращён");
+  };
+
+  const deletePost = async (post: WallPost) => {
+    if (!window.confirm(`Удалить пост "${post.title}"?`)) return;
+    const next = await api<WallListData>(`/api/wall/posts/${post.id}?userId=${encodeURIComponent(currentUser.id)}`, {
+      method: "DELETE"
+    });
+    setWallData(next);
+    if (selectedPost?.id === post.id) setWallHash();
+    setToast("Пост удалён");
+  };
+
+  const createTag = async (name: string, color: string) => {
+    const next = await api<WallListData>("/api/wall/tags", {
+      method: "POST",
+      body: JSON.stringify({ name, color })
+    });
+    setWallData(next);
+  };
+
+  const deleteTag = async (targetTagId: string) => {
+    const next = await api<WallListData>(`/api/wall/tags/${targetTagId}`, { method: "DELETE" });
+    setWallData(next);
+    if (tagId === targetTagId) setTagId("");
+  };
+
+  const uploadWallFile = async (file: File) => {
+    const response = await fetch("/api/wall/files", {
+      method: "POST",
+      headers: {
+        "Content-Type": file.type || "application/octet-stream",
+        "x-author-id": currentUser.id,
+        "x-file-name": encodeURIComponent(file.name)
+      },
+      body: file
+    });
+    const result = (await response.json()) as ApiResult;
+    if (!result.ok) throw new Error(result.error ?? "Не удалось загрузить файл");
+    const uploaded = result.payload as WallFile;
+    setWallData((current) => ({ ...current, files: [uploaded, ...current.files] }));
+    return uploaded;
+  };
+
+  return (
+    <section className="wall-layout">
+      <div className="panel wall-list-panel">
+        <div className="panel-head">
+          <div>
+            <h2>Стена</h2>
+            <small>Гайды, конфиги, ссылки и файлы по сервисам</small>
+          </div>
+          <div className="wall-head-actions">
+            <button className="ghost" type="button" onClick={() => setTagsOpen(true)}>
+              <Tag size={16} />
+              Теги
+            </button>
+            <button className="primary" type="button" onClick={() => setCreating(true)}>
+              <Plus size={16} />
+              Пост
+            </button>
+          </div>
+        </div>
+
+        <div className="wall-filters">
+          <input placeholder="Поиск по стене" value={search} onChange={(event) => setSearch(event.target.value)} />
+          <select value={tagId} onChange={(event) => setTagId(event.target.value)}>
+            <option value="">Все теги</option>
+            {wallData.tags.map((tag) => (
+              <option key={tag.id} value={tag.id}>
+                {tag.name}
+              </option>
+            ))}
+          </select>
+          <select value={serviceId} onChange={(event) => setServiceId(event.target.value)}>
+            <option value="">Все сервисы</option>
+            {state.services.map((service) => (
+              <option key={service.id} value={service.id}>
+                {service.name}
+              </option>
+            ))}
+          </select>
+          <button className={classNames("ghost", archive && "active-filter")} type="button" onClick={() => setArchive((value) => !value)}>
+            <Archive size={16} />
+            Архив
+          </button>
+        </div>
+
+        <div className="wall-rows">
+          {wallData.posts.rows.map((post) => (
+            <WallPostRow
+              key={post.id}
+              post={post}
+              tags={wallData.tags}
+              files={wallData.files}
+              service={post.serviceId ? serviceById(post.serviceId) : undefined}
+              author={userById(post.authorId)}
+              selected={selectedPostId === post.id}
+              canManage={isAdmin || post.authorId === currentUser.id}
+              onOpen={() => setWallHash(post.id)}
+              onEdit={() => setEditingPost(post)}
+              onArchive={() => archivePost(post, !post.archived).catch((error) => setToast(error.message))}
+              onDelete={() => deletePost(post).catch((error) => setToast(error.message))}
+            />
+          ))}
+          {!wallData.posts.rows.length && <Empty label="Постов пока нет" />}
+        </div>
+
+        <PaginationControls page={wallData.posts} onChange={(nextOffset) => loadWall(nextOffset).catch((error) => setToast(error.message))} />
+      </div>
+
+      <WallPostPanel
+        post={selectedPost}
+        tags={wallData.tags}
+        files={wallData.files}
+        serviceById={serviceById}
+        userById={userById}
+        canManage={Boolean(selectedPost && (isAdmin || selectedPost.authorId === currentUser.id))}
+        onEdit={(post) => setEditingPost(post)}
+        onArchive={(post) => archivePost(post, !post.archived).catch((error) => setToast(error.message))}
+        onDelete={(post) => deletePost(post).catch((error) => setToast(error.message))}
+        setToast={setToast}
+      />
+
+      {(creating || editingPost) && (
+        <WallPostModal
+          state={state}
+          currentUser={currentUser}
+          post={editingPost}
+          tags={wallData.tags}
+          files={wallData.files}
+          onUpload={uploadWallFile}
+          onClose={() => {
+            setCreating(false);
+            setEditingPost(null);
+          }}
+          onSave={savePost}
+          setToast={setToast}
+        />
+      )}
+
+      {tagsOpen && (
+        <WallTagsModal
+          tags={wallData.tags}
+          onCreate={(name, color) => createTag(name, color).catch((error) => setToast(error.message))}
+          onDelete={(targetTagId) => deleteTag(targetTagId).catch((error) => setToast(error.message))}
+          onClose={() => setTagsOpen(false)}
+        />
+      )}
+    </section>
+  );
+}
+
+function WallPostRow({
+  post,
+  tags,
+  files,
+  service,
+  author,
+  selected,
+  canManage,
+  onOpen,
+  onEdit,
+  onArchive,
+  onDelete
+}: {
+  post: WallPost;
+  tags: WallTag[];
+  files: WallFile[];
+  service?: Service;
+  author?: User;
+  selected: boolean;
+  canManage: boolean;
+  onOpen: () => void;
+  onEdit: () => void;
+  onArchive: () => void;
+  onDelete: () => void;
+}) {
+  const postTags = tags.filter((tag) => post.tagIds.includes(tag.id));
+  const previewImage = files.find((file) => post.fileIds.includes(file.id) && file.mimeType.startsWith("image/"));
+
+  return (
+    <article className={classNames("wall-row", post.pinned && "pinned", selected && "selected")} onClick={onOpen}>
+      <div className="wall-preview">
+        {previewImage ? <img src={previewImage.url} alt="" /> : <FileText size={22} />}
+      </div>
+      <div className="wall-row-main">
+        <div className="wall-row-title">
+          {post.pinned && <Pin size={14} />}
+          <strong>{post.title}</strong>
+          {post.archived && <span className="status-pill cancelled">Архив</span>}
+        </div>
+        <p>{post.preview || post.content.slice(0, 160) || "Без превью"}</p>
+        <div className="wall-meta">
+          <span>{author?.name ?? "Автор"}</span>
+          <span>{dateTime(post.updatedAt)}</span>
+          <span>
+            <Eye size={13} />
+            {post.views}
+          </span>
+          {service && <span>{service.name}</span>}
+        </div>
+      </div>
+      <div className="wall-tag-strip">
+        {postTags.slice(0, 4).map((tag) => (
+          <span key={tag.id} className="wall-tag" style={{ "--tag-color": tag.color } as CSSProperties}>
+            {tag.name}
+          </span>
+        ))}
+      </div>
+      {canManage && (
+        <div className="wall-row-actions" onClick={(event) => event.stopPropagation()}>
+          <button className="icon-button" type="button" title="Редактировать" onClick={onEdit}>
+            <Pencil size={15} />
+          </button>
+          <button className="icon-button" type="button" title={post.archived ? "Вернуть" : "Архивировать"} onClick={onArchive}>
+            {post.archived ? <ArchiveRestore size={15} /> : <Archive size={15} />}
+          </button>
+          <button className="icon-button danger" type="button" title="Удалить" onClick={onDelete}>
+            <Trash2 size={15} />
+          </button>
+        </div>
+      )}
+    </article>
+  );
+}
+
+function WallPostPanel({
+  post,
+  tags,
+  files,
+  serviceById,
+  userById,
+  canManage,
+  onEdit,
+  onArchive,
+  onDelete,
+  setToast
+}: {
+  post: WallPost | null;
+  tags: WallTag[];
+  files: WallFile[];
+  serviceById: (id: string) => Service | undefined;
+  userById: (id: string) => User | undefined;
+  canManage: boolean;
+  onEdit: (post: WallPost) => void;
+  onArchive: (post: WallPost) => void;
+  onDelete: (post: WallPost) => void;
+  setToast: (value: string) => void;
+}) {
+  if (!post) {
+    return (
+      <aside className="panel wall-post-panel empty-post">
+        <BookOpen size={28} />
+        <strong>Выберите пост</strong>
+        <span>Откройте гайд из списка или создайте новый.</span>
+      </aside>
+    );
+  }
+
+  const postTags = tags.filter((tag) => post.tagIds.includes(tag.id));
+  const attachments = files.filter((file) => post.fileIds.includes(file.id));
+  const service = post.serviceId ? serviceById(post.serviceId) : undefined;
+  const author = userById(post.authorId);
+
+  return (
+    <aside className="panel wall-post-panel">
+      <div className="wall-post-head">
+        <div>
+          <div className="wall-row-title">
+            {post.pinned && <Pin size={15} />}
+            <h2>{post.title}</h2>
+          </div>
+          <div className="wall-meta">
+            <span>{author?.name ?? "Автор"}</span>
+            <span>{service?.name ?? "Общий пост"}</span>
+            <span>{dateTime(post.updatedAt)}</span>
+            <span>
+              <Eye size={13} />
+              {post.views}
+            </span>
+          </div>
+        </div>
+        <button
+          className="ghost compact"
+          type="button"
+          onClick={() => {
+            void navigator.clipboard?.writeText(`${window.location.origin}${window.location.pathname}#/wall/${post.id}`);
+            setToast("Ссылка скопирована");
+          }}
+        >
+          <Link size={14} />
+          Ссылка
+        </button>
+      </div>
+
+      <div className="wall-tag-strip full">
+        {post.archived && <span className="status-pill cancelled">Архив</span>}
+        {postTags.map((tag) => (
+          <span key={tag.id} className="wall-tag" style={{ "--tag-color": tag.color } as CSSProperties}>
+            {tag.name}
+          </span>
+        ))}
+      </div>
+
+      <div className="wall-content">{renderWallContent(post.content, files)}</div>
+
+      {attachments.length > 0 && (
+        <div className="wall-attachments">
+          <strong>Файлы для установки</strong>
+          {attachments.map((file) => (
+            <a key={file.id} className="wall-file-link" href={file.url} download>
+              <Paperclip size={15} />
+              <span>{file.originalName}</span>
+              <small>{fileSize(file.size)}</small>
+            </a>
+          ))}
+        </div>
+      )}
+
+      {canManage && (
+        <div className="wall-post-actions">
+          <button className="ghost" type="button" onClick={() => onEdit(post)}>
+            <Pencil size={16} />
+            Править
+          </button>
+          <button className="ghost" type="button" onClick={() => onArchive(post)}>
+            {post.archived ? <ArchiveRestore size={16} /> : <Archive size={16} />}
+            {post.archived ? "Вернуть" : "В архив"}
+          </button>
+          <button className="ghost danger" type="button" onClick={() => onDelete(post)}>
+            <Trash2 size={16} />
+            Удалить
+          </button>
+        </div>
+      )}
+    </aside>
+  );
+}
+
+function renderWallContent(content: string, files: WallFile[]) {
+  const fileByUrl = new Map(files.map((file) => [file.url, file]));
+  const tokenPattern = /!\[([^\]|]+)(?:\|(\d{2,4}))?\]\(([^)]+)\)|\[([^\]]+)\]\(([^)]+)\)/g;
+
+  return (content || "Пост пока пуст").split("\n").map((line, lineIndex) => {
+    const parts: ReactNode[] = [];
+    let cursor = 0;
+    for (const match of line.matchAll(tokenPattern)) {
+      if (match.index === undefined) continue;
+      if (match.index > cursor) parts.push(line.slice(cursor, match.index));
+
+      if (match[3]) {
+        const width = Math.min(1200, Math.max(120, Number(match[2] ?? 720)));
+        parts.push(<img key={`${lineIndex}-${match.index}`} className="wall-inline-image" src={match[3]} alt={match[1]} style={{ width }} />);
+      } else {
+        const file = fileByUrl.get(match[5]);
+        parts.push(
+          <a key={`${lineIndex}-${match.index}`} href={match[5]} download={Boolean(file)}>
+            {match[4]}
+          </a>
+        );
+      }
+      cursor = match.index + match[0].length;
+    }
+    if (cursor < line.length) parts.push(line.slice(cursor));
+    return <p key={lineIndex}>{parts.length ? parts : "\u00A0"}</p>;
+  });
+}
+
+function WallPostModal({
+  state,
+  currentUser,
+  post,
+  tags,
+  files,
+  onUpload,
+  onClose,
+  onSave,
+  setToast
+}: {
+  state: AppState;
+  currentUser: User;
+  post: WallPost | null;
+  tags: WallTag[];
+  files: WallFile[];
+  onUpload: (file: File) => Promise<WallFile>;
+  onClose: () => void;
+  onSave: (draft: WallPostDraft) => Promise<void>;
+  setToast: (value: string) => void;
+}) {
+  const textRef = useRef<HTMLTextAreaElement>(null);
+  const [draft, setDraft] = useState<WallPostDraft>(
+    post
+      ? {
+          id: post.id,
+          title: post.title,
+          preview: post.preview,
+          content: post.content,
+          serviceId: post.serviceId ?? "",
+          tagIds: post.tagIds,
+          fileIds: post.fileIds,
+          pinned: post.pinned,
+          archived: post.archived
+        }
+      : blankWallPostDraft
+  );
+  const [uploading, setUploading] = useState(false);
+  const [imageWidth, setImageWidth] = useState(720);
+
+  const attachedFiles = files.filter((file) => draft.fileIds.includes(file.id));
+
+  const insertText = (value: string, fileId?: string) => {
+    const textarea = textRef.current;
+    const start = textarea?.selectionStart ?? draft.content.length;
+    const end = textarea?.selectionEnd ?? draft.content.length;
+    const nextContent = `${draft.content.slice(0, start)}${value}${draft.content.slice(end)}`;
+    setDraft((current) => ({
+      ...current,
+      content: nextContent,
+      fileIds: fileId && !current.fileIds.includes(fileId) ? [...current.fileIds, fileId] : current.fileIds
+    }));
+    window.setTimeout(() => {
+      textarea?.focus();
+      textarea?.setSelectionRange(start + value.length, start + value.length);
+    });
+  };
+
+  const insertFileLink = (file: WallFile) => insertText(`[${file.originalName}](${file.url})`, file.id);
+  const insertImage = (file: WallFile) => insertText(`![${file.originalName}|${imageWidth}](${file.url})`, file.id);
+
+  const uploadFiles = async (fileList: FileList | null) => {
+    if (!fileList?.length) return;
+    try {
+      setUploading(true);
+      for (const file of Array.from(fileList)) {
+        const uploaded = await onUpload(file);
+        setDraft((current) => ({
+          ...current,
+          fileIds: current.fileIds.includes(uploaded.id) ? current.fileIds : [...current.fileIds, uploaded.id]
+        }));
+      }
+      setToast("Файлы загружены");
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : "Ошибка загрузки файла");
+    } finally {
+      setUploading(false);
+    }
+  };
+
+  return (
+    <ModalShell
+      title={post ? "Редактирование поста" : "Новый пост"}
+      subtitle={`Автор: ${currentUser.name}`}
+      wide
+      onClose={onClose}
+      footer={
+        <>
+          <button className="ghost" type="button" onClick={onClose}>
+            Отмена
+          </button>
+          <button className="primary" type="button" disabled={!draft.title.trim()} onClick={() => onSave(draft)}>
+            <Check size={16} />
+            Сохранить
+          </button>
+        </>
+      }
+    >
+      <div className="wall-editor">
+        <div className="form-grid modal-form">
+          <label>
+            Название
+            <input autoFocus value={draft.title} onChange={(event) => setDraft({ ...draft, title: event.target.value })} />
+          </label>
+          <label>
+            Сервис
+            <select value={draft.serviceId} onChange={(event) => setDraft({ ...draft, serviceId: event.target.value })}>
+              <option value="">Общий пост</option>
+              {state.services.map((service) => (
+                <option key={service.id} value={service.id}>
+                  {service.name}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="wide-field">
+            Превью
+            <input value={draft.preview} onChange={(event) => setDraft({ ...draft, preview: event.target.value })} />
+          </label>
+          <label className="toggle-row">
+            <input checked={draft.pinned} type="checkbox" onChange={(event) => setDraft({ ...draft, pinned: event.target.checked })} />
+            Закрепить сверху
+          </label>
+          <label className="toggle-row">
+            <input checked={draft.archived} type="checkbox" onChange={(event) => setDraft({ ...draft, archived: event.target.checked })} />
+            Архив
+          </label>
+        </div>
+
+        <div className="wall-editor-tags">
+          {tags.map((tag) => (
+            <button
+              key={tag.id}
+              className={classNames("wall-tag selectable", draft.tagIds.includes(tag.id) && "selected")}
+              style={{ "--tag-color": tag.color } as CSSProperties}
+              type="button"
+              onClick={() =>
+                setDraft((current) => ({
+                  ...current,
+                  tagIds: current.tagIds.includes(tag.id)
+                    ? current.tagIds.filter((item) => item !== tag.id)
+                    : [...current.tagIds, tag.id]
+                }))
+              }
+            >
+              {tag.name}
+            </button>
+          ))}
+          {!tags.length && <span className="muted">Теги пока не созданы</span>}
+        </div>
+
+        <div className="wall-editor-grid">
+          <label className="wall-content-field">
+            Текст поста
+            <textarea
+              ref={textRef}
+              rows={14}
+              value={draft.content}
+              onChange={(event) => setDraft({ ...draft, content: event.target.value })}
+              onDragOver={(event) => event.preventDefault()}
+              onDrop={(event) => {
+                event.preventDefault();
+                const draggedFileId = event.dataTransfer.getData("text/plain").replace("wall-file:", "");
+                const file = files.find((item) => item.id === draggedFileId);
+                if (file) insertFileLink(file);
+              }}
+            />
+          </label>
+
+          <aside className="wall-file-box">
+            <div className="wall-file-tools">
+              <label className="file-action">
+                <Upload size={15} />
+                {uploading ? "Загрузка..." : "Загрузить"}
+                <input multiple type="file" disabled={uploading} onChange={(event) => uploadFiles(event.target.files)} />
+              </label>
+              <label>
+                Ширина картинки
+                <input type="number" min="120" max="1200" step="20" value={imageWidth} onChange={(event) => setImageWidth(Number(event.target.value))} />
+              </label>
+            </div>
+            <div className="wall-file-list">
+              {files.map((file) => {
+                const attached = draft.fileIds.includes(file.id);
+                const isImage = file.mimeType.startsWith("image/");
+                return (
+                  <div key={file.id} className={classNames("wall-file-chip", attached && "attached")} draggable onDragStart={(event) => event.dataTransfer.setData("text/plain", `wall-file:${file.id}`)}>
+                    <Paperclip size={14} />
+                    <span>{file.originalName}</span>
+                    <small>{fileSize(file.size)}</small>
+                    <button className="ghost compact" type="button" onClick={() => insertFileLink(file)}>
+                      <Link size={13} />
+                    </button>
+                    {isImage && (
+                      <button className="ghost compact" type="button" onClick={() => insertImage(file)}>
+                        <Image size={13} />
+                      </button>
+                    )}
+                    <button
+                      className="ghost compact"
+                      type="button"
+                      onClick={() =>
+                        setDraft((current) => ({
+                          ...current,
+                          fileIds: attached ? current.fileIds.filter((item) => item !== file.id) : [...current.fileIds, file.id]
+                        }))
+                      }
+                    >
+                      {attached ? "Убрать" : "Прикрепить"}
+                    </button>
+                  </div>
+                );
+              })}
+              {!files.length && <Empty label="Файлов пока нет" />}
+            </div>
+          </aside>
+        </div>
+
+        {attachedFiles.length > 0 && (
+          <div className="wall-attached-summary">
+            <strong>Прикреплено</strong>
+            {attachedFiles.map((file) => (
+              <span key={file.id} className="chip">
+                {file.originalName}
+              </span>
+            ))}
+          </div>
+        )}
+      </div>
+    </ModalShell>
+  );
+}
+
+function WallTagsModal({
+  tags,
+  onCreate,
+  onDelete,
+  onClose
+}: {
+  tags: WallTag[];
+  onCreate: (name: string, color: string) => void;
+  onDelete: (tagId: string) => void;
+  onClose: () => void;
+}) {
+  const [name, setName] = useState("");
+  const [color, setColor] = useState("#7aa8ff");
+
+  return (
+    <ModalShell
+      title="Теги стены"
+      onClose={onClose}
+      footer={
+        <>
+          <button className="ghost" type="button" onClick={onClose}>
+            Закрыть
+          </button>
+          <button
+            className="primary"
+            type="button"
+            disabled={!name.trim()}
+            onClick={() => {
+              onCreate(name, color);
+              setName("");
+            }}
+          >
+            <Plus size={16} />
+            Создать
+          </button>
+        </>
+      }
+    >
+      <div className="form-grid modal-form">
+        <label>
+          Название
+          <input autoFocus value={name} onChange={(event) => setName(event.target.value)} />
+        </label>
+        <label>
+          Цвет
+          <input type="color" value={color} onChange={(event) => setColor(event.target.value)} />
+        </label>
+      </div>
+      <div className="wall-tag-manager">
+        {tags.map((tag) => (
+          <div key={tag.id} className="currency-row">
+            <span className="wall-tag" style={{ "--tag-color": tag.color } as CSSProperties}>
+              {tag.name}
+            </span>
+            <button className="icon-button danger" type="button" title="Удалить" onClick={() => onDelete(tag.id)}>
+              <Trash2 size={15} />
+            </button>
+          </div>
+        ))}
+        {!tags.length && <Empty label="Теги пока не созданы" />}
+      </div>
+    </ModalShell>
   );
 }
 

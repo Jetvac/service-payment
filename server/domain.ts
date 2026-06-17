@@ -119,6 +119,9 @@ export function seedData(): AppData {
     debits: [],
     latencyChecks: [],
     notifications: [],
+    wallTags: [],
+    wallFiles: [],
+    wallPosts: [],
     settings: {
       telegram: {
         enabled: false,

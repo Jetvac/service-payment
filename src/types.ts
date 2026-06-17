@@ -154,6 +154,40 @@ export type Notification = {
   createdAt: string;
 };
 
+export type WallTag = {
+  id: string;
+  name: string;
+  color: string;
+  createdAt: string;
+};
+
+export type WallFile = {
+  id: string;
+  originalName: string;
+  storageName: string;
+  mimeType: string;
+  size: number;
+  url: string;
+  uploadedBy: string;
+  createdAt: string;
+};
+
+export type WallPost = {
+  id: string;
+  title: string;
+  preview: string;
+  content: string;
+  authorId: string;
+  serviceId: string | null;
+  tagIds: string[];
+  fileIds: string[];
+  pinned: boolean;
+  archived: boolean;
+  views: number;
+  createdAt: string;
+  updatedAt: string;
+};
+
 export type ServiceSummary = {
   serviceId: string;
   memberCount: number;

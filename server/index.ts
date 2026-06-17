@@ -5,7 +5,19 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { Client } from "ssh2";
 import { Store } from "./store";
-import type { AppData, AutoDeposit, BillingPeriod, Currency, LatencyCheck, Service, ServiceConnectionSettings, ServiceHealthStatus, User } from "./types";
+import type {
+  AppData,
+  AutoDeposit,
+  BillingPeriod,
+  Currency,
+  LatencyCheck,
+  Service,
+  ServiceConnectionSettings,
+  ServiceHealthStatus,
+  User,
+  WallFile,
+  WallPost
+} from "./types";
 import {
   addDeposit,
   addNotification,
@@ -41,6 +53,8 @@ const port = Number(process.env.PORT ?? 4077);
 const store = new Store();
 const execFileAsync = promisify(execFile);
 const latencyLineColors = ["#7aa8ff", "#47d18c", "#f8c15d", "#ff8b82", "#b994ff", "#5ed4d6", "#f49ac2", "#c6cad2"];
+const wallFilesDir = path.resolve(process.cwd(), "data", "wall-files");
+const maxWallFileSize = 2 * 1024 * 1024 * 1024;
 
 app.use(express.json({ limit: "25mb" }));
 
@@ -66,6 +80,81 @@ function pageResult<T>(items: T[], offset: number, limit: number) {
     offset,
     limit,
     hasMore: offset + limit < items.length
+  };
+}
+
+function wallFileUrl(fileId: string) {
+  return `/api/wall/files/${encodeURIComponent(fileId)}/download`;
+}
+
+function safeFileName(value: string) {
+  const normalized = value.replace(/[<>:"/\\|?*\u0000-\u001f]/g, "_").trim();
+  return normalized.slice(0, 180) || "file";
+}
+
+function decodeHeaderValue(value: unknown, fallback = "") {
+  const text = String(value ?? fallback);
+  try {
+    return decodeURIComponent(text);
+  } catch {
+    return text;
+  }
+}
+
+function getActor(data: AppData, userId: unknown) {
+  const user = data.users.find((item) => item.id === String(userId ?? ""));
+  if (!user) throw new Error("Пользователь не найден");
+  return user;
+}
+
+function canManageWallPost(actor: User, post: WallPost) {
+  return actor.botAdmin || post.authorId === actor.id;
+}
+
+function normalizeStringList(value: unknown) {
+  return Array.isArray(value) ? Array.from(new Set(value.map((item) => String(item)).filter(Boolean))) : [];
+}
+
+function normalizeWallPostInput(data: AppData, body: Partial<WallPost>, fallback?: WallPost) {
+  const serviceId = body.serviceId === null || body.serviceId === "" || body.serviceId === undefined ? null : String(body.serviceId);
+  if (serviceId && !data.services.some((service) => service.id === serviceId)) throw new Error("Сервис не найден");
+
+  const tagIds = normalizeStringList(body.tagIds).filter((tagId) => data.wallTags.some((tag) => tag.id === tagId));
+  const fileIds = normalizeStringList(body.fileIds).filter((fileId) => data.wallFiles.some((file) => file.id === fileId));
+
+  return {
+    title: String(body.title ?? fallback?.title ?? "").trim().slice(0, 160) || "Без названия",
+    preview: String(body.preview ?? fallback?.preview ?? "").slice(0, 420),
+    content: String(body.content ?? fallback?.content ?? "").slice(0, 200_000),
+    serviceId,
+    tagIds,
+    fileIds,
+    pinned: Boolean(body.pinned ?? fallback?.pinned ?? false),
+    archived: Boolean(body.archived ?? fallback?.archived ?? false)
+  };
+}
+
+function wallListData(data: AppData, query: Record<string, unknown>) {
+  const { offset, limit } = readPage(query, 20, 80);
+  const search = String(query.search ?? "").trim().toLowerCase();
+  const serviceId = String(query.serviceId ?? "");
+  const tagId = String(query.tagId ?? "");
+  const archived = String(query.archive ?? query.archived ?? "false") === "true";
+
+  const posts = data.wallPosts
+    .filter((post) => post.archived === archived)
+    .filter((post) => !serviceId || post.serviceId === serviceId)
+    .filter((post) => !tagId || post.tagIds.includes(tagId))
+    .filter((post) => {
+      if (!search) return true;
+      return [post.title, post.preview, post.content].some((value) => value.toLowerCase().includes(search));
+    })
+    .sort((a, b) => Number(b.pinned) - Number(a.pinned) || new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime());
+
+  return {
+    posts: pageResult(posts, offset, limit),
+    tags: data.wallTags,
+    files: data.wallFiles
   };
 }
 
@@ -588,6 +677,233 @@ app.get("/api/latency-checks", (req, res) => {
   try {
     const { offset, limit } = readPage(req.query as Record<string, unknown>, 20, 100);
     res.json(ok(pageResult(store.read().latencyChecks, offset, limit)));
+  } catch (error) {
+    res.status(400).json(fail(error));
+  }
+});
+
+app.get("/api/wall", (req, res) => {
+  try {
+    res.json(ok(wallListData(store.read(), req.query as Record<string, unknown>)));
+  } catch (error) {
+    res.status(400).json(fail(error));
+  }
+});
+
+app.get("/api/wall/posts/:id", (req, res) => {
+  try {
+    const post = store.read().wallPosts.find((item) => item.id === req.params.id);
+    if (!post) throw new Error("Пост не найден");
+    res.json(ok(post));
+  } catch (error) {
+    res.status(404).json(fail(error));
+  }
+});
+
+app.post("/api/wall/posts/:id/view", (req, res) => {
+  try {
+    let post: WallPost | undefined;
+    store.write((data) => {
+      post = data.wallPosts.find((item) => item.id === req.params.id);
+      if (!post) throw new Error("Пост не найден");
+      post.views += 1;
+    });
+    res.json(ok(post));
+  } catch (error) {
+    res.status(404).json(fail(error));
+  }
+});
+
+app.post("/api/wall/posts", (req, res) => {
+  try {
+    store.write((data) => {
+      const actor = getActor(data, req.body.authorId);
+      const createdAt = nowIso();
+      const input = normalizeWallPostInput(data, req.body);
+      data.wallPosts.unshift({
+        id: id("wpost"),
+        ...input,
+        authorId: actor.id,
+        views: 0,
+        createdAt,
+        updatedAt: createdAt
+      });
+    });
+
+    res.json(ok(wallListData(store.read(), req.query as Record<string, unknown>)));
+  } catch (error) {
+    res.status(400).json(fail(error));
+  }
+});
+
+app.put("/api/wall/posts/:id", (req, res) => {
+  try {
+    store.write((data) => {
+      const post = data.wallPosts.find((item) => item.id === req.params.id);
+      if (!post) throw new Error("Пост не найден");
+      const actor = getActor(data, req.body.authorId);
+      if (!canManageWallPost(actor, post)) throw new Error("Нет прав на изменение поста");
+      Object.assign(post, normalizeWallPostInput(data, req.body, post), { updatedAt: nowIso() });
+    });
+
+    res.json(ok(wallListData(store.read(), req.query as Record<string, unknown>)));
+  } catch (error) {
+    res.status(400).json(fail(error));
+  }
+});
+
+app.delete("/api/wall/posts/:id", (req, res) => {
+  try {
+    store.write((data) => {
+      const post = data.wallPosts.find((item) => item.id === req.params.id);
+      if (!post) throw new Error("Пост не найден");
+      const actor = getActor(data, req.query.userId);
+      if (!canManageWallPost(actor, post)) throw new Error("Нет прав на удаление поста");
+      data.wallPosts = data.wallPosts.filter((item) => item.id !== post.id);
+    });
+
+    res.json(ok(wallListData(store.read(), req.query as Record<string, unknown>)));
+  } catch (error) {
+    res.status(400).json(fail(error));
+  }
+});
+
+app.post("/api/wall/tags", (req, res) => {
+  try {
+    store.write((data) => {
+      const name = String(req.body.name ?? "").trim().slice(0, 48);
+      if (!name) throw new Error("Название тега обязательно");
+      if (data.wallTags.some((tag) => tag.name.toLowerCase() === name.toLowerCase())) throw new Error("Такой тег уже есть");
+      data.wallTags.push({
+        id: id("wtag"),
+        name,
+        color: String(req.body.color ?? "#7aa8ff"),
+        createdAt: nowIso()
+      });
+    });
+
+    res.json(ok(wallListData(store.read(), req.query as Record<string, unknown>)));
+  } catch (error) {
+    res.status(400).json(fail(error));
+  }
+});
+
+app.delete("/api/wall/tags/:id", (req, res) => {
+  try {
+    store.write((data) => {
+      data.wallTags = data.wallTags.filter((tag) => tag.id !== req.params.id);
+      for (const post of data.wallPosts) {
+        post.tagIds = post.tagIds.filter((tagId) => tagId !== req.params.id);
+      }
+    });
+
+    res.json(ok(wallListData(store.read(), req.query as Record<string, unknown>)));
+  } catch (error) {
+    res.status(400).json(fail(error));
+  }
+});
+
+app.post("/api/wall/files", async (req, res) => {
+  const data = store.read();
+  const actor = data.users.find((item) => item.id === String(req.header("x-author-id") ?? req.query.authorId ?? ""));
+  if (!actor) {
+    res.status(400).json(fail(new Error("Пользователь не найден")));
+    return;
+  }
+
+  const contentLength = Number(req.header("content-length") ?? 0);
+  if (contentLength > maxWallFileSize) {
+    res.status(413).json(fail(new Error("Файл больше 2 ГБ")));
+    return;
+  }
+
+  const fileId = id("wfile");
+  const originalName = safeFileName(decodeHeaderValue(req.header("x-file-name"), "file"));
+  const storageName = `${fileId}_${originalName}`;
+  const filePath = path.join(wallFilesDir, storageName);
+  let received = 0;
+
+  try {
+    fs.mkdirSync(wallFilesDir, { recursive: true });
+    await new Promise<void>((resolve, reject) => {
+      const output = fs.createWriteStream(filePath);
+      const failUpload = (error: Error) => {
+        output.destroy();
+        fs.rmSync(filePath, { force: true });
+        reject(error);
+      };
+
+      req.on("data", (chunk: Buffer) => {
+        received += chunk.length;
+        if (received > maxWallFileSize) {
+          req.destroy(new Error("Файл больше 2 ГБ"));
+        }
+      });
+      req.on("error", failUpload);
+      output.on("error", failUpload);
+      output.on("finish", resolve);
+      req.pipe(output);
+    });
+
+    const file: WallFile = {
+      id: fileId,
+      originalName,
+      storageName,
+      mimeType: String(req.header("content-type") ?? "application/octet-stream"),
+      size: received,
+      url: wallFileUrl(fileId),
+      uploadedBy: actor.id,
+      createdAt: nowIso()
+    };
+
+    store.write((current) => {
+      current.wallFiles.unshift(file);
+    });
+
+    res.json(ok(file));
+  } catch (error) {
+    fs.rmSync(filePath, { force: true });
+    res.status(400).json(fail(error));
+  }
+});
+
+app.get("/api/wall/files/:id/download", (req, res) => {
+  try {
+    const file = store.read().wallFiles.find((item) => item.id === req.params.id);
+    if (!file) throw new Error("Файл не найден");
+    const filePath = path.join(wallFilesDir, file.storageName);
+    if (!fs.existsSync(filePath)) throw new Error("Файл отсутствует на сервере");
+
+    res.setHeader("Content-Type", file.mimeType || "application/octet-stream");
+    res.setHeader("Content-Length", String(file.size));
+    res.setHeader(
+      "Content-Disposition",
+      `inline; filename="${safeFileName(file.originalName).replace(/"/g, "")}"; filename*=UTF-8''${encodeURIComponent(file.originalName)}`
+    );
+    fs.createReadStream(filePath).pipe(res);
+  } catch (error) {
+    res.status(404).json(fail(error));
+  }
+});
+
+app.delete("/api/wall/files/:id", (req, res) => {
+  try {
+    let storageName = "";
+    store.write((data) => {
+      const file = data.wallFiles.find((item) => item.id === req.params.id);
+      if (!file) throw new Error("Файл не найден");
+      const actor = getActor(data, req.query.userId);
+      if (!actor.botAdmin && file.uploadedBy !== actor.id) throw new Error("Нет прав на удаление файла");
+
+      storageName = file.storageName;
+      data.wallFiles = data.wallFiles.filter((item) => item.id !== file.id);
+      for (const post of data.wallPosts) {
+        post.fileIds = post.fileIds.filter((fileId) => fileId !== file.id);
+      }
+    });
+
+    if (storageName) fs.rmSync(path.join(wallFilesDir, storageName), { force: true });
+    res.json(ok(wallListData(store.read(), req.query as Record<string, unknown>)));
   } catch (error) {
     res.status(400).json(fail(error));
   }

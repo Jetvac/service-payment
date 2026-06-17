@@ -18,7 +18,8 @@ export class Store {
   }
 
   exportData() {
-    return JSON.parse(JSON.stringify(this.data)) as AppData;
+    const { wallFiles: _wallFiles, wallPosts: _wallPosts, wallTags: _wallTags, ...paymentData } = this.data;
+    return JSON.parse(JSON.stringify(paymentData)) as Omit<AppData, "wallFiles" | "wallPosts" | "wallTags">;
   }
 
   write(mutator: (data: AppData) => void) {
@@ -28,7 +29,15 @@ export class Store {
   }
 
   replace(raw: unknown) {
-    this.data = this.migrate(this.normalizeImport(raw));
+    const wallData = {
+      wallFiles: this.data.wallFiles ?? [],
+      wallPosts: this.data.wallPosts ?? [],
+      wallTags: this.data.wallTags ?? []
+    };
+    this.data = {
+      ...this.migrate(this.normalizeImport(raw)),
+      ...wallData
+    };
     this.persist();
     return this.data;
   }
@@ -80,6 +89,9 @@ export class Store {
       debits: Array.isArray(backup.debits) ? backup.debits : [],
       latencyChecks: Array.isArray(backup.latencyChecks) ? backup.latencyChecks : [],
       notifications: Array.isArray(backup.notifications) ? backup.notifications : [],
+      wallTags: Array.isArray(backup.wallTags) ? backup.wallTags : [],
+      wallFiles: Array.isArray(backup.wallFiles) ? backup.wallFiles : [],
+      wallPosts: Array.isArray(backup.wallPosts) ? backup.wallPosts : [],
       settings: {
         ...fallback.settings,
         ...(backup.settings ?? {}),
@@ -164,6 +176,9 @@ export class Store {
     }
 
     data.notifications ??= [];
+    data.wallTags ??= [];
+    data.wallFiles ??= [];
+    data.wallPosts ??= [];
     data.autoDeposits ??= [];
     data.deposits ??= [];
     data.debits ??= [];
@@ -254,6 +269,40 @@ export class Store {
     }
 
     data.latencyChecks = data.latencyChecks.slice(0, 2000);
+
+    for (const tag of data.wallTags) {
+      tag.id = String(tag.id ?? "");
+      tag.name = String(tag.name ?? "Тег").trim() || "Тег";
+      tag.color = String(tag.color ?? "#7aa8ff");
+      tag.createdAt = String(tag.createdAt ?? new Date().toISOString());
+    }
+
+    for (const file of data.wallFiles) {
+      file.id = String(file.id ?? "");
+      file.originalName = String(file.originalName ?? "file");
+      file.storageName = String(file.storageName ?? "");
+      file.mimeType = String(file.mimeType ?? "application/octet-stream");
+      file.size = Math.max(0, normalizeNumber(file.size, 0));
+      file.url = String(file.url ?? `/api/wall/files/${file.id}/download`);
+      file.uploadedBy = String(file.uploadedBy ?? "");
+      file.createdAt = String(file.createdAt ?? new Date().toISOString());
+    }
+
+    for (const post of data.wallPosts) {
+      post.id = String(post.id ?? "");
+      post.title = String(post.title ?? "Без названия").trim() || "Без названия";
+      post.preview = String(post.preview ?? "");
+      post.content = String(post.content ?? "");
+      post.authorId = String(post.authorId ?? data.users[0]?.id ?? "");
+      post.serviceId = post.serviceId ? String(post.serviceId) : null;
+      post.tagIds = Array.isArray(post.tagIds) ? post.tagIds.map(String) : [];
+      post.fileIds = Array.isArray(post.fileIds) ? post.fileIds.map(String) : [];
+      post.pinned = Boolean(post.pinned);
+      post.archived = Boolean(post.archived);
+      post.views = Math.max(0, normalizeNumber(post.views, 0));
+      post.createdAt = String(post.createdAt ?? new Date().toISOString());
+      post.updatedAt = String(post.updatedAt ?? post.createdAt);
+    }
 
     return data;
   }
