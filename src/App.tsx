@@ -2079,6 +2079,7 @@ function WallPostDetail({
   const attachments = files.filter((file) => post.fileIds.includes(file.id));
   const service = post.serviceId ? serviceById(post.serviceId) : undefined;
   const author = userById(post.authorId);
+  const displayAuthor = author ?? { name: "Автор", avatarUrl: "" };
   const pinned = isWallPostPinned(post, tags);
   const archived = isWallPostArchived(post, tags);
 
@@ -2090,13 +2091,18 @@ function WallPostDetail({
           Назад
         </button>
         <div className="wall-detail-title">
-          <div className="wall-row-title">
-            {pinned && <Pin size={15} />}
-            <h2>{post.title}</h2>
-            {archived && <span className="status-pill cancelled">Архив</span>}
+          <div className="wall-detail-title-line">
+            <div className="wall-row-title">
+              {pinned && <Pin size={15} />}
+              <h2>{post.title}</h2>
+              {archived && <span className="status-pill cancelled">Архив</span>}
+            </div>
+            <div className="wall-detail-author">
+              <UserAvatar user={displayAuthor} />
+              <span>{displayAuthor.name}</span>
+            </div>
           </div>
           <div className="wall-meta">
-            <span>{author?.name ?? "Автор"}</span>
             <span>{service?.name ?? "Общий пост"}</span>
             <span>{dateTime(post.updatedAt)}</span>
             <span>
@@ -2172,9 +2178,17 @@ function WallPostDetail({
 
 function WallAttachment({ file }: { file: WallFile }) {
   const isImage = file.mimeType.startsWith("image/");
+  if (isImage) {
+    return (
+      <a className="wall-image-attachment" href={file.url} target="_blank" rel="noreferrer" title={file.originalName}>
+        <img src={file.url} alt={file.originalName} />
+      </a>
+    );
+  }
+
   return (
-    <a className={classNames("wall-file-link", isImage && "image-attachment")} href={file.url} download>
-      {isImage ? <img src={file.url} alt="" /> : <Paperclip size={15} />}
+    <a className="wall-file-link" href={file.url} download>
+      <Paperclip size={15} />
       <span>{file.originalName}</span>
       <small>{fileSize(file.size)}</small>
     </a>
@@ -2286,7 +2300,7 @@ function CommentItem({
               ))}
             </div>
           )}
-          <button className="ghost compact" type="button" onClick={() => setReplying((value) => !value)}>
+          <button className="comment-reply-button" type="button" onClick={() => setReplying((value) => !value)}>
             Ответить
           </button>
           {replying && (
