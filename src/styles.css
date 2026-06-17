@@ -1006,6 +1006,19 @@ td small {
   background: color-mix(in srgb, var(--tag-color, #7aa8ff), transparent 76%);
 }
 
+.wall-tag-row {
+  display: grid;
+  grid-template-columns: minmax(120px, 1fr) auto auto 34px;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+}
+
+.compact-toggle {
+  min-height: 28px;
+  white-space: nowrap;
+}
+
 .wall-post-panel {
   position: sticky;
   top: 24px;
@@ -1107,6 +1120,47 @@ td small {
   gap: 14px;
 }
 
+.wall-preview-picker {
+  display: grid;
+  gap: 8px;
+  color: #8a8f98;
+  font-size: 12px;
+}
+
+.wall-preview-drop {
+  display: grid;
+  min-height: 160px;
+  place-items: center;
+  overflow: hidden;
+  border: 1px dashed rgba(122, 168, 255, 0.35);
+  border-radius: 8px;
+  color: #c8d8ff;
+  background: rgba(122, 168, 255, 0.08);
+  cursor: pointer;
+}
+
+.wall-preview-drop.has-image {
+  min-height: 210px;
+}
+
+.wall-preview-drop span {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 700;
+}
+
+.wall-preview-drop img {
+  width: 100%;
+  height: 100%;
+  min-height: 210px;
+  object-fit: cover;
+}
+
+.wall-preview-drop input {
+  display: none;
+}
+
 .wall-editor-tags,
 .wall-attached-summary,
 .wall-tag-manager {
@@ -1124,10 +1178,42 @@ td small {
 }
 
 .wall-content-field textarea {
+  display: block;
   min-height: 360px;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 13px;
   line-height: 1.5;
+}
+
+.wall-drop-zone {
+  position: relative;
+}
+
+.wall-drop-zone.dragging textarea {
+  border-color: rgba(122, 168, 255, 0.72);
+  background: rgba(122, 168, 255, 0.08);
+}
+
+.wall-drop-hint {
+  position: absolute;
+  right: 10px;
+  bottom: 10px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 999px;
+  color: #aeb4bf;
+  background: rgba(7, 8, 10, 0.82);
+  padding: 5px 8px;
+  font-size: 11px;
+  pointer-events: none;
+}
+
+.wall-drop-zone.dragging .wall-drop-hint {
+  color: #f4f5f7;
+  border-color: rgba(122, 168, 255, 0.45);
+  background: rgba(122, 168, 255, 0.18);
 }
 
 .wall-file-box {
@@ -1598,6 +1684,7 @@ td small {
     position: static;
     flex-direction: row;
     align-items: center;
+    gap: 8px;
     width: 100%;
     height: auto;
     overflow-x: auto;
@@ -1611,13 +1698,21 @@ td small {
   }
 
   .sidebar-footer {
-    margin-left: auto;
-    margin-top: 0;
+    display: none;
   }
 
   .account-card {
-    grid-template-columns: 40px 34px;
-    margin-left: auto;
+    display: flex;
+    flex: 0 0 auto;
+    grid-template-columns: none;
+    gap: 6px;
+    margin-left: 0;
+    padding: 6px;
+  }
+
+  .account-card .icon-button {
+    width: 34px;
+    grid-row: auto;
   }
 
   .workspace {
@@ -1627,10 +1722,6 @@ td small {
   .topbar {
     align-items: flex-start;
     flex-direction: column;
-  }
-
-  .top-actions {
-    width: 100%;
   }
 
   .page-grid,
@@ -1650,7 +1741,8 @@ td small {
 
   .wall-filters,
   .wall-row,
-  .wall-file-chip {
+  .wall-file-chip,
+  .wall-tag-row {
     grid-template-columns: 1fr;
   }
 

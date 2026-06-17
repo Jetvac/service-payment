@@ -274,6 +274,8 @@ export class Store {
       tag.id = String(tag.id ?? "");
       tag.name = String(tag.name ?? "Тег").trim() || "Тег";
       tag.color = String(tag.color ?? "#7aa8ff");
+      tag.pinned = Boolean(tag.pinned);
+      tag.archived = Boolean(tag.archived);
       tag.createdAt = String(tag.createdAt ?? new Date().toISOString());
     }
 
@@ -289,16 +291,19 @@ export class Store {
     }
 
     for (const post of data.wallPosts) {
+      const legacyPost = post as typeof post & { preview?: unknown; pinned?: unknown; archived?: unknown };
       post.id = String(post.id ?? "");
       post.title = String(post.title ?? "Без названия").trim() || "Без названия";
-      post.preview = String(post.preview ?? "");
+      post.previewFileId = post.previewFileId ? String(post.previewFileId) : null;
+      if (post.previewFileId && !data.wallFiles.some((file) => file.id === post.previewFileId)) post.previewFileId = null;
       post.content = String(post.content ?? "");
       post.authorId = String(post.authorId ?? data.users[0]?.id ?? "");
       post.serviceId = post.serviceId ? String(post.serviceId) : null;
       post.tagIds = Array.isArray(post.tagIds) ? post.tagIds.map(String) : [];
       post.fileIds = Array.isArray(post.fileIds) ? post.fileIds.map(String) : [];
-      post.pinned = Boolean(post.pinned);
-      post.archived = Boolean(post.archived);
+      delete legacyPost.preview;
+      delete legacyPost.pinned;
+      delete legacyPost.archived;
       post.views = Math.max(0, normalizeNumber(post.views, 0));
       post.createdAt = String(post.createdAt ?? new Date().toISOString());
       post.updatedAt = String(post.updatedAt ?? post.createdAt);

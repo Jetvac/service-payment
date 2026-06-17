@@ -158,6 +158,8 @@ export type WallTag = {
   id: string;
   name: string;
   color: string;
+  pinned: boolean;
+  archived: boolean;
   createdAt: string;
 };
 
@@ -175,14 +177,12 @@ export type WallFile = {
 export type WallPost = {
   id: string;
   title: string;
-  preview: string;
+  previewFileId: string | null;
   content: string;
   authorId: string;
   serviceId: string | null;
   tagIds: string[];
   fileIds: string[];
-  pinned: boolean;
-  archived: boolean;
   views: number;
   createdAt: string;
   updatedAt: string;

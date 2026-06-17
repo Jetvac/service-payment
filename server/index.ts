@@ -16,7 +16,8 @@ import type {
   ServiceHealthStatus,
   User,
   WallFile,
-  WallPost
+  WallPost,
+  WallTag
 } from "./types";
 import {
   addDeposit,
@@ -121,16 +122,27 @@ function normalizeWallPostInput(data: AppData, body: Partial<WallPost>, fallback
 
   const tagIds = normalizeStringList(body.tagIds).filter((tagId) => data.wallTags.some((tag) => tag.id === tagId));
   const fileIds = normalizeStringList(body.fileIds).filter((fileId) => data.wallFiles.some((file) => file.id === fileId));
+  const rawPreviewFileId =
+    body.previewFileId === null || body.previewFileId === "" || body.previewFileId === undefined
+      ? fallback?.previewFileId ?? null
+      : String(body.previewFileId);
+  const previewFileId = rawPreviewFileId && data.wallFiles.some((file) => file.id === rawPreviewFileId) ? rawPreviewFileId : null;
 
   return {
     title: String(body.title ?? fallback?.title ?? "").trim().slice(0, 160) || "Без названия",
-    preview: String(body.preview ?? fallback?.preview ?? "").slice(0, 420),
+    previewFileId,
     content: String(body.content ?? fallback?.content ?? "").slice(0, 200_000),
     serviceId,
     tagIds,
-    fileIds,
-    pinned: Boolean(body.pinned ?? fallback?.pinned ?? false),
-    archived: Boolean(body.archived ?? fallback?.archived ?? false)
+    fileIds
+  };
+}
+
+function wallPostFlags(post: WallPost, tags: WallTag[]) {
+  const postTags = tags.filter((tag) => post.tagIds.includes(tag.id));
+  return {
+    pinned: postTags.some((tag) => tag.pinned),
+    archived: postTags.some((tag) => tag.archived)
   };
 }
 
@@ -142,14 +154,18 @@ function wallListData(data: AppData, query: Record<string, unknown>) {
   const archived = String(query.archive ?? query.archived ?? "false") === "true";
 
   const posts = data.wallPosts
-    .filter((post) => post.archived === archived)
+    .filter((post) => wallPostFlags(post, data.wallTags).archived === archived)
     .filter((post) => !serviceId || post.serviceId === serviceId)
     .filter((post) => !tagId || post.tagIds.includes(tagId))
     .filter((post) => {
       if (!search) return true;
-      return [post.title, post.preview, post.content].some((value) => value.toLowerCase().includes(search));
+      return [post.title, post.content].some((value) => value.toLowerCase().includes(search));
     })
-    .sort((a, b) => Number(b.pinned) - Number(a.pinned) || new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime());
+    .sort((a, b) => {
+      const aFlags = wallPostFlags(a, data.wallTags);
+      const bFlags = wallPostFlags(b, data.wallTags);
+      return Number(bFlags.pinned) - Number(aFlags.pinned) || new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime();
+    });
 
   return {
     posts: pageResult(posts, offset, limit),
@@ -195,8 +211,10 @@ function dashboardData(data: AppData, query: Record<string, unknown>) {
   const latencySeries: Array<{ key: string; name: string; color: string }> = [];
   const latencySeriesByPair = new Map<string, { key: string; name: string; color: string }>();
   const latencyBuckets = new Map<string, { time: string; ts: number; sums: Record<string, { sum: number; count: number }> }>();
+  const knownUserIds = new Set(data.users.map((user) => user.id));
+  const knownLatencyChecks = data.latencyChecks.filter((check) => !check.userId || knownUserIds.has(check.userId));
 
-  for (const check of data.latencyChecks.filter((item) => item.latencyMs !== null).slice(0, 240).reverse()) {
+  for (const check of knownLatencyChecks.filter((item) => item.latencyMs !== null).slice(0, 240).reverse()) {
     const user = data.users.find((item) => item.id === check.userId);
     const service = data.services.find((item) => item.id === check.serviceId);
     const pair = `${check.userId ?? "unknown"}:${check.serviceId}`;
@@ -230,9 +248,10 @@ function dashboardData(data: AppData, query: Record<string, unknown>) {
   }
 
   const latencyStats = new Map<string, { name: string; sum: number; count: number }>();
-  for (const check of data.latencyChecks) {
+  for (const check of knownLatencyChecks) {
     if (check.latencyMs === null || !check.userId) continue;
     const user = data.users.find((item) => item.id === check.userId);
+    if (!user) continue;
     const current = latencyStats.get(check.userId) ?? { name: user?.name ?? "Участник", sum: 0, count: 0 };
     current.sum += check.latencyMs;
     current.count += 1;
@@ -257,7 +276,7 @@ function dashboardData(data: AppData, query: Record<string, unknown>) {
       .map((item) => ({ name: item.name, avg: Math.round(item.sum / item.count), count: item.count }))
       .sort((a, b) => b.count - a.count)
       .slice(0, 10),
-    latencyRecent: pageResult(data.latencyChecks, latencyPage.offset, latencyPage.limit),
+    latencyRecent: pageResult(knownLatencyChecks, latencyPage.offset, latencyPage.limit),
     notifications: pageResult(data.notifications, notificationPage.offset, notificationPage.limit)
   };
 }
@@ -778,8 +797,31 @@ app.post("/api/wall/tags", (req, res) => {
         id: id("wtag"),
         name,
         color: String(req.body.color ?? "#7aa8ff"),
+        pinned: Boolean(req.body.pinned),
+        archived: Boolean(req.body.archived),
         createdAt: nowIso()
       });
+    });
+
+    res.json(ok(wallListData(store.read(), req.query as Record<string, unknown>)));
+  } catch (error) {
+    res.status(400).json(fail(error));
+  }
+});
+
+app.put("/api/wall/tags/:id", (req, res) => {
+  try {
+    store.write((data) => {
+      const tag = data.wallTags.find((item) => item.id === req.params.id);
+      if (!tag) throw new Error("Тег не найден");
+      const name = String(req.body.name ?? tag.name).trim().slice(0, 48);
+      if (!name) throw new Error("Название тега обязательно");
+      const sameName = data.wallTags.find((item) => item.id !== tag.id && item.name.toLowerCase() === name.toLowerCase());
+      if (sameName) throw new Error("Такой тег уже есть");
+      tag.name = name;
+      tag.color = String(req.body.color ?? tag.color);
+      tag.pinned = Boolean(req.body.pinned);
+      tag.archived = Boolean(req.body.archived);
     });
 
     res.json(ok(wallListData(store.read(), req.query as Record<string, unknown>)));
@@ -1007,6 +1049,7 @@ app.delete("/api/users/:id", (req, res) => {
       data.users = data.users.filter((item) => item.id !== req.params.id);
       data.memberships = data.memberships.filter((item) => item.userId !== req.params.id);
       data.autoDeposits = data.autoDeposits.filter((item) => item.userId !== req.params.id);
+      data.latencyChecks = data.latencyChecks.filter((item) => item.userId !== req.params.id);
     });
 
     res.json(ok(apiState()));

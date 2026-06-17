@@ -38,7 +38,7 @@ import {
   UserPlus,
   Users
 } from "lucide-react";
-import { type CSSProperties, type ReactNode, useEffect, useMemo, useRef, useState } from "react";
+import { type CSSProperties, type DragEvent, type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import {
   Area,
   AreaChart,
@@ -144,13 +144,11 @@ type WallListData = {
 type WallPostDraft = {
   id?: string;
   title: string;
-  preview: string;
+  previewFileId: string | null;
   content: string;
   serviceId: string;
   tagIds: string[];
   fileIds: string[];
-  pinned: boolean;
-  archived: boolean;
 };
 
 const authStorageKey = "vpn-payment-current-user-id";
@@ -273,13 +271,11 @@ const emptyWallData: WallListData = {
 
 const blankWallPostDraft: WallPostDraft = {
   title: "",
-  preview: "",
+  previewFileId: null,
   content: "",
   serviceId: "",
   tagIds: [],
-  fileIds: [],
-  pinned: false,
-  archived: false
+  fileIds: []
 };
 
 function money(value: number, currency: string) {
@@ -1210,27 +1206,6 @@ export default function App() {
             <span className="eyebrow">VPN Payment Control</span>
             <h1>{navItems.find((item) => item.id === view)?.label}</h1>
           </div>
-          <div className="top-actions">
-            <select value={selectedServiceId} onChange={(event) => setSelectedServiceId(event.target.value)}>
-              {state.services.map((service) => (
-                <option key={service.id} value={service.id}>
-                  {service.name}
-                </option>
-              ))}
-            </select>
-            <button
-              className="icon-button"
-              onClick={() => {
-                load()
-                  .then(() => refreshOpenViewData())
-                  .catch((error) => setToast(error.message));
-              }}
-              type="button"
-              title="Обновить"
-            >
-              <RefreshCcw size={16} />
-            </button>
-          </div>
         </header>
 
         {warning.low && (
@@ -1609,16 +1584,6 @@ function WallView({
     setToast("Пост сохранён");
   };
 
-  const archivePost = async (post: WallPost, archived: boolean) => {
-    const next = await api<WallListData>(`/api/wall/posts/${post.id}`, {
-      method: "PUT",
-      body: JSON.stringify({ ...post, authorId: currentUser.id, archived })
-    });
-    setWallData(next);
-    if (selectedPost?.id === post.id) setSelectedPost({ ...post, archived });
-    setToast(archived ? "Пост отправлен в архив" : "Пост возвращён");
-  };
-
   const deletePost = async (post: WallPost) => {
     if (!window.confirm(`Удалить пост "${post.title}"?`)) return;
     const next = await api<WallListData>(`/api/wall/posts/${post.id}?userId=${encodeURIComponent(currentUser.id)}`, {
@@ -1629,10 +1594,18 @@ function WallView({
     setToast("Пост удалён");
   };
 
-  const createTag = async (name: string, color: string) => {
+  const createTag = async (tag: Pick<WallTag, "name" | "color" | "pinned" | "archived">) => {
     const next = await api<WallListData>("/api/wall/tags", {
       method: "POST",
-      body: JSON.stringify({ name, color })
+      body: JSON.stringify(tag)
+    });
+    setWallData(next);
+  };
+
+  const updateTag = async (tag: WallTag) => {
+    const next = await api<WallListData>(`/api/wall/tags/${tag.id}`, {
+      method: "PUT",
+      body: JSON.stringify(tag)
     });
     setWallData(next);
   };
@@ -1717,7 +1690,6 @@ function WallView({
               canManage={isAdmin || post.authorId === currentUser.id}
               onOpen={() => setWallHash(post.id)}
               onEdit={() => setEditingPost(post)}
-              onArchive={() => archivePost(post, !post.archived).catch((error) => setToast(error.message))}
               onDelete={() => deletePost(post).catch((error) => setToast(error.message))}
             />
           ))}
@@ -1735,7 +1707,6 @@ function WallView({
         userById={userById}
         canManage={Boolean(selectedPost && (isAdmin || selectedPost.authorId === currentUser.id))}
         onEdit={(post) => setEditingPost(post)}
-        onArchive={(post) => archivePost(post, !post.archived).catch((error) => setToast(error.message))}
         onDelete={(post) => deletePost(post).catch((error) => setToast(error.message))}
         setToast={setToast}
       />
@@ -1760,13 +1731,53 @@ function WallView({
       {tagsOpen && (
         <WallTagsModal
           tags={wallData.tags}
-          onCreate={(name, color) => createTag(name, color).catch((error) => setToast(error.message))}
+          onCreate={(tag) => createTag(tag).catch((error) => setToast(error.message))}
+          onUpdate={(tag) => updateTag(tag).catch((error) => setToast(error.message))}
           onDelete={(targetTagId) => deleteTag(targetTagId).catch((error) => setToast(error.message))}
           onClose={() => setTagsOpen(false)}
         />
       )}
     </section>
   );
+}
+
+function isWallPostPinned(post: WallPost, tags: WallTag[]) {
+  return tags.some((tag) => post.tagIds.includes(tag.id) && tag.pinned);
+}
+
+function isWallPostArchived(post: WallPost, tags: WallTag[]) {
+  return tags.some((tag) => post.tagIds.includes(tag.id) && tag.archived);
+}
+
+function wallPostPreviewFile(post: WallPost, files: WallFile[]) {
+  return (post.previewFileId ? files.find((file) => file.id === post.previewFileId) : undefined) ??
+    files.find((file) => post.fileIds.includes(file.id) && file.mimeType.startsWith("image/"));
+}
+
+async function copyText(value: string) {
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(value);
+      return true;
+    } catch {
+      // Fall through to the textarea fallback for embedded browsers.
+    }
+  }
+
+  const textarea = document.createElement("textarea");
+  textarea.value = value;
+  textarea.setAttribute("readonly", "");
+  textarea.style.position = "fixed";
+  textarea.style.left = "-9999px";
+  textarea.style.top = "0";
+  document.body.appendChild(textarea);
+  textarea.focus();
+  textarea.select();
+  try {
+    return document.execCommand("copy");
+  } finally {
+    document.body.removeChild(textarea);
+  }
 }
 
 function WallPostRow({
@@ -1779,7 +1790,6 @@ function WallPostRow({
   canManage,
   onOpen,
   onEdit,
-  onArchive,
   onDelete
 }: {
   post: WallPost;
@@ -1791,24 +1801,26 @@ function WallPostRow({
   canManage: boolean;
   onOpen: () => void;
   onEdit: () => void;
-  onArchive: () => void;
   onDelete: () => void;
 }) {
   const postTags = tags.filter((tag) => post.tagIds.includes(tag.id));
-  const previewImage = files.find((file) => post.fileIds.includes(file.id) && file.mimeType.startsWith("image/"));
+  const previewImage = wallPostPreviewFile(post, files);
+  const pinned = isWallPostPinned(post, tags);
+  const archived = isWallPostArchived(post, tags);
+  const excerpt = post.content.replace(/\s+/g, " ").trim().slice(0, 160);
 
   return (
-    <article className={classNames("wall-row", post.pinned && "pinned", selected && "selected")} onClick={onOpen}>
+    <article className={classNames("wall-row", pinned && "pinned", selected && "selected")} onClick={onOpen}>
       <div className="wall-preview">
         {previewImage ? <img src={previewImage.url} alt="" /> : <FileText size={22} />}
       </div>
       <div className="wall-row-main">
         <div className="wall-row-title">
-          {post.pinned && <Pin size={14} />}
+          {pinned && <Pin size={14} />}
           <strong>{post.title}</strong>
-          {post.archived && <span className="status-pill cancelled">Архив</span>}
+          {archived && <span className="status-pill cancelled">Архив</span>}
         </div>
-        <p>{post.preview || post.content.slice(0, 160) || "Без превью"}</p>
+        <p>{excerpt || "Без описания"}</p>
         <div className="wall-meta">
           <span>{author?.name ?? "Автор"}</span>
           <span>{dateTime(post.updatedAt)}</span>
@@ -1831,9 +1843,6 @@ function WallPostRow({
           <button className="icon-button" type="button" title="Редактировать" onClick={onEdit}>
             <Pencil size={15} />
           </button>
-          <button className="icon-button" type="button" title={post.archived ? "Вернуть" : "Архивировать"} onClick={onArchive}>
-            {post.archived ? <ArchiveRestore size={15} /> : <Archive size={15} />}
-          </button>
           <button className="icon-button danger" type="button" title="Удалить" onClick={onDelete}>
             <Trash2 size={15} />
           </button>
@@ -1851,7 +1860,6 @@ function WallPostPanel({
   userById,
   canManage,
   onEdit,
-  onArchive,
   onDelete,
   setToast
 }: {
@@ -1862,7 +1870,6 @@ function WallPostPanel({
   userById: (id: string) => User | undefined;
   canManage: boolean;
   onEdit: (post: WallPost) => void;
-  onArchive: (post: WallPost) => void;
   onDelete: (post: WallPost) => void;
   setToast: (value: string) => void;
 }) {
@@ -1880,13 +1887,15 @@ function WallPostPanel({
   const attachments = files.filter((file) => post.fileIds.includes(file.id));
   const service = post.serviceId ? serviceById(post.serviceId) : undefined;
   const author = userById(post.authorId);
+  const pinned = isWallPostPinned(post, tags);
+  const archived = isWallPostArchived(post, tags);
 
   return (
     <aside className="panel wall-post-panel">
       <div className="wall-post-head">
         <div>
           <div className="wall-row-title">
-            {post.pinned && <Pin size={15} />}
+            {pinned && <Pin size={15} />}
             <h2>{post.title}</h2>
           </div>
           <div className="wall-meta">
@@ -1902,9 +1911,11 @@ function WallPostPanel({
         <button
           className="ghost compact"
           type="button"
-          onClick={() => {
-            void navigator.clipboard?.writeText(`${window.location.origin}${window.location.pathname}#/wall/${post.id}`);
-            setToast("Ссылка скопирована");
+          onClick={async () => {
+            const url = `${window.location.origin}${window.location.pathname}#/wall/${post.id}`;
+            const copied = await copyText(url);
+            if (!copied) window.prompt("Ссылка на пост", url);
+            setToast(copied ? "Ссылка скопирована" : "Ссылка готова для копирования");
           }}
         >
           <Link size={14} />
@@ -1913,7 +1924,7 @@ function WallPostPanel({
       </div>
 
       <div className="wall-tag-strip full">
-        {post.archived && <span className="status-pill cancelled">Архив</span>}
+        {archived && <span className="status-pill cancelled">Архив</span>}
         {postTags.map((tag) => (
           <span key={tag.id} className="wall-tag" style={{ "--tag-color": tag.color } as CSSProperties}>
             {tag.name}
@@ -1941,10 +1952,6 @@ function WallPostPanel({
           <button className="ghost" type="button" onClick={() => onEdit(post)}>
             <Pencil size={16} />
             Править
-          </button>
-          <button className="ghost" type="button" onClick={() => onArchive(post)}>
-            {post.archived ? <ArchiveRestore size={16} /> : <Archive size={16} />}
-            {post.archived ? "Вернуть" : "В архив"}
           </button>
           <button className="ghost danger" type="button" onClick={() => onDelete(post)}>
             <Trash2 size={16} />
@@ -2012,20 +2019,20 @@ function WallPostModal({
       ? {
           id: post.id,
           title: post.title,
-          preview: post.preview,
+          previewFileId: post.previewFileId,
           content: post.content,
           serviceId: post.serviceId ?? "",
           tagIds: post.tagIds,
-          fileIds: post.fileIds,
-          pinned: post.pinned,
-          archived: post.archived
+          fileIds: post.fileIds
         }
       : blankWallPostDraft
   );
   const [uploading, setUploading] = useState(false);
+  const [dragActive, setDragActive] = useState(false);
   const [imageWidth, setImageWidth] = useState(720);
 
   const attachedFiles = files.filter((file) => draft.fileIds.includes(file.id));
+  const previewFile = draft.previewFileId ? files.find((file) => file.id === draft.previewFileId) : undefined;
 
   const insertText = (value: string, fileId?: string) => {
     const textarea = textRef.current;
@@ -2065,6 +2072,39 @@ function WallPostModal({
     }
   };
 
+  const uploadPreview = async (fileList: FileList | null) => {
+    const file = Array.from(fileList ?? []).find((item) => item.type.startsWith("image/"));
+    if (!file) {
+      setToast("Выберите изображение для превью");
+      return;
+    }
+
+    try {
+      setUploading(true);
+      const uploaded = await onUpload(file);
+      setDraft((current) => ({ ...current, previewFileId: uploaded.id }));
+      setToast("Превью загружено");
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : "Ошибка загрузки превью");
+    } finally {
+      setUploading(false);
+    }
+  };
+
+  const handleContentDrop = (event: DragEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    setDragActive(false);
+
+    if (event.dataTransfer.files.length) {
+      void uploadFiles(event.dataTransfer.files);
+      return;
+    }
+
+    const draggedFileId = event.dataTransfer.getData("text/plain").replace("wall-file:", "");
+    const file = files.find((item) => item.id === draggedFileId);
+    if (file) insertFileLink(file);
+  };
+
   return (
     <ModalShell
       title={post ? "Редактирование поста" : "Новый пост"}
@@ -2100,18 +2140,32 @@ function WallPostModal({
               ))}
             </select>
           </label>
-          <label className="wide-field">
+          <div className="wall-preview-picker wide-field">
             Превью
-            <input value={draft.preview} onChange={(event) => setDraft({ ...draft, preview: event.target.value })} />
-          </label>
-          <label className="toggle-row">
-            <input checked={draft.pinned} type="checkbox" onChange={(event) => setDraft({ ...draft, pinned: event.target.checked })} />
-            Закрепить сверху
-          </label>
-          <label className="toggle-row">
-            <input checked={draft.archived} type="checkbox" onChange={(event) => setDraft({ ...draft, archived: event.target.checked })} />
-            Архив
-          </label>
+            <label
+              className={classNames("wall-preview-drop", previewFile && "has-image")}
+              onDragOver={(event) => event.preventDefault()}
+              onDrop={(event) => {
+                event.preventDefault();
+                void uploadPreview(event.dataTransfer.files);
+              }}
+            >
+              {previewFile ? (
+                <img src={previewFile.url} alt="" />
+              ) : (
+                <span>
+                  <Image size={18} />
+                  Обложка поста
+                </span>
+              )}
+              <input accept="image/*" type="file" disabled={uploading} onChange={(event) => uploadPreview(event.target.files)} />
+            </label>
+            {previewFile && (
+              <button className="ghost compact" type="button" onClick={() => setDraft((current) => ({ ...current, previewFileId: null }))}>
+                Убрать превью
+              </button>
+            )}
+          </div>
         </div>
 
         <div className="wall-editor-tags">
@@ -2139,19 +2193,32 @@ function WallPostModal({
         <div className="wall-editor-grid">
           <label className="wall-content-field">
             Текст поста
-            <textarea
-              ref={textRef}
-              rows={14}
-              value={draft.content}
-              onChange={(event) => setDraft({ ...draft, content: event.target.value })}
-              onDragOver={(event) => event.preventDefault()}
-              onDrop={(event) => {
+            <div
+              className={classNames("wall-drop-zone", dragActive && "dragging")}
+              onDragEnter={(event) => {
                 event.preventDefault();
-                const draggedFileId = event.dataTransfer.getData("text/plain").replace("wall-file:", "");
-                const file = files.find((item) => item.id === draggedFileId);
-                if (file) insertFileLink(file);
+                setDragActive(true);
               }}
-            />
+              onDragOver={(event) => {
+                event.preventDefault();
+                setDragActive(true);
+              }}
+              onDragLeave={(event) => {
+                if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDragActive(false);
+              }}
+              onDrop={handleContentDrop}
+            >
+              <textarea
+                ref={textRef}
+                rows={14}
+                value={draft.content}
+                onChange={(event) => setDraft({ ...draft, content: event.target.value })}
+              />
+              <span className="wall-drop-hint">
+                <Upload size={14} />
+                Перетащите файл в текст
+              </span>
+            </div>
           </label>
 
           <aside className="wall-file-box">
@@ -2181,6 +2248,11 @@ function WallPostModal({
                     {isImage && (
                       <button className="ghost compact" type="button" onClick={() => insertImage(file)}>
                         <Image size={13} />
+                      </button>
+                    )}
+                    {isImage && (
+                      <button className="ghost compact" type="button" onClick={() => setDraft((current) => ({ ...current, previewFileId: file.id }))}>
+                        Превью
                       </button>
                     )}
                     <button
@@ -2221,16 +2293,20 @@ function WallPostModal({
 function WallTagsModal({
   tags,
   onCreate,
+  onUpdate,
   onDelete,
   onClose
 }: {
   tags: WallTag[];
-  onCreate: (name: string, color: string) => void;
+  onCreate: (tag: Pick<WallTag, "name" | "color" | "pinned" | "archived">) => void;
+  onUpdate: (tag: WallTag) => void;
   onDelete: (tagId: string) => void;
   onClose: () => void;
 }) {
   const [name, setName] = useState("");
   const [color, setColor] = useState("#7aa8ff");
+  const [pinned, setPinned] = useState(false);
+  const [archived, setArchived] = useState(false);
 
   return (
     <ModalShell
@@ -2246,8 +2322,10 @@ function WallTagsModal({
             type="button"
             disabled={!name.trim()}
             onClick={() => {
-              onCreate(name, color);
+              onCreate({ name, color, pinned, archived });
               setName("");
+              setPinned(false);
+              setArchived(false);
             }}
           >
             <Plus size={16} />
@@ -2265,13 +2343,29 @@ function WallTagsModal({
           Цвет
           <input type="color" value={color} onChange={(event) => setColor(event.target.value)} />
         </label>
+        <label className="toggle-row">
+          <input checked={pinned} type="checkbox" onChange={(event) => setPinned(event.target.checked)} />
+          Закрепляющий тег
+        </label>
+        <label className="toggle-row">
+          <input checked={archived} type="checkbox" onChange={(event) => setArchived(event.target.checked)} />
+          Архивный тег
+        </label>
       </div>
       <div className="wall-tag-manager">
         {tags.map((tag) => (
-          <div key={tag.id} className="currency-row">
+          <div key={tag.id} className="wall-tag-row">
             <span className="wall-tag" style={{ "--tag-color": tag.color } as CSSProperties}>
               {tag.name}
             </span>
+            <label className="toggle-row compact-toggle">
+              <input checked={tag.pinned} type="checkbox" onChange={(event) => onUpdate({ ...tag, pinned: event.target.checked })} />
+              Закрепляет
+            </label>
+            <label className="toggle-row compact-toggle">
+              <input checked={tag.archived} type="checkbox" onChange={(event) => onUpdate({ ...tag, archived: event.target.checked })} />
+              Архив
+            </label>
             <button className="icon-button danger" type="button" title="Удалить" onClick={() => onDelete(tag.id)}>
               <Trash2 size={15} />
             </button>
@@ -3270,7 +3364,10 @@ function PeopleView({
               state={state}
               serviceById={serviceById}
               onSave={saveUser}
-              onDelete={() => mutate(`/api/users/${user.id}`, undefined, "DELETE")}
+              onDelete={() => {
+                if (!window.confirm(`Удалить участника "${user.name}" и его историю замеров пинга?`)) return Promise.resolve(state);
+                return mutate(`/api/users/${user.id}`, undefined, "DELETE");
+              }}
             />
           ))}
         </div>
