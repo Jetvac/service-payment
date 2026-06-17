@@ -18,8 +18,8 @@ export class Store {
   }
 
   exportData() {
-    const { wallFiles: _wallFiles, wallPosts: _wallPosts, wallTags: _wallTags, ...paymentData } = this.data;
-    return JSON.parse(JSON.stringify(paymentData)) as Omit<AppData, "wallFiles" | "wallPosts" | "wallTags">;
+    const { wallFiles: _wallFiles, wallPosts: _wallPosts, wallTags: _wallTags, wallComments: _wallComments, ...paymentData } = this.data;
+    return JSON.parse(JSON.stringify(paymentData)) as Omit<AppData, "wallFiles" | "wallPosts" | "wallTags" | "wallComments">;
   }
 
   write(mutator: (data: AppData) => void) {
@@ -32,7 +32,8 @@ export class Store {
     const wallData = {
       wallFiles: this.data.wallFiles ?? [],
       wallPosts: this.data.wallPosts ?? [],
-      wallTags: this.data.wallTags ?? []
+      wallTags: this.data.wallTags ?? [],
+      wallComments: this.data.wallComments ?? []
     };
     this.data = {
       ...this.migrate(this.normalizeImport(raw)),
@@ -92,6 +93,7 @@ export class Store {
       wallTags: Array.isArray(backup.wallTags) ? backup.wallTags : [],
       wallFiles: Array.isArray(backup.wallFiles) ? backup.wallFiles : [],
       wallPosts: Array.isArray(backup.wallPosts) ? backup.wallPosts : [],
+      wallComments: Array.isArray(backup.wallComments) ? backup.wallComments : [],
       settings: {
         ...fallback.settings,
         ...(backup.settings ?? {}),
@@ -181,6 +183,7 @@ export class Store {
     data.wallTags ??= [];
     data.wallFiles ??= [];
     data.wallPosts ??= [];
+    data.wallComments ??= [];
     data.autoDeposits ??= [];
     data.deposits ??= [];
     data.debits ??= [];
@@ -310,6 +313,17 @@ export class Store {
       post.views = Math.max(0, normalizeNumber(post.views, 0));
       post.createdAt = String(post.createdAt ?? new Date().toISOString());
       post.updatedAt = String(post.updatedAt ?? post.createdAt);
+    }
+
+    for (const comment of data.wallComments) {
+      comment.id = String(comment.id ?? "");
+      comment.postId = String(comment.postId ?? "");
+      comment.parentId = comment.parentId ? String(comment.parentId) : null;
+      comment.authorId = String(comment.authorId ?? data.users[0]?.id ?? "");
+      comment.content = String(comment.content ?? "");
+      comment.fileIds = Array.isArray(comment.fileIds) ? comment.fileIds.map(String) : [];
+      comment.createdAt = String(comment.createdAt ?? new Date().toISOString());
+      comment.updatedAt = String(comment.updatedAt ?? comment.createdAt);
     }
 
     return data;

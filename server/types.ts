@@ -192,6 +192,17 @@ export type WallPost = {
   updatedAt: string;
 };
 
+export type WallComment = {
+  id: string;
+  postId: string;
+  parentId: string | null;
+  authorId: string;
+  content: string;
+  fileIds: string[];
+  createdAt: string;
+  updatedAt: string;
+};
+
 export type TelegramSettings = {
   enabled: boolean;
   botToken: string;
@@ -237,6 +248,7 @@ export type AppData = {
   wallTags: WallTag[];
   wallFiles: WallFile[];
   wallPosts: WallPost[];
+  wallComments: WallComment[];
   settings: AppSettings;
 };
 

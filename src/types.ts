@@ -190,6 +190,17 @@ export type WallPost = {
   updatedAt: string;
 };
 
+export type WallComment = {
+  id: string;
+  postId: string;
+  parentId: string | null;
+  authorId: string;
+  content: string;
+  fileIds: string[];
+  createdAt: string;
+  updatedAt: string;
+};
+
 export type ServiceSummary = {
   serviceId: string;
   memberCount: number;

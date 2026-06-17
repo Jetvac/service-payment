@@ -1,10 +1,12 @@
 import crypto from "node:crypto";
+import http from "node:http";
 import express, { type NextFunction, type Request, type Response } from "express";
 import { execFile, spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { promisify } from "node:util";
 import { Client } from "ssh2";
+import { WebSocketServer } from "ws";
 import { Store } from "./store";
 import type {
   AppData,
@@ -16,6 +18,7 @@ import type {
   ServiceConnectionSettings,
   ServiceHealthStatus,
   User,
+  WallComment,
   WallFile,
   WallPost,
   WallTag
@@ -51,6 +54,8 @@ import {
 } from "./telegram";
 
 const app = express();
+const server = http.createServer(app);
+const realtime = new WebSocketServer({ server, path: "/api/realtime" });
 const port = Number(process.env.PORT ?? 4077);
 const store = new Store();
 const execFileAsync = promisify(execFile);
@@ -59,6 +64,23 @@ const wallFilesDir = path.resolve(process.cwd(), "data", "wall-files");
 const maxWallFileSize = 2 * 1024 * 1024 * 1024;
 
 app.use(express.json({ limit: "25mb" }));
+
+function broadcastRealtime(payload: unknown) {
+  const message = JSON.stringify(payload);
+  for (const client of realtime.clients) {
+    if (client.readyState === client.OPEN) client.send(message);
+  }
+}
+
+realtime.on("connection", (socket, request) => {
+  const url = new URL(request.url ?? "/api/realtime", `http://${request.headers.host ?? "localhost"}`);
+  const token = url.searchParams.get("token") ?? "";
+  const data = store.read();
+  const session = token ? data.settings.security.sessions?.[token] : undefined;
+  if (!session || !data.users.some((user) => user.id === session.userId)) {
+    socket.close(1008, "auth required");
+  }
+});
 
 function ok(payload: unknown) {
   return { ok: true, payload };
@@ -98,12 +120,44 @@ function removeWallFileFromDisk(file: Pick<WallFile, "storageName">) {
   fs.rmSync(path.join(wallFilesDir, file.storageName), { force: true });
 }
 
+function findWallFileOnDisk(fileId: string) {
+  if (!fs.existsSync(wallFilesDir)) return null;
+  const prefix = `${fileId}_`;
+  const storageName = fs.readdirSync(wallFilesDir).find((name) => name.startsWith(prefix));
+  if (!storageName) return null;
+  const originalName = storageName.slice(prefix.length) || "file";
+  const stat = fs.statSync(path.join(wallFilesDir, storageName));
+  const mimeType =
+    /\.(png)$/i.test(originalName) ? "image/png" :
+    /\.(jpe?g)$/i.test(originalName) ? "image/jpeg" :
+    /\.(gif)$/i.test(originalName) ? "image/gif" :
+    /\.(webp)$/i.test(originalName) ? "image/webp" :
+    "application/octet-stream";
+
+  return {
+    id: fileId,
+    originalName,
+    storageName,
+    mimeType,
+    size: stat.size,
+    url: wallFileUrl(fileId),
+    uploadedBy: "",
+    createdAt: stat.birthtime.toISOString()
+  } satisfies WallFile;
+}
+
 function wallPostFileIds(data: AppData, post: WallPost) {
   const ids = new Set<string>();
   if (post.previewFileId) ids.add(post.previewFileId);
   for (const fileId of post.fileIds) ids.add(fileId);
+  for (const comment of data.wallComments.filter((item) => item.postId === post.id)) {
+    for (const fileId of comment.fileIds) ids.add(fileId);
+  }
   for (const file of data.wallFiles) {
     if (post.content.includes(wallFileUrl(file.id)) || post.content.includes(file.url)) ids.add(file.id);
+    for (const comment of data.wallComments.filter((item) => item.postId === post.id)) {
+      if (comment.content.includes(wallFileUrl(file.id)) || comment.content.includes(file.url)) ids.add(file.id);
+    }
   }
   return ids;
 }
@@ -261,6 +315,28 @@ function wallListData(data: AppData, query: Record<string, unknown>) {
     tags: data.wallTags,
     files: data.wallFiles.map(publicWallFile)
   };
+}
+
+function wallCommentsForPost(data: AppData, postId: string) {
+  return data.wallComments
+    .filter((comment) => comment.postId === postId)
+    .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
+}
+
+function normalizeWallCommentInput(data: AppData, postId: string, body: Partial<WallComment>) {
+  const post = data.wallPosts.find((item) => item.id === postId);
+  if (!post) throw new Error("Пост не найден");
+
+  const parentId = body.parentId ? String(body.parentId) : null;
+  if (parentId && !data.wallComments.some((comment) => comment.id === parentId && comment.postId === postId)) {
+    throw new Error("Комментарий для ответа не найден");
+  }
+
+  const fileIds = normalizeStringList(body.fileIds).filter((fileId) => data.wallFiles.some((file) => file.id === fileId));
+  const content = String(body.content ?? "").trim().slice(0, 20_000);
+  if (!content && !fileIds.length) throw new Error("Комментарий пустой");
+
+  return { parentId, content, fileIds };
 }
 
 function isEffectiveOperation(operation: { cancelledAt?: string | null; reversesId?: string | null }) {
@@ -860,6 +936,44 @@ app.post("/api/wall/posts/:id/view", (req, res) => {
   }
 });
 
+app.get("/api/wall/posts/:id/comments", (req, res) => {
+  try {
+    const post = store.read().wallPosts.find((item) => item.id === req.params.id);
+    if (!post) throw new Error("Пост не найден");
+    res.json(ok(wallCommentsForPost(store.read(), req.params.id)));
+  } catch (error) {
+    res.status(404).json(fail(error));
+  }
+});
+
+app.post("/api/wall/posts/:id/comments", (req, res) => {
+  try {
+    let comment: WallComment | undefined;
+    store.write((data) => {
+      const actor = getActor(data, req.body.authorId);
+      const input = normalizeWallCommentInput(data, req.params.id, req.body);
+      const createdAt = nowIso();
+      comment = {
+        id: id("wcom"),
+        postId: req.params.id,
+        parentId: input.parentId,
+        authorId: actor.id,
+        content: input.content,
+        fileIds: input.fileIds,
+        createdAt,
+        updatedAt: createdAt
+      };
+      data.wallComments.push(comment);
+    });
+
+    const comments = wallCommentsForPost(store.read(), req.params.id);
+    broadcastRealtime({ type: "wall-comment-created", postId: req.params.id, comment, comments });
+    res.json(ok(comments));
+  } catch (error) {
+    res.status(400).json(fail(error));
+  }
+});
+
 app.post("/api/wall/posts", (req, res) => {
   try {
     store.write((data) => {
@@ -909,6 +1023,7 @@ app.delete("/api/wall/posts/:id", (req, res) => {
       if (!canManageWallPost(actor, post)) throw new Error("Нет прав на удаление поста");
       const previousFileIds = wallPostFileIds(data, post);
       data.wallPosts = data.wallPosts.filter((item) => item.id !== post.id);
+      data.wallComments = data.wallComments.filter((comment) => comment.postId !== post.id);
       cleanupUnusedWallFiles(data, previousFileIds);
     });
 
@@ -1033,7 +1148,7 @@ app.post("/api/wall/files", async (req, res) => {
       current.wallFiles.unshift(file);
     });
 
-    res.json(ok(file));
+    res.json(ok(publicWallFile(file)));
   } catch (error) {
     fs.rmSync(filePath, { force: true });
     res.status(400).json(fail(error));
@@ -1054,8 +1169,14 @@ app.post("/api/wall/files/cleanup", (req, res) => {
 
 app.get("/api/wall/files/:id/download", (req, res) => {
   try {
-    const file = store.read().wallFiles.find((item) => item.id === req.params.id);
+    const data = store.read();
+    let file = data.wallFiles.find((item) => item.id === req.params.id) ?? findWallFileOnDisk(req.params.id);
     if (!file) throw new Error("Файл не найден");
+    if (!data.wallFiles.some((item) => item.id === file.id)) {
+      store.write((current) => {
+        if (!current.wallFiles.some((item) => item.id === file!.id)) current.wallFiles.unshift(file!);
+      });
+    }
     const filePath = path.join(wallFilesDir, file.storageName);
     if (!fs.existsSync(filePath)) throw new Error("Файл отсутствует на сервере");
 
@@ -1085,6 +1206,9 @@ app.delete("/api/wall/files/:id", (req, res) => {
       for (const post of data.wallPosts) {
         post.fileIds = post.fileIds.filter((fileId) => fileId !== file.id);
         if (post.previewFileId === file.id) post.previewFileId = null;
+      }
+      for (const comment of data.wallComments) {
+        comment.fileIds = comment.fileIds.filter((fileId) => fileId !== file.id);
       }
     });
 
@@ -1903,6 +2027,6 @@ app.get(/^(?!\/api).*/, (_req, res) => {
   res.sendFile(path.join(distDir, "index.html"));
 });
 
-app.listen(port, () => {
+server.listen(port, () => {
   console.log(`VPN Payment Control API: http://localhost:${port}`);
 });

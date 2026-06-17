@@ -862,7 +862,7 @@ td small {
 
 .wall-layout {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(360px, 0.68fr);
+  grid-template-columns: minmax(0, 1fr);
   gap: 16px;
   align-items: start;
 }
@@ -870,6 +870,28 @@ td small {
 .wall-list-panel,
 .wall-post-panel {
   min-height: calc(100vh - 116px);
+}
+
+.wall-detail-panel {
+  min-height: calc(100vh - 116px);
+}
+
+.wall-detail-head {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 14px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  padding: 16px 18px;
+}
+
+.wall-detail-title {
+  min-width: 0;
+}
+
+.inline-actions {
+  border-top: 0;
+  padding: 0;
 }
 
 .wall-head-actions,
@@ -1066,6 +1088,11 @@ td small {
   line-height: 1.62;
 }
 
+.wall-content.detail-content {
+  max-height: none;
+  padding-top: 16px;
+}
+
 .wall-content p {
   margin: 0;
   overflow-wrap: anywhere;
@@ -1104,6 +1131,17 @@ td small {
   background: rgba(255, 255, 255, 0.035);
   padding: 9px 10px;
   text-decoration: none;
+}
+
+.wall-file-link.image-attachment {
+  grid-template-columns: 56px minmax(0, 1fr) auto;
+}
+
+.wall-file-link.image-attachment img {
+  width: 56px;
+  height: 42px;
+  border-radius: 6px;
+  object-fit: cover;
 }
 
 .wall-file-link span,
@@ -1277,6 +1315,106 @@ td small {
 .wall-attached-summary {
   align-items: center;
   padding-bottom: 16px;
+}
+
+.comments-panel {
+  display: grid;
+  gap: 14px;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  padding: 16px 18px 18px;
+}
+
+.comments-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.comments-list,
+.comment-branch {
+  display: grid;
+  gap: 10px;
+}
+
+.comment-branch.nested {
+  margin-left: 34px;
+  padding-left: 12px;
+  border-left: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.comment-item {
+  display: grid;
+  gap: 10px;
+}
+
+.comment-card,
+.comment-composer {
+  display: grid;
+  grid-template-columns: 40px minmax(0, 1fr);
+  gap: 10px;
+  min-width: 0;
+}
+
+.comment-body {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.035);
+  padding: 10px;
+}
+
+.comment-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.comment-meta span {
+  color: #8a8f98;
+  font-size: 12px;
+}
+
+.comment-body p {
+  margin: 0;
+  overflow-wrap: anywhere;
+  color: #d8dbe2;
+}
+
+.comment-attachments {
+  display: grid;
+  gap: 8px;
+}
+
+.comment-attachments.editor {
+  margin-top: 8px;
+}
+
+.comment-composer {
+  align-items: start;
+}
+
+.comment-composer textarea {
+  min-height: 92px;
+}
+
+.comment-composer.compact textarea {
+  min-height: 70px;
+}
+
+.comment-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.show-more-replies {
+  width: max-content;
+  margin-left: 50px;
 }
 
 .add-member {
@@ -1803,9 +1941,14 @@ td small {
 
   .wall-row-actions,
   .wall-head-actions,
-  .wall-post-head {
+  .wall-post-head,
+  .wall-detail-head {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .wall-detail-head {
+    display: flex;
   }
 
   .wall-tag-strip {
@@ -1814,6 +1957,16 @@ td small {
 
   .wall-content {
     max-height: none;
+  }
+
+  .comment-card,
+  .comment-composer {
+    grid-template-columns: 34px minmax(0, 1fr);
+  }
+
+  .comment-branch.nested {
+    margin-left: 12px;
+    padding-left: 10px;
   }
 
   .wide,

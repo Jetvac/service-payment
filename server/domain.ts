@@ -126,6 +126,7 @@ export function seedData(): AppData {
     wallTags: [],
     wallFiles: [],
     wallPosts: [],
+    wallComments: [],
     settings: {
       telegram: {
         enabled: false,

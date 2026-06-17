@@ -1,6 +1,7 @@
 import {
   Activity,
   AlertTriangle,
+  ArrowLeft,
   Archive,
   ArchiveRestore,
   BellRing,
@@ -66,6 +67,7 @@ import type {
   ServiceHealthStatus,
   TelegramSettings,
   User,
+  WallComment,
   WallFile,
   WallPost,
   WallTag
@@ -1635,6 +1637,7 @@ function WallView({
   const [creating, setCreating] = useState(false);
   const [tagsOpen, setTagsOpen] = useState(false);
   const [selectedPost, setSelectedPost] = useState<WallPost | null>(null);
+  const [comments, setComments] = useState<WallComment[]>([]);
 
   const loadWall = async (nextOffset = offset) => {
     const query = new URLSearchParams({
@@ -1659,18 +1662,25 @@ function WallView({
   useEffect(() => {
     if (!selectedPostId) {
       setSelectedPost(null);
+      setComments([]);
       return;
     }
 
     api<WallPost>(`/api/wall/posts/${selectedPostId}`)
       .then((post) => {
         setSelectedPost(post);
-        return api<WallPost>(`/api/wall/posts/${selectedPostId}/view`, {
-          method: "POST",
-          body: JSON.stringify({})
-        });
+        return Promise.all([
+          Promise.resolve(post),
+          api<WallComment[]>(`/api/wall/posts/${selectedPostId}/comments`),
+          api<WallPost>(`/api/wall/posts/${selectedPostId}/view`, {
+            method: "POST",
+            body: JSON.stringify({})
+          })
+        ]);
       })
-      .then((post) => {
+      .then(([initialPost, nextComments, viewedPost]) => {
+        setComments(nextComments);
+        const post = viewedPost ?? initialPost;
         setSelectedPost(post);
         setWallData((current) => ({
           ...current,
@@ -1682,6 +1692,42 @@ function WallView({
       })
       .catch((error) => setToast(error.message));
   }, [selectedPostId]);
+
+  useEffect(() => {
+    const token = window.localStorage.getItem(authTokenStorageKey);
+    if (!token) return;
+    const protocol = window.location.protocol === "https:" ? "wss" : "ws";
+    const socket = new WebSocket(`${protocol}://${window.location.host}/api/realtime?token=${encodeURIComponent(token)}`);
+
+    socket.addEventListener("message", (event) => {
+      try {
+        const message = JSON.parse(event.data) as { type?: string; postId?: string; comments?: WallComment[] };
+        if (message.type === "wall-comment-created" && message.postId === selectedPostId && Array.isArray(message.comments)) {
+          setComments(message.comments);
+        }
+      } catch {
+        // Ignore malformed realtime events.
+      }
+    });
+
+    return () => socket.close();
+  }, [selectedPostId]);
+
+  const loadComments = async (postId = selectedPostId) => {
+    if (!postId) return [];
+    const next = await api<WallComment[]>(`/api/wall/posts/${postId}/comments`);
+    setComments(next);
+    return next;
+  };
+
+  const saveComment = async (postId: string, content: string, fileIds: string[], parentId: string | null) => {
+    const next = await api<WallComment[]>(`/api/wall/posts/${postId}/comments`, {
+      method: "POST",
+      body: JSON.stringify({ authorId: currentUser.id, content, fileIds, parentId })
+    });
+    setComments(next);
+    return next;
+  };
 
   const savePost = async (draft: WallPostDraft) => {
     const body = { ...draft, serviceId: draft.serviceId || null, authorId: currentUser.id };
@@ -1770,7 +1816,27 @@ function WallView({
   };
 
   return (
-    <section className="wall-layout">
+    <section className={classNames("wall-layout", selectedPost && "post-open")}>
+      {selectedPost ? (
+        <WallPostDetail
+          post={selectedPost}
+          comments={comments}
+          tags={wallData.tags}
+          files={wallData.files}
+          currentUser={currentUser}
+          serviceById={serviceById}
+          userById={userById}
+          canManage={isAdmin || selectedPost.authorId === currentUser.id}
+          onBack={() => setWallHash()}
+          onEdit={(post) => setEditingPost(post)}
+          onDelete={(post) => deletePost(post).catch((error) => setToast(error.message))}
+          onUpload={uploadWallFile}
+          onDeleteFile={deleteWallFile}
+          onSaveComment={saveComment}
+          onReloadComments={() => loadComments(selectedPost.id)}
+          setToast={setToast}
+        />
+      ) : (
       <div className="panel wall-list-panel">
         <div className="panel-head wall-toolbar">
           <div className="wall-head-actions">
@@ -1820,7 +1886,8 @@ function WallView({
               author={userById(post.authorId)}
               selected={selectedPostId === post.id}
               canManage={isAdmin || post.authorId === currentUser.id}
-              onOpen={() => setWallHash(post.id)}
+              onOpen={() => undefined}
+              onDoubleOpen={() => setWallHash(post.id)}
               onEdit={() => setEditingPost(post)}
               onDelete={() => deletePost(post).catch((error) => setToast(error.message))}
             />
@@ -1830,18 +1897,7 @@ function WallView({
 
         <PaginationControls page={wallData.posts} onChange={(nextOffset) => loadWall(nextOffset).catch((error) => setToast(error.message))} />
       </div>
-
-      <WallPostPanel
-        post={selectedPost}
-        tags={wallData.tags}
-        files={wallData.files}
-        serviceById={serviceById}
-        userById={userById}
-        canManage={Boolean(selectedPost && (isAdmin || selectedPost.authorId === currentUser.id))}
-        onEdit={(post) => setEditingPost(post)}
-        onDelete={(post) => deletePost(post).catch((error) => setToast(error.message))}
-        setToast={setToast}
-      />
+      )}
 
       {(creating || editingPost) && (
         <WallPostModal
@@ -1919,6 +1975,7 @@ function WallPostRow({
   selected,
   canManage,
   onOpen,
+  onDoubleOpen,
   onEdit,
   onDelete
 }: {
@@ -1930,6 +1987,7 @@ function WallPostRow({
   selected: boolean;
   canManage: boolean;
   onOpen: () => void;
+  onDoubleOpen: () => void;
   onEdit: () => void;
   onDelete: () => void;
 }) {
@@ -1940,7 +1998,7 @@ function WallPostRow({
   const excerpt = post.content.replace(/\s+/g, " ").trim().slice(0, 160);
 
   return (
-    <article className={classNames("wall-row", pinned && "pinned", selected && "selected")} onClick={onOpen}>
+    <article className={classNames("wall-row", pinned && "pinned", selected && "selected")} onClick={onOpen} onDoubleClick={onDoubleOpen}>
       <div className="wall-preview">
         {previewImage ? <img src={previewImage.url} alt="" /> : <FileText size={22} />}
       </div>
@@ -1979,6 +2037,376 @@ function WallPostRow({
         </div>
       )}
     </article>
+  );
+}
+
+function WallPostDetail({
+  post,
+  comments,
+  tags,
+  files,
+  currentUser,
+  serviceById,
+  userById,
+  canManage,
+  onBack,
+  onEdit,
+  onDelete,
+  onUpload,
+  onDeleteFile,
+  onSaveComment,
+  onReloadComments,
+  setToast
+}: {
+  post: WallPost;
+  comments: WallComment[];
+  tags: WallTag[];
+  files: WallFile[];
+  currentUser: User;
+  serviceById: (id: string) => Service | undefined;
+  userById: (id: string) => User | undefined;
+  canManage: boolean;
+  onBack: () => void;
+  onEdit: (post: WallPost) => void;
+  onDelete: (post: WallPost) => void;
+  onUpload: (file: File) => Promise<WallFile>;
+  onDeleteFile: (file: WallFile) => Promise<void>;
+  onSaveComment: (postId: string, content: string, fileIds: string[], parentId: string | null) => Promise<WallComment[]>;
+  onReloadComments: () => Promise<WallComment[]>;
+  setToast: (value: string) => void;
+}) {
+  const postTags = tags.filter((tag) => post.tagIds.includes(tag.id));
+  const attachments = files.filter((file) => post.fileIds.includes(file.id));
+  const service = post.serviceId ? serviceById(post.serviceId) : undefined;
+  const author = userById(post.authorId);
+  const pinned = isWallPostPinned(post, tags);
+  const archived = isWallPostArchived(post, tags);
+
+  return (
+    <article className="panel wall-detail-panel">
+      <div className="wall-detail-head">
+        <button className="ghost compact" type="button" onClick={onBack}>
+          <ArrowLeft size={15} />
+          Назад
+        </button>
+        <div className="wall-detail-title">
+          <div className="wall-row-title">
+            {pinned && <Pin size={15} />}
+            <h2>{post.title}</h2>
+            {archived && <span className="status-pill cancelled">Архив</span>}
+          </div>
+          <div className="wall-meta">
+            <span>{author?.name ?? "Автор"}</span>
+            <span>{service?.name ?? "Общий пост"}</span>
+            <span>{dateTime(post.updatedAt)}</span>
+            <span>
+              <Eye size={13} />
+              {post.views}
+            </span>
+          </div>
+        </div>
+        {canManage && (
+          <div className="wall-post-actions inline-actions">
+            <button className="ghost" type="button" onClick={() => onEdit(post)}>
+              <Pencil size={16} />
+              Править
+            </button>
+            <button className="ghost danger" type="button" onClick={() => onDelete(post)}>
+              <Trash2 size={16} />
+              Удалить
+            </button>
+          </div>
+        )}
+      </div>
+
+      <div className="wall-tag-strip full">
+        {postTags.map((tag) => (
+          <span key={tag.id} className="wall-tag" style={{ "--tag-color": tag.color } as CSSProperties}>
+            {tag.name}
+          </span>
+        ))}
+      </div>
+
+      <div className="wall-content detail-content">{renderWallContent(post.content, files)}</div>
+
+      {attachments.length > 0 && (
+        <div className="wall-attachments">
+          <strong>Файлы</strong>
+          {attachments.map((file) => (
+            <WallAttachment key={file.id} file={file} />
+          ))}
+        </div>
+      )}
+
+      <section className="comments-panel">
+        <div className="comments-head">
+          <h2>Комментарии</h2>
+          <button className="ghost compact" type="button" onClick={() => onReloadComments().catch((error) => setToast(error.message))}>
+            <RefreshCcw size={14} />
+            Обновить
+          </button>
+        </div>
+        <CommentComposer
+          currentUser={currentUser}
+          files={files}
+          onUpload={onUpload}
+          onDeleteFile={onDeleteFile}
+          onSave={(content, fileIds) => onSaveComment(post.id, content, fileIds, null)}
+          setToast={setToast}
+        />
+        <CommentTree
+          comments={comments}
+          files={files}
+          currentUser={currentUser}
+          userById={userById}
+          postId={post.id}
+          onUpload={onUpload}
+          onDeleteFile={onDeleteFile}
+          onSaveComment={onSaveComment}
+          setToast={setToast}
+        />
+      </section>
+    </article>
+  );
+}
+
+function WallAttachment({ file }: { file: WallFile }) {
+  const isImage = file.mimeType.startsWith("image/");
+  return (
+    <a className={classNames("wall-file-link", isImage && "image-attachment")} href={file.url} download>
+      {isImage ? <img src={file.url} alt="" /> : <Paperclip size={15} />}
+      <span>{file.originalName}</span>
+      <small>{fileSize(file.size)}</small>
+    </a>
+  );
+}
+
+function CommentTree({
+  comments,
+  files,
+  currentUser,
+  userById,
+  postId,
+  onUpload,
+  onDeleteFile,
+  onSaveComment,
+  setToast
+}: {
+  comments: WallComment[];
+  files: WallFile[];
+  currentUser: User;
+  userById: (id: string) => User | undefined;
+  postId: string;
+  onUpload: (file: File) => Promise<WallFile>;
+  onDeleteFile: (file: WallFile) => Promise<void>;
+  onSaveComment: (postId: string, content: string, fileIds: string[], parentId: string | null) => Promise<WallComment[]>;
+  setToast: (value: string) => void;
+}) {
+  const [expanded, setExpanded] = useState<Set<string>>(() => new Set());
+  const byParent = useMemo(() => {
+    const map = new Map<string, WallComment[]>();
+    for (const comment of comments) {
+      const key = comment.parentId ?? "root";
+      map.set(key, [...(map.get(key) ?? []), comment]);
+    }
+    return map;
+  }, [comments]);
+
+  const renderBranch = (parentId: string | null, depth = 0): ReactNode => {
+    const children = byParent.get(parentId ?? "root") ?? [];
+    const visible = expanded.has(parentId ?? "root") || children.length <= 3 ? children : children.slice(0, 3);
+    return (
+      <div className={classNames("comment-branch", depth > 0 && "nested")}>
+        {visible.map((comment) => (
+          <CommentItem
+            key={comment.id}
+            comment={comment}
+            files={files}
+            currentUser={currentUser}
+            author={userById(comment.authorId)}
+            onUpload={onUpload}
+            onDeleteFile={onDeleteFile}
+            onReply={(content, fileIds) => onSaveComment(postId, content, fileIds, comment.id)}
+            setToast={setToast}
+          >
+            {renderBranch(comment.id, depth + 1)}
+          </CommentItem>
+        ))}
+        {children.length > 3 && !expanded.has(parentId ?? "root") && (
+          <button className="ghost compact show-more-replies" type="button" onClick={() => setExpanded((current) => new Set(current).add(parentId ?? "root"))}>
+            Показать ещё {children.length - 3}
+          </button>
+        )}
+      </div>
+    );
+  };
+
+  return <div className="comments-list">{comments.length ? renderBranch(null) : <Empty label="Комментариев пока нет" />}</div>;
+}
+
+function CommentItem({
+  comment,
+  files,
+  currentUser,
+  author,
+  onUpload,
+  onDeleteFile,
+  onReply,
+  setToast,
+  children
+}: {
+  comment: WallComment;
+  files: WallFile[];
+  currentUser: User;
+  author?: User;
+  onUpload: (file: File) => Promise<WallFile>;
+  onDeleteFile: (file: WallFile) => Promise<void>;
+  onReply: (content: string, fileIds: string[]) => Promise<WallComment[]>;
+  setToast: (value: string) => void;
+  children: ReactNode;
+}) {
+  const [replying, setReplying] = useState(false);
+  const attached = files.filter((file) => comment.fileIds.includes(file.id));
+  const displayAuthor = author ?? { name: "Участник", avatarUrl: "" };
+
+  return (
+    <div className="comment-item">
+      <div className="comment-card">
+        <UserAvatar user={displayAuthor} />
+        <div className="comment-body">
+          <div className="comment-meta">
+            <strong>{displayAuthor.name}</strong>
+            <span>{dateTime(comment.createdAt)}</span>
+          </div>
+          <p>{comment.content}</p>
+          {attached.length > 0 && (
+            <div className="comment-attachments">
+              {attached.map((file) => (
+                <WallAttachment key={file.id} file={file} />
+              ))}
+            </div>
+          )}
+          <button className="ghost compact" type="button" onClick={() => setReplying((value) => !value)}>
+            Ответить
+          </button>
+          {replying && (
+            <CommentComposer
+              compact
+              currentUser={currentUser}
+              files={files}
+              onUpload={onUpload}
+              onDeleteFile={onDeleteFile}
+              onSave={(content, fileIds) => onReply(content, fileIds).then((result) => {
+                setReplying(false);
+                return result;
+              })}
+              setToast={setToast}
+            />
+          )}
+        </div>
+      </div>
+      {children}
+    </div>
+  );
+}
+
+function CommentComposer({
+  currentUser,
+  files,
+  compact = false,
+  onUpload,
+  onDeleteFile,
+  onSave,
+  setToast
+}: {
+  currentUser: User;
+  files: WallFile[];
+  compact?: boolean;
+  onUpload: (file: File) => Promise<WallFile>;
+  onDeleteFile: (file: WallFile) => Promise<void>;
+  onSave: (content: string, fileIds: string[]) => Promise<unknown>;
+  setToast: (value: string) => void;
+}) {
+  const [content, setContent] = useState("");
+  const [fileIds, setFileIds] = useState<string[]>([]);
+  const [saving, setSaving] = useState(false);
+  const [uploading, setUploading] = useState(false);
+  const attached = files.filter((file) => fileIds.includes(file.id));
+
+  const upload = async (fileList: FileList | null) => {
+    if (!fileList?.length) return;
+    try {
+      setUploading(true);
+      const uploadedIds: string[] = [];
+      for (const file of Array.from(fileList)) {
+        const uploaded = await onUpload(file);
+        uploadedIds.push(uploaded.id);
+      }
+      setFileIds((current) => Array.from(new Set([...current, ...uploadedIds])));
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : "Ошибка загрузки файла");
+    } finally {
+      setUploading(false);
+    }
+  };
+
+  const submit = async () => {
+    if (!content.trim() && !fileIds.length) return;
+    try {
+      setSaving(true);
+      await onSave(content, fileIds);
+      setContent("");
+      setFileIds([]);
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : "Не удалось отправить комментарий");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className={classNames("comment-composer", compact && "compact")}>
+      <UserAvatar user={currentUser} />
+      <div>
+        <textarea
+          rows={compact ? 2 : 3}
+          placeholder={compact ? "Ответ" : "Комментарий"}
+          value={content}
+          onChange={(event) => setContent(event.target.value)}
+          onDragOver={(event) => event.preventDefault()}
+          onDrop={(event) => {
+            event.preventDefault();
+            void upload(event.dataTransfer.files);
+          }}
+        />
+        {attached.length > 0 && (
+          <div className="comment-attachments editor">
+            {attached.map((file) => (
+              <span key={file.id} className="wall-file-chip attached">
+                <span>{file.originalName}</span>
+                <button className="ghost compact" type="button" onClick={() => setFileIds((current) => current.filter((id) => id !== file.id))}>
+                  Убрать
+                </button>
+                <button className="ghost compact danger" type="button" onClick={() => onDeleteFile(file).catch((error) => setToast(error.message))}>
+                  <Trash2 size={13} />
+                </button>
+              </span>
+            ))}
+          </div>
+        )}
+        <div className="comment-actions">
+          <label className="file-action">
+            <Upload size={14} />
+            {uploading ? "Загрузка..." : "Файл"}
+            <input multiple type="file" disabled={uploading} onChange={(event) => upload(event.target.files)} />
+          </label>
+          <button className="primary" type="button" disabled={saving || (!content.trim() && !fileIds.length)} onClick={() => void submit()}>
+            <Send size={15} />
+            Отправить
+          </button>
+        </div>
+      </div>
+    </div>
   );
 }
 
