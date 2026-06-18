@@ -135,6 +135,22 @@ type DashboardData = {
   notifications: PageResult<AppNotification>;
 };
 
+type LatencyChartData = Pick<DashboardData, "latencyTimeline" | "latencySeries">;
+
+type LatencyPeriodGroup = "day" | "week" | "decade" | "month" | "quarter" | "halfyear" | "year" | "other";
+
+type LatencyPeriodRange = {
+  presetId: string;
+  label: string;
+  from: string;
+  to: string;
+  group: LatencyPeriodGroup;
+};
+
+type LatencyPeriodPreset = LatencyPeriodRange & {
+  description?: string;
+};
+
 type OperationPages = {
   deposits: PageResult<Deposit>;
   debits: PageResult<Debit>;
@@ -280,6 +296,11 @@ const emptyDashboardData: DashboardData = {
   notifications: emptyPage<AppNotification>(8)
 };
 
+const emptyLatencyChart: LatencyChartData = {
+  latencyTimeline: [],
+  latencySeries: []
+};
+
 const emptyOperationPages: OperationPages = {
   deposits: emptyPage<Deposit>(),
   debits: emptyPage<Debit>()
@@ -350,6 +371,192 @@ function shortDate(value: string) {
     day: "2-digit",
     month: "2-digit"
   }).format(new Date(value));
+}
+
+function dateInputValue(date: Date) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function dateFromInput(value: string) {
+  const [year, month, day] = value.split("-").map(Number);
+  if (!year || !month || !day) return new Date();
+  return new Date(year, month - 1, day);
+}
+
+function dateInputToIso(value: string, endOfDay = false) {
+  if (!value) return "";
+  const date = dateFromInput(value);
+  date.setHours(endOfDay ? 23 : 0, endOfDay ? 59 : 0, endOfDay ? 59 : 0, endOfDay ? 999 : 0);
+  return date.toISOString();
+}
+
+function addDays(date: Date, days: number) {
+  const next = new Date(date);
+  next.setDate(next.getDate() + days);
+  return next;
+}
+
+function addMonths(date: Date, months: number) {
+  const next = new Date(date);
+  next.setMonth(next.getMonth() + months);
+  return next;
+}
+
+function startOfWeek(date: Date) {
+  const next = new Date(date);
+  const offset = (next.getDay() + 6) % 7;
+  next.setDate(next.getDate() - offset);
+  return next;
+}
+
+function endOfWeek(date: Date) {
+  return addDays(startOfWeek(date), 6);
+}
+
+function startOfMonth(date: Date) {
+  return new Date(date.getFullYear(), date.getMonth(), 1);
+}
+
+function endOfMonth(date: Date) {
+  return new Date(date.getFullYear(), date.getMonth() + 1, 0);
+}
+
+function decadeRange(date: Date, offset = 0) {
+  const absolute = date.getFullYear() * 36 + date.getMonth() * 3 + Math.floor((date.getDate() - 1) / 10) + offset;
+  const year = Math.floor(absolute / 36);
+  const month = Math.floor((absolute % 36) / 3);
+  const decade = absolute % 3;
+  const from = new Date(year, month, decade * 10 + 1);
+  const to = decade === 2 ? endOfMonth(from) : new Date(year, month, decade * 10 + 10);
+  return { from, to };
+}
+
+function quarterRange(date: Date, offset = 0) {
+  const absolute = date.getFullYear() * 4 + Math.floor(date.getMonth() / 3) + offset;
+  const year = Math.floor(absolute / 4);
+  const quarter = absolute % 4;
+  const from = new Date(year, quarter * 3, 1);
+  return { from, to: new Date(year, quarter * 3 + 3, 0) };
+}
+
+function halfYearRange(date: Date, offset = 0) {
+  const absolute = date.getFullYear() * 2 + Math.floor(date.getMonth() / 6) + offset;
+  const year = Math.floor(absolute / 2);
+  const half = absolute % 2;
+  const from = new Date(year, half * 6, 1);
+  return { from, to: new Date(year, half * 6 + 6, 0) };
+}
+
+function makeLatencyPeriod(presetId: string, label: string, from: Date | "", to: Date | "", group: LatencyPeriodGroup): LatencyPeriodPreset {
+  return {
+    presetId,
+    label,
+    from: from ? dateInputValue(from) : "",
+    to: to ? dateInputValue(to) : "",
+    group
+  };
+}
+
+function latencyPeriodLabel(period: Pick<LatencyPeriodRange, "from" | "to" | "label" | "presetId">) {
+  if (period.label && period.presetId !== "custom") return period.label;
+  if (!period.from && !period.to) return "Весь период";
+  const format = (value: string) => new Intl.DateTimeFormat("ru-RU").format(dateFromInput(value));
+  if (period.from && period.to) return `${format(period.from)} - ${format(period.to)}`;
+  if (period.from) return `С ${format(period.from)}`;
+  return `До ${format(period.to)}`;
+}
+
+function buildLatencyPeriodPresets(group: LatencyPeriodGroup, now = new Date()): LatencyPeriodPreset[] {
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const weekStart = startOfWeek(today);
+  const monthStart = startOfMonth(today);
+  const currentDecade = decadeRange(today);
+  const previousDecade = decadeRange(today, -1);
+  const nextDecade = decadeRange(today, 1);
+  const currentQuarter = quarterRange(today);
+  const previousQuarter = quarterRange(today, -1);
+  const currentHalfYear = halfYearRange(today);
+  const previousHalfYear = halfYearRange(today, -1);
+
+  if (group === "day") {
+    return [
+      makeLatencyPeriod("today", "Сегодня", today, today, group),
+      makeLatencyPeriod("yesterday", "Вчера", addDays(today, -1), addDays(today, -1), group),
+      makeLatencyPeriod("last3", "Последние 3 дня", addDays(today, -2), today, group),
+      makeLatencyPeriod("tomorrow", "Завтра", addDays(today, 1), addDays(today, 1), group)
+    ];
+  }
+  if (group === "week") {
+    return [
+      makeLatencyPeriod("previousWeek", "Прошлая неделя", addDays(weekStart, -7), addDays(weekStart, -1), group),
+      makeLatencyPeriod("last7", "Последние 7 дней", addDays(today, -6), today, group),
+      makeLatencyPeriod("fromWeekStart", "С начала этой недели", weekStart, today, group),
+      makeLatencyPeriod("thisWeek", "Эта неделя", weekStart, endOfWeek(today), group),
+      makeLatencyPeriod("toWeekEnd", "До конца этой недели", today, endOfWeek(today), group),
+      makeLatencyPeriod("next7", "Следующие 7 дней", today, addDays(today, 6), group),
+      makeLatencyPeriod("nextWeek", "Следующая неделя", addDays(weekStart, 7), addDays(weekStart, 13), group)
+    ];
+  }
+  if (group === "decade") {
+    return [
+      makeLatencyPeriod("previousDecade", "Прошлая декада", previousDecade.from, previousDecade.to, group),
+      makeLatencyPeriod("thisDecade", "Эта декада", currentDecade.from, currentDecade.to, group),
+      makeLatencyPeriod("fromDecadeStart", "С начала этой декады", currentDecade.from, today, group),
+      makeLatencyPeriod("nextDecade", "Следующая декада", nextDecade.from, nextDecade.to, group)
+    ];
+  }
+  if (group === "month") {
+    return [
+      makeLatencyPeriod("previousMonth", "Прошлый месяц", startOfMonth(addMonths(today, -1)), endOfMonth(addMonths(today, -1)), group),
+      makeLatencyPeriod("last30", "Последние 30 дней", addDays(today, -29), today, group),
+      makeLatencyPeriod("fromMonthStart", "С начала месяца", monthStart, today, group),
+      makeLatencyPeriod("thisMonth", "Этот месяц", monthStart, endOfMonth(today), group),
+      makeLatencyPeriod("nextMonth", "Следующий месяц", startOfMonth(addMonths(today, 1)), endOfMonth(addMonths(today, 1)), group)
+    ];
+  }
+  if (group === "quarter") {
+    return [
+      makeLatencyPeriod("previousQuarter", "Прошлый квартал", previousQuarter.from, previousQuarter.to, group),
+      makeLatencyPeriod("thisQuarter", "Этот квартал", currentQuarter.from, currentQuarter.to, group),
+      makeLatencyPeriod("fromQuarterStart", "С начала квартала", currentQuarter.from, today, group)
+    ];
+  }
+  if (group === "halfyear") {
+    return [
+      makeLatencyPeriod("previousHalfYear", "Прошлое полугодие", previousHalfYear.from, previousHalfYear.to, group),
+      makeLatencyPeriod("thisHalfYear", "Это полугодие", currentHalfYear.from, currentHalfYear.to, group),
+      makeLatencyPeriod("fromHalfYearStart", "С начала полугодия", currentHalfYear.from, today, group)
+    ];
+  }
+  if (group === "year") {
+    return [
+      makeLatencyPeriod("previousYear", "Прошлый год", new Date(today.getFullYear() - 1, 0, 1), new Date(today.getFullYear() - 1, 11, 31), group),
+      makeLatencyPeriod("last365", "Последние 365 дней", addDays(today, -364), today, group),
+      makeLatencyPeriod("fromYearStart", "С начала года", new Date(today.getFullYear(), 0, 1), today, group),
+      makeLatencyPeriod("thisYear", "Этот год", new Date(today.getFullYear(), 0, 1), new Date(today.getFullYear(), 11, 31), group)
+    ];
+  }
+  return [
+    { presetId: "all", label: "Весь период", from: "", to: "", group },
+    makeLatencyPeriod("last14", "Последние 14 дней", addDays(today, -13), today, group),
+    makeLatencyPeriod("last90", "Последние 90 дней", addDays(today, -89), today, group)
+  ];
+}
+
+function defaultLatencyPeriod() {
+  return buildLatencyPeriodPresets("week")[1];
+}
+
+function appendLatencyPeriodQuery(query: URLSearchParams, period: LatencyPeriodRange, prefix = "") {
+  const from = dateInputToIso(period.from, false);
+  const to = dateInputToIso(period.to, true);
+  const fromKey = prefix ? `${prefix}From` : "from";
+  const toKey = prefix ? `${prefix}To` : "to";
+  if (from) query.set(fromKey, from);
+  if (to) query.set(toKey, to);
 }
 
 function serviceConnection(service: Service): ServiceConnectionSettings {
@@ -577,6 +784,115 @@ function Empty({ label }: { label: string }) {
   return <div className="empty">{label}</div>;
 }
 
+function LatencyPeriodModal({
+  value,
+  onSelect,
+  onClose
+}: {
+  value: LatencyPeriodRange;
+  onSelect: (period: LatencyPeriodRange) => void;
+  onClose: () => void;
+}) {
+  const [group, setGroup] = useState<LatencyPeriodGroup>(value.group);
+  const [draft, setDraft] = useState<LatencyPeriodRange>(value);
+  const presets = useMemo(() => buildLatencyPeriodPresets(group), [group]);
+  const groups: Array<{ id: LatencyPeriodGroup; label: string }> = [
+    { id: "day", label: "День" },
+    { id: "week", label: "Неделя" },
+    { id: "decade", label: "Декада" },
+    { id: "month", label: "Месяц" },
+    { id: "quarter", label: "Квартал" },
+    { id: "halfyear", label: "Полугодие" },
+    { id: "year", label: "Год" },
+    { id: "other", label: "Прочее" }
+  ];
+
+  const setCustomRange = (next: Partial<Pick<LatencyPeriodRange, "from" | "to">>) => {
+    setDraft((current) => ({
+      ...current,
+      ...next,
+      presetId: "custom",
+      label: ""
+    }));
+  };
+
+  return (
+    <ModalShell
+      title="Выберите период"
+      onClose={onClose}
+      footer={
+        <>
+          <button className="ghost" type="button" onClick={onClose}>
+            Отмена
+          </button>
+          <button className="primary" type="button" onClick={() => onSelect({ ...draft, label: latencyPeriodLabel(draft), group })}>
+            <Check size={16} />
+            Выбрать
+          </button>
+        </>
+      }
+    >
+      <div className="period-picker">
+        <div className="period-picker-fields">
+          <label>
+            <input type="date" value={draft.from} onChange={(event) => setCustomRange({ from: event.target.value })} />
+          </label>
+          <span>–</span>
+          <label>
+            <input type="date" value={draft.to} onChange={(event) => setCustomRange({ to: event.target.value })} />
+          </label>
+          <button
+            className="link-button"
+            type="button"
+            onClick={() => {
+              setGroup("other");
+              setDraft({ presetId: "all", label: "Весь период", from: "", to: "", group: "other" });
+            }}
+          >
+            Очистить период
+          </button>
+        </div>
+
+        <div className="period-picker-body">
+          <div className="period-preset-list">
+            {presets.map((preset) => (
+              <button
+                key={preset.presetId}
+                className={classNames("period-preset", draft.presetId === preset.presetId && draft.group === preset.group && "active")}
+                type="button"
+                onClick={() => setDraft(preset)}
+              >
+                {preset.label}
+              </button>
+            ))}
+          </div>
+
+          <div className="period-group-list">
+            {groups.map((item) => (
+              <button
+                key={item.id}
+                className={classNames("period-group", group === item.id && "active")}
+                type="button"
+                onClick={() => setGroup(item.id)}
+              >
+                {item.label}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <button
+          className="link-button period-custom-link"
+          type="button"
+          onClick={() => setDraft((current) => ({ ...current, presetId: "custom", label: "" }))}
+        >
+          Показать произвольный период
+        </button>
+      </div>
+    </ModalShell>
+  );
+}
+
 function ModalShell({
   title,
   subtitle,
@@ -727,9 +1043,12 @@ export default function App() {
   const [dashboardData, setDashboardData] = useState<DashboardData>(emptyDashboardData);
   const [dashboardNotificationOffset, setDashboardNotificationOffset] = useState(0);
   const [dashboardLatencyOffset, setDashboardLatencyOffset] = useState(0);
+  const [dashboardLatencyPeriod, setDashboardLatencyPeriod] = useState<LatencyPeriodRange>(() => defaultLatencyPeriod());
   const [operationPages, setOperationPages] = useState<OperationPages>(emptyOperationPages);
   const [operationOffsets, setOperationOffsets] = useState({ deposits: 0, debits: 0 });
   const [accountPages, setAccountPages] = useState<AccountPages>(emptyAccountPages);
+  const [accountLatencyChart, setAccountLatencyChart] = useState<LatencyChartData>(emptyLatencyChart);
+  const [accountLatencyPeriod, setAccountLatencyPeriod] = useState<LatencyPeriodRange>(() => defaultLatencyPeriod());
   const [accountOffsets, setAccountOffsets] = useState({ deposits: 0, debits: 0, latency: 0 });
   const [wallPostId, setWallPostId] = useState(() => wallPostIdFromHash());
   const [wallRefreshKey, setWallRefreshKey] = useState(0);
@@ -766,13 +1085,18 @@ export default function App() {
     }));
   };
 
-  const loadDashboardData = async (notificationOffset = dashboardNotificationOffset, latencyOffset = dashboardLatencyOffset) => {
+  const loadDashboardData = async (
+    notificationOffset = dashboardNotificationOffset,
+    latencyOffset = dashboardLatencyOffset,
+    latencyPeriod = dashboardLatencyPeriod
+  ) => {
     const query = new URLSearchParams({
       notificationOffset: String(notificationOffset),
       notificationLimit: "8",
       latencyOffset: String(latencyOffset),
       latencyLimit: "20"
     });
+    appendLatencyPeriodQuery(query, latencyPeriod, "latency");
     const nextDashboard = await api<DashboardData>(`/api/dashboard?${query.toString()}`);
     setDashboardData(nextDashboard);
     setDashboardNotificationOffset(notificationOffset);
@@ -807,7 +1131,8 @@ export default function App() {
   const loadAccountData = async (
     depositOffset = accountOffsets.deposits,
     debitOffset = accountOffsets.debits,
-    latencyOffset = accountOffsets.latency
+    latencyOffset = accountOffsets.latency,
+    latencyPeriod = accountLatencyPeriod
   ) => {
     if (!currentUser) return emptyAccountPages;
     const depositQuery = new URLSearchParams({
@@ -825,26 +1150,35 @@ export default function App() {
       limit: String(ledgerPageLimit),
       userId: currentUser.id
     });
-    const [deposits, debits, latency] = await Promise.all([
+    const latencyChartQuery = new URLSearchParams({ userId: currentUser.id });
+    appendLatencyPeriodQuery(latencyChartQuery, latencyPeriod);
+    const [deposits, debits, latency, latencyChart] = await Promise.all([
       api<PageResult<Deposit>>(`/api/deposits?${depositQuery.toString()}`),
       api<PageResult<Debit>>(`/api/debits?${debitQuery.toString()}`),
-      api<PageResult<LatencyCheck>>(`/api/latency-checks?${latencyQuery.toString()}`)
+      api<PageResult<LatencyCheck>>(`/api/latency-checks?${latencyQuery.toString()}`),
+      api<LatencyChartData>(`/api/latency-chart?${latencyChartQuery.toString()}`)
     ]);
     const nextPages = { deposits, debits, latency };
     setAccountPages(nextPages);
+    setAccountLatencyChart(latencyChart);
     setAccountOffsets({ deposits: depositOffset, debits: debitOffset, latency: latencyOffset });
     return nextPages;
   };
 
   const refreshOpenViewData = async (reset = false) => {
     if (view === "dashboard") {
-      await loadDashboardData(reset ? 0 : dashboardNotificationOffset, reset ? 0 : dashboardLatencyOffset);
+      await loadDashboardData(reset ? 0 : dashboardNotificationOffset, reset ? 0 : dashboardLatencyOffset, dashboardLatencyPeriod);
     }
     if (view === "ledger") {
       await loadOperationData(reset ? 0 : operationOffsets.deposits, reset ? 0 : operationOffsets.debits);
     }
     if (view === "account") {
-      await loadAccountData(reset ? 0 : accountOffsets.deposits, reset ? 0 : accountOffsets.debits, reset ? 0 : accountOffsets.latency);
+      await loadAccountData(
+        reset ? 0 : accountOffsets.deposits,
+        reset ? 0 : accountOffsets.debits,
+        reset ? 0 : accountOffsets.latency,
+        accountLatencyPeriod
+      );
     }
     if (view === "wall") {
       setWallRefreshKey((current) => current + 1);
@@ -1231,15 +1565,25 @@ export default function App() {
   const saveUser = (user: User & { adminPassword?: string; currentPassword?: string }) => mutate(`/api/users/${user.id}`, user, "PUT");
   const saveTelegram = (telegram: TelegramSettings) => mutate("/api/settings/telegram", telegram, "PUT");
   const saveCurrency = (currency: Currency) => mutate(`/api/currencies/${currency.code}`, currency, "PUT");
+  const applyDashboardLatencyPeriod = (period: LatencyPeriodRange) => {
+    setDashboardLatencyPeriod(period);
+    loadDashboardData(dashboardNotificationOffset, 0, period).catch((error) => setToast(error.message));
+  };
+  const applyAccountLatencyPeriod = (period: LatencyPeriodRange) => {
+    setAccountLatencyPeriod(period);
+    loadAccountData(accountOffsets.deposits, accountOffsets.debits, 0, period).catch((error) => setToast(error.message));
+  };
 
   const content = {
     dashboard: (
       <Dashboard
         state={state}
         dashboard={dashboard}
+        latencyPeriod={dashboardLatencyPeriod}
         clientHealth={clientHealth}
         serviceById={serviceById}
         userById={userById}
+        onLatencyPeriodChange={applyDashboardLatencyPeriod}
         onLatencyPageChange={(offset) => loadDashboardData(dashboardNotificationOffset, offset).catch((error) => setToast(error.message))}
         onNotificationPageChange={(offset) => loadDashboardData(offset, dashboardLatencyOffset).catch((error) => setToast(error.message))}
       />
@@ -1327,12 +1671,15 @@ export default function App() {
         state={state}
         currentUser={currentUser}
         pages={accountPages}
+        latencyGraph={accountLatencyChart}
+        latencyPeriod={accountLatencyPeriod}
         mutate={mutate}
         saveUser={saveUser}
         serviceById={serviceById}
         userById={userById}
         setToast={setToast}
         onReload={() => loadAccountData()}
+        onLatencyPeriodChange={applyAccountLatencyPeriod}
         onPageChange={(kind, offset) => {
           const nextDepositOffset = kind === "deposits" ? offset : accountOffsets.deposits;
           const nextDebitOffset = kind === "debits" ? offset : accountOffsets.debits;
@@ -1462,9 +1809,11 @@ export default function App() {
 function Dashboard({
   state,
   dashboard,
+  latencyPeriod,
   clientHealth,
   serviceById,
   userById,
+  onLatencyPeriodChange,
   onLatencyPageChange,
   onNotificationPageChange
 }: {
@@ -1482,12 +1831,16 @@ function Dashboard({
     latencyByUser: Array<{ name: string; avg: number; count: number }>;
     notifications: PageResult<AppNotification>;
   };
+  latencyPeriod: LatencyPeriodRange;
   clientHealth: Record<string, ClientHealth>;
   serviceById: (id: string) => Service | undefined;
   userById: (id: string) => User | undefined;
+  onLatencyPeriodChange: (period: LatencyPeriodRange) => void;
   onLatencyPageChange: (offset: number) => void;
   onNotificationPageChange: (offset: number) => void;
 }) {
+  const [latencyPeriodOpen, setLatencyPeriodOpen] = useState(false);
+
   return (
     <section className="page-grid">
       <div className="stats-grid">
@@ -1632,7 +1985,13 @@ function Dashboard({
       <div className="panel chart-panel wide">
         <div className="panel-head">
           <h2>История задержки</h2>
-          <span className="chip">{dashboard.latencySeries.length}</span>
+          <div className="actions">
+            <button className="ghost compact period-trigger" type="button" onClick={() => setLatencyPeriodOpen(true)}>
+              <CalendarClock size={14} />
+              {latencyPeriodLabel(latencyPeriod)}
+            </button>
+            <span className="chip">{dashboard.latencySeries.length}</span>
+          </div>
         </div>
         <div className="chart-wrap latency-history">
           {dashboard.latencyTimeline.length && dashboard.latencySeries.length ? (
@@ -1661,6 +2020,16 @@ function Dashboard({
             <Empty label="История замеров пока пуста" />
           )}
         </div>
+        {latencyPeriodOpen && (
+          <LatencyPeriodModal
+            value={latencyPeriod}
+            onClose={() => setLatencyPeriodOpen(false)}
+            onSelect={(period) => {
+              onLatencyPeriodChange(period);
+              setLatencyPeriodOpen(false);
+            }}
+          />
+        )}
       </div>
 
       <div className="panel wide">
@@ -4142,27 +4511,34 @@ function AccountView({
   state,
   currentUser,
   pages,
+  latencyGraph,
+  latencyPeriod,
   mutate,
   saveUser,
   serviceById,
   userById,
   setToast,
   onReload,
+  onLatencyPeriodChange,
   onPageChange
 }: {
   state: AppState;
   currentUser: User;
   pages: AccountPages;
+  latencyGraph: LatencyChartData;
+  latencyPeriod: LatencyPeriodRange;
   mutate: (path: string, body?: unknown, method?: string) => Promise<AppState>;
   saveUser: (user: User & { adminPassword?: string; currentPassword?: string }) => Promise<AppState>;
   serviceById: (id: string) => Service | undefined;
   userById: (id: string) => User | undefined;
   setToast: (value: string) => void;
   onReload: () => Promise<AccountPages>;
+  onLatencyPeriodChange: (period: LatencyPeriodRange) => void;
   onPageChange: (kind: keyof AccountPages, offset: number) => void;
 }) {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [depositOpen, setDepositOpen] = useState(false);
+  const [latencyPeriodOpen, setLatencyPeriodOpen] = useState(false);
   const userServices = useMemo(() => activeServicesForUser(state, currentUser.id), [currentUser.id, state.memberships, state.services]);
   const firstService = userServices[0];
   const [depositDraft, setDepositDraft] = useState<DepositForm>({
@@ -4311,18 +4687,24 @@ function AccountView({
       <div className="panel chart-panel wide">
         <div className="panel-head">
           <h2>Моя задержка до сервисов</h2>
-          <span className="chip">{latencyChart.series.length}</span>
+          <div className="actions">
+            <button className="ghost compact period-trigger" type="button" onClick={() => setLatencyPeriodOpen(true)}>
+              <CalendarClock size={14} />
+              {latencyPeriodLabel(latencyPeriod)}
+            </button>
+            <span className="chip">{latencyGraph.latencySeries.length}</span>
+          </div>
         </div>
         <div className="chart-wrap latency-history">
-          {latencyChart.points.length && latencyChart.series.length ? (
+          {latencyGraph.latencyTimeline.length && latencyGraph.latencySeries.length ? (
             <ResponsiveContainer width="100%" height="100%">
-              <LineChart data={latencyChart.points}>
+              <LineChart data={latencyGraph.latencyTimeline}>
                 <CartesianGrid stroke="rgba(255,255,255,.06)" vertical={false} />
                 <XAxis dataKey="time" axisLine={false} tickLine={false} tick={{ fill: "#8a8f98", fontSize: 12 }} />
                 <YAxis axisLine={false} tickLine={false} tick={{ fill: "#8a8f98", fontSize: 12 }} />
                 <Tooltip contentStyle={{ background: "#111318", border: "1px solid #272a33", borderRadius: 8 }} />
                 <Legend wrapperStyle={{ color: "#c6cad2", fontSize: 12 }} />
-                {latencyChart.series.map((series) => (
+                {latencyGraph.latencySeries.map((series) => (
                   <Line
                     key={series.key}
                     type="monotone"
@@ -4340,6 +4722,16 @@ function AccountView({
             <Empty label="Замеров задержки пока нет" />
           )}
         </div>
+        {latencyPeriodOpen && (
+          <LatencyPeriodModal
+            value={latencyPeriod}
+            onClose={() => setLatencyPeriodOpen(false)}
+            onSelect={(period) => {
+              onLatencyPeriodChange(period);
+              setLatencyPeriodOpen(false);
+            }}
+          />
+        )}
       </div>
 
       <HistoryTable

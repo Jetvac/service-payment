@@ -461,6 +461,100 @@ h2 {
   border-color: rgba(71, 209, 140, 0.26);
 }
 
+.period-trigger {
+  max-width: min(320px, 48vw);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.period-picker {
+  display: grid;
+  gap: 12px;
+  min-width: min(620px, calc(100vw - 72px));
+  padding: 16px;
+}
+
+.period-picker-fields {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+}
+
+.period-picker-fields label {
+  min-width: 0;
+}
+
+.period-picker-fields input {
+  min-height: 34px;
+}
+
+.link-button {
+  border: 0;
+  color: #9fbdff;
+  background: transparent;
+  padding: 0;
+  text-align: left;
+  text-decoration: underline;
+}
+
+.period-picker-body {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 118px;
+  gap: 12px;
+  min-height: 280px;
+}
+
+.period-preset-list,
+.period-group-list {
+  display: grid;
+  align-content: start;
+  gap: 4px;
+  min-width: 0;
+}
+
+.period-preset-list {
+  overflow: auto;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.025);
+  padding: 6px;
+}
+
+.period-preset,
+.period-group {
+  min-height: 32px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  color: #d8dbe2;
+  background: transparent;
+  padding: 0 10px;
+  text-align: left;
+}
+
+.period-preset:hover,
+.period-preset.active {
+  color: #fff;
+  background: rgba(122, 168, 255, 0.16);
+}
+
+.period-group {
+  border-color: rgba(255, 255, 255, 0.12);
+  text-align: center;
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.period-group.active {
+  border-color: rgba(122, 168, 255, 0.55);
+  color: #fff;
+  background: rgba(122, 168, 255, 0.16);
+}
+
+.period-custom-link {
+  width: max-content;
+}
+
 .service-health {
   display: inline-flex;
   align-items: center;
@@ -2212,5 +2306,23 @@ td small {
 
   .pagination-controls {
     justify-content: space-between;
+  }
+
+  .period-picker {
+    min-width: 0;
+    padding: 14px;
+  }
+
+  .period-picker-fields,
+  .period-picker-body {
+    grid-template-columns: 1fr;
+  }
+
+  .period-group-list {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .period-trigger {
+    max-width: 100%;
   }
 }

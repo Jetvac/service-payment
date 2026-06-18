@@ -382,6 +382,100 @@ function plainDate(value: string) {
   }).format(new Date(value));
 }
 
+function readTime(value: unknown) {
+  const raw = String(value ?? "");
+  if (!raw) return null;
+  const time = new Date(raw).getTime();
+  return Number.isFinite(time) ? time : null;
+}
+
+function latencyBucketSize(rangeMs: number) {
+  const hour = 60 * 60 * 1000;
+  const day = 24 * hour;
+  if (rangeMs <= 2 * day) return 30 * 60 * 1000;
+  if (rangeMs <= 14 * day) return 6 * hour;
+  if (rangeMs <= 90 * day) return day;
+  if (rangeMs <= 370 * day) return 7 * day;
+  return 31 * day;
+}
+
+function latencyBucketLabel(bucketTime: number, bucketSize: number) {
+  const date = new Date(bucketTime);
+  const day = 24 * 60 * 60 * 1000;
+  if (bucketSize < day) {
+    return new Intl.DateTimeFormat("ru-RU", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" }).format(date);
+  }
+  return new Intl.DateTimeFormat("ru-RU", { day: "2-digit", month: "2-digit", year: "2-digit" }).format(date);
+}
+
+function latencyChartData(data: AppData, query: Record<string, unknown>) {
+  const from = readTime(query.from);
+  const to = readTime(query.to);
+  const rangeMs = Math.max(1, (to ?? Date.now()) - (from ?? ((to ?? Date.now()) - 7 * 24 * 60 * 60 * 1000)));
+  const bucketSize = latencyBucketSize(rangeMs);
+  const userId = String(query.userId ?? "");
+  const knownUserIds = new Set(data.users.map((user) => user.id));
+  const checks = data.latencyChecks
+    .filter((check) => !check.userId || knownUserIds.has(check.userId))
+    .filter((check) => !userId || check.userId === userId)
+    .filter((check) => {
+      const checkedAt = new Date(check.checkedAt).getTime();
+      return (!from || checkedAt >= from) && (!to || checkedAt <= to);
+    });
+
+  const latencySeries: Array<{ key: string; name: string; color: string }> = [];
+  const latencySeriesByPair = new Map<string, { key: string; name: string; color: string }>();
+  const latencyBuckets = new Map<string, { time: string; ts: number; sums: Record<string, { sum: number; count: number }> }>();
+
+  for (const check of checks.filter((item) => item.latencyMs !== null).slice(0, 5000).reverse()) {
+    const user = data.users.find((item) => item.id === check.userId);
+    const service = data.services.find((item) => item.id === check.serviceId);
+    const pair = `${check.userId ?? "unknown"}:${check.serviceId}`;
+    let series = latencySeriesByPair.get(pair);
+    if (!series && latencySeries.length < latencyLineColors.length) {
+      series = {
+        key: `latency_${latencySeries.length}`,
+        name: userId ? service?.name ?? "Сервис" : `${user?.name ?? "Не выбран"} · ${service?.name ?? "Сервис"}`,
+        color: latencyLineColors[latencySeries.length]
+      };
+      latencySeriesByPair.set(pair, series);
+      latencySeries.push(series);
+    }
+    if (!series) continue;
+
+    const checkedAt = new Date(check.checkedAt).getTime();
+    const bucketTime = Math.floor(checkedAt / bucketSize) * bucketSize;
+    const bucketId = String(bucketTime);
+    const bucket =
+      latencyBuckets.get(bucketId) ??
+      {
+        time: latencyBucketLabel(bucketTime, bucketSize),
+        ts: bucketTime,
+        sums: {}
+      };
+    const current = bucket.sums[series.key] ?? { sum: 0, count: 0 };
+    current.sum += check.latencyMs ?? 0;
+    current.count += 1;
+    bucket.sums[series.key] = current;
+    latencyBuckets.set(bucketId, bucket);
+  }
+
+  return {
+    latencyTimeline: Array.from(latencyBuckets.values())
+      .sort((a, b) => a.ts - b.ts)
+      .slice(-160)
+      .map((bucket) => {
+        const point: Record<string, string | number> = { time: bucket.time };
+        for (const series of latencySeries) {
+          const value = bucket.sums[series.key];
+          if (value) point[series.key] = Math.round(value.sum / value.count);
+        }
+        return point;
+      }),
+    latencySeries
+  };
+}
+
 function dashboardData(data: AppData, query: Record<string, unknown>) {
   const notificationPage = readPage(
     { offset: query.notificationOffset, limit: query.notificationLimit },
@@ -444,6 +538,7 @@ function dashboardData(data: AppData, query: Record<string, unknown>) {
     latencyBuckets.set(bucketId, bucket);
   }
 
+  const selectedLatencyChart = latencyChartData(data, { from: query.latencyFrom, to: query.latencyTo });
   const latencyStats = new Map<string, { name: string; sum: number; count: number }>();
   for (const check of knownLatencyChecks) {
     if (check.latencyMs === null || !check.userId) continue;
@@ -457,7 +552,7 @@ function dashboardData(data: AppData, query: Record<string, unknown>) {
 
   return {
     chart: Array.from(byDate.values()).reverse().slice(-14),
-    latencyTimeline: Array.from(latencyBuckets.values())
+    latencyTimeline: selectedLatencyChart.latencyTimeline.length ? selectedLatencyChart.latencyTimeline : Array.from(latencyBuckets.values())
       .sort((a, b) => a.ts - b.ts)
       .slice(-40)
       .map((bucket) => {
@@ -468,7 +563,7 @@ function dashboardData(data: AppData, query: Record<string, unknown>) {
         }
         return point;
       }),
-    latencySeries,
+    latencySeries: selectedLatencyChart.latencySeries.length ? selectedLatencyChart.latencySeries : latencySeries,
     latencyByUser: Array.from(latencyStats.values())
       .map((item) => ({ name: item.name, avg: Math.round(item.sum / item.count), count: item.count }))
       .sort((a, b) => b.count - a.count)
@@ -952,6 +1047,17 @@ app.get("/api/latency-checks", (req, res) => {
     const userId = actor?.botAdmin ? requestedUserId : actor?.id ?? "";
     const rows = userId ? store.read().latencyChecks.filter((check) => check.userId === userId) : store.read().latencyChecks;
     res.json(ok(pageResult(rows, offset, limit)));
+  } catch (error) {
+    res.status(400).json(fail(error));
+  }
+});
+
+app.get("/api/latency-chart", (req, res) => {
+  try {
+    const actor = authUserFromRequest(req);
+    const requestedUserId = String(req.query.userId ?? "");
+    const userId = actor?.botAdmin ? requestedUserId : actor?.id ?? "";
+    res.json(ok(latencyChartData(store.read(), { ...req.query, userId })));
   } catch (error) {
     res.status(400).json(fail(error));
   }
