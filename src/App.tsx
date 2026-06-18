@@ -77,7 +77,7 @@ import type {
 } from "./types";
 import type { AutoDeposit } from "./types";
 
-type View = "dashboard" | "wall" | "services" | "people" | "ledger" | "bot";
+type View = "dashboard" | "wall" | "services" | "people" | "ledger" | "bot" | "account";
 
 type DepositForm = {
   serviceId: string;
@@ -140,6 +140,10 @@ type OperationPages = {
   debits: PageResult<Debit>;
 };
 
+type AccountPages = OperationPages & {
+  latency: PageResult<LatencyCheck>;
+};
+
 type WallListData = {
   posts: PageResult<WallPost>;
   tags: WallTag[];
@@ -190,6 +194,8 @@ const healthLabels: Record<ServiceHealthStatus | "checking", string> = {
   unknown: "Нет данных",
   checking: "Проверка"
 };
+
+const latencyLineColors = ["#7aa8ff", "#47d18c", "#f8c15d", "#ff8b82", "#b994ff", "#5ed4d6", "#f49ac2", "#c6cad2"];
 
 const navItems = [
   { id: "dashboard", label: "Обзор", icon: Gauge },
@@ -279,6 +285,12 @@ const emptyOperationPages: OperationPages = {
   debits: emptyPage<Debit>()
 };
 
+const emptyAccountPages: AccountPages = {
+  deposits: emptyPage<Deposit>(),
+  debits: emptyPage<Debit>(),
+  latency: emptyPage<LatencyCheck>(20)
+};
+
 const emptyWallData: WallListData = {
   posts: emptyPage<WallPost>(wallPageLimit),
   tags: [],
@@ -330,6 +342,13 @@ function dateTime(value: string | null | undefined) {
     year: "2-digit",
     hour: "2-digit",
     minute: "2-digit"
+  }).format(new Date(value));
+}
+
+function shortDate(value: string) {
+  return new Intl.DateTimeFormat("ru-RU", {
+    day: "2-digit",
+    month: "2-digit"
   }).format(new Date(value));
 }
 
@@ -710,12 +729,17 @@ export default function App() {
   const [dashboardLatencyOffset, setDashboardLatencyOffset] = useState(0);
   const [operationPages, setOperationPages] = useState<OperationPages>(emptyOperationPages);
   const [operationOffsets, setOperationOffsets] = useState({ deposits: 0, debits: 0 });
+  const [accountPages, setAccountPages] = useState<AccountPages>(emptyAccountPages);
+  const [accountOffsets, setAccountOffsets] = useState({ deposits: 0, debits: 0, latency: 0 });
   const [wallPostId, setWallPostId] = useState(() => wallPostIdFromHash());
   const [wallRefreshKey, setWallRefreshKey] = useState(0);
 
   const currentUser = useMemo(() => state?.users.find((user) => user.id === currentUserId), [currentUserId, state?.users]);
   const isAdmin = Boolean(currentUser?.botAdmin);
-  const visibleNavItems = useMemo(() => navItems.filter((item) => isAdmin || item.id !== "bot"), [isAdmin]);
+  const visibleNavItems = useMemo(
+    () => navItems.filter((item) => isAdmin || !["bot", "people", "ledger"].includes(item.id)),
+    [isAdmin]
+  );
 
   const clearAuth = () => {
     window.localStorage.removeItem(authStorageKey);
@@ -780,12 +804,47 @@ export default function App() {
     return nextPages;
   };
 
+  const loadAccountData = async (
+    depositOffset = accountOffsets.deposits,
+    debitOffset = accountOffsets.debits,
+    latencyOffset = accountOffsets.latency
+  ) => {
+    if (!currentUser) return emptyAccountPages;
+    const depositQuery = new URLSearchParams({
+      offset: String(depositOffset),
+      limit: String(ledgerPageLimit),
+      userId: currentUser.id
+    });
+    const debitQuery = new URLSearchParams({
+      offset: String(debitOffset),
+      limit: String(ledgerPageLimit),
+      userId: currentUser.id
+    });
+    const latencyQuery = new URLSearchParams({
+      offset: String(latencyOffset),
+      limit: String(ledgerPageLimit),
+      userId: currentUser.id
+    });
+    const [deposits, debits, latency] = await Promise.all([
+      api<PageResult<Deposit>>(`/api/deposits?${depositQuery.toString()}`),
+      api<PageResult<Debit>>(`/api/debits?${debitQuery.toString()}`),
+      api<PageResult<LatencyCheck>>(`/api/latency-checks?${latencyQuery.toString()}`)
+    ]);
+    const nextPages = { deposits, debits, latency };
+    setAccountPages(nextPages);
+    setAccountOffsets({ deposits: depositOffset, debits: debitOffset, latency: latencyOffset });
+    return nextPages;
+  };
+
   const refreshOpenViewData = async (reset = false) => {
     if (view === "dashboard") {
       await loadDashboardData(reset ? 0 : dashboardNotificationOffset, reset ? 0 : dashboardLatencyOffset);
     }
     if (view === "ledger") {
       await loadOperationData(reset ? 0 : operationOffsets.deposits, reset ? 0 : operationOffsets.debits);
+    }
+    if (view === "account") {
+      await loadAccountData(reset ? 0 : accountOffsets.deposits, reset ? 0 : accountOffsets.debits, reset ? 0 : accountOffsets.latency);
     }
     if (view === "wall") {
       setWallRefreshKey((current) => current + 1);
@@ -830,6 +889,11 @@ export default function App() {
   }, [view, currentUser?.id, isAdmin]);
 
   useEffect(() => {
+    if (!state || !currentUser || view !== "account") return;
+    loadAccountData(0, 0, 0).catch((error) => setToast(error.message));
+  }, [view, currentUser?.id]);
+
+  useEffect(() => {
     if (!state) return;
     if (currentUserId && !state.users.some((user) => user.id === currentUserId)) {
       clearAuth();
@@ -838,7 +902,7 @@ export default function App() {
   }, [currentUserId, state]);
 
   useEffect(() => {
-    if (!isAdmin && view === "bot") {
+    if (!isAdmin && ["bot", "people", "ledger"].includes(view)) {
       setView("dashboard");
     }
   }, [isAdmin, view]);
@@ -1164,7 +1228,7 @@ export default function App() {
     }
   };
 
-  const saveUser = (user: User & { adminPassword?: string }) => mutate(`/api/users/${user.id}`, user, "PUT");
+  const saveUser = (user: User & { adminPassword?: string; currentPassword?: string }) => mutate(`/api/users/${user.id}`, user, "PUT");
   const saveTelegram = (telegram: TelegramSettings) => mutate("/api/settings/telegram", telegram, "PUT");
   const saveCurrency = (currency: Currency) => mutate(`/api/currencies/${currency.code}`, currency, "PUT");
 
@@ -1211,6 +1275,7 @@ export default function App() {
         deployingServiceId={deployingServiceId}
         deployEchoServer={deployEchoServer}
         saveService={saveService}
+        isAdmin={isAdmin}
       />
     ),
     people: (
@@ -1256,9 +1321,29 @@ export default function App() {
         importDatabase={importDatabase}
         updateApplication={updateApplication}
       />
+    ),
+    account: (
+      <AccountView
+        state={state}
+        currentUser={currentUser}
+        pages={accountPages}
+        mutate={mutate}
+        saveUser={saveUser}
+        serviceById={serviceById}
+        userById={userById}
+        setToast={setToast}
+        onReload={() => loadAccountData()}
+        onPageChange={(kind, offset) => {
+          const nextDepositOffset = kind === "deposits" ? offset : accountOffsets.deposits;
+          const nextDebitOffset = kind === "debits" ? offset : accountOffsets.debits;
+          const nextLatencyOffset = kind === "latency" ? offset : accountOffsets.latency;
+          loadAccountData(nextDepositOffset, nextDebitOffset, nextLatencyOffset).catch((error) => setToast(error.message));
+        }}
+      />
     )
   }[view];
 
+  const viewTitle = view === "account" ? "Аккаунт" : navItems.find((item) => item.id === view)?.label ?? "";
   const warning = userBalanceWarning(state, currentUser);
 
   return (
@@ -1298,7 +1383,23 @@ export default function App() {
           })}
         </nav>
 
-        <div className="account-card">
+        <div
+          className={classNames("account-card", view === "account" && "active")}
+          role="button"
+          tabIndex={0}
+          onClick={() => {
+            if (window.location.hash.startsWith("#/wall")) {
+              setWallPostId("");
+              window.history.replaceState(null, "", window.location.pathname);
+            }
+            setView("account");
+          }}
+          onKeyDown={(event) => {
+            if (event.key !== "Enter" && event.key !== " ") return;
+            event.preventDefault();
+            setView("account");
+          }}
+        >
           <UserAvatar user={currentUser} />
           <div>
             <strong>{currentUser.name}</strong>
@@ -1308,7 +1409,8 @@ export default function App() {
             className="icon-button"
             type="button"
             title="Выйти"
-            onClick={() => {
+            onClick={(event) => {
+              event.stopPropagation();
               api("/api/auth/logout", { method: "POST", body: JSON.stringify({}) }).catch(() => undefined);
               clearAuth();
               loadAuthUsers().catch((error) => setToast(error.message));
@@ -1328,7 +1430,7 @@ export default function App() {
         <header className="topbar">
           <div>
             <span className="eyebrow">VPN Payment Control</span>
-            <h1>{navItems.find((item) => item.id === view)?.label}</h1>
+            <h1>{viewTitle}</h1>
           </div>
         </header>
 
@@ -1856,7 +1958,8 @@ function WallView({
   const closeWallPostModal = (draft?: WallPostDraft) => {
     setCreating(false);
     setEditingPost(null);
-    const draftFileIds = Array.from(new Set([...(draft?.fileIds ?? []), draft?.previewFileId ?? ""].filter(Boolean)));
+    const ownedFileIds = wallData.files.filter((file) => file.uploadedBy === currentUser.id).map((file) => file.id);
+    const draftFileIds = Array.from(new Set([...(draft?.fileIds ?? []), draft?.previewFileId ?? "", ...ownedFileIds].filter(Boolean)));
     cleanupWallFiles(draftFileIds).catch((error) => setToast(error.message));
   };
 
@@ -2187,9 +2290,11 @@ function WallPostDetail({
       {attachments.length > 0 && (
         <div className="wall-attachments">
           <strong>Файлы</strong>
-          {attachments.map((file) => (
-            <WallAttachment key={file.id} file={file} />
-          ))}
+          <div className="wall-attachment-grid">
+            {attachments.map((file) => (
+              <WallAttachment key={file.id} file={file} compact />
+            ))}
+          </div>
         </div>
       )}
 
@@ -2223,18 +2328,24 @@ function WallPostDetail({
   );
 }
 
-function WallAttachment({ file }: { file: WallFile }) {
+function WallAttachment({ file, compact = false }: { file: WallFile; compact?: boolean }) {
   const isImage = file.mimeType.startsWith("image/");
   if (isImage) {
     return (
-      <a className="wall-image-attachment" href={file.url} target="_blank" rel="noreferrer" title={file.originalName}>
+      <a
+        className={classNames("wall-image-attachment", compact && "compact")}
+        href={file.url}
+        target="_blank"
+        rel="noreferrer"
+        title={file.originalName}
+      >
         <img src={file.url} alt={file.originalName} />
       </a>
     );
   }
 
   return (
-    <a className="wall-file-link" href={file.url} download>
+    <a className={classNames("wall-file-link", compact && "compact")} href={file.url} download>
       <Paperclip size={15} />
       <span>{file.originalName}</span>
       <small>{fileSize(file.size)}</small>
@@ -2746,6 +2857,7 @@ function WallPostModal({
 
   const attachedFiles = files.filter((file) => draft.fileIds.includes(file.id));
   const previewFile = draft.previewFileId ? files.find((file) => file.id === draft.previewFileId) : undefined;
+  const modalFiles = files.filter((file) => draft.fileIds.includes(file.id) || draft.previewFileId === file.id);
   const previewVisible = Boolean(previewFile && !brokenPreviewIds.has(previewFile.id));
 
   const insertText = (value: string, fileId?: string) => {
@@ -2821,7 +2933,7 @@ function WallPostModal({
     }
 
     const draggedFileId = event.dataTransfer.getData("text/plain").replace("wall-file:", "");
-    const file = files.find((item) => item.id === draggedFileId);
+    const file = modalFiles.find((item) => item.id === draggedFileId);
     if (file) insertFileLink(file);
   };
 
@@ -2963,7 +3075,7 @@ function WallPostModal({
               </label>
             </div>
             <div className="wall-file-list">
-              {files.map((file) => {
+              {modalFiles.map((file) => {
                 const attached = draft.fileIds.includes(file.id);
                 const isImage = file.mimeType.startsWith("image/");
                 return (
@@ -3006,7 +3118,7 @@ function WallPostModal({
                   </div>
                 );
               })}
-              {!files.length && <Empty label="Файлов пока нет" />}
+              {!modalFiles.length && <Empty label="Файлы поста пока не загружены" />}
             </div>
           </aside>
         </div>
@@ -3129,7 +3241,8 @@ function ServicesView({
   toggleServiceMaintenance,
   deployingServiceId,
   deployEchoServer,
-  saveService
+  saveService,
+  isAdmin
 }: {
   state: AppState;
   serviceForm: typeof blankService;
@@ -3147,6 +3260,7 @@ function ServicesView({
   deployingServiceId: string;
   deployEchoServer: (serviceId: string) => Promise<AppState>;
   saveService: (service: Service) => Promise<AppState>;
+  isAdmin: boolean;
 }) {
   const [draft, setDraft] = useState<Service | null>(selectedService ?? null);
   const [depositDraft, setDepositDraft] = useState<DepositForm | null>(null);
@@ -3202,14 +3316,16 @@ function ServicesView({
       <div className="panel wide">
         <div className="panel-head">
           <h2>Список сервисов</h2>
-          <button
-            className="primary"
-            type="button"
-            onClick={() => setCreateOpen(true)}
-          >
-            <Plus size={16} />
-            Добавить
-          </button>
+          {isAdmin && (
+            <button
+              className="primary"
+              type="button"
+              onClick={() => setCreateOpen(true)}
+            >
+              <Plus size={16} />
+              Добавить
+            </button>
+          )}
         </div>
         <div className="form-grid service-create service-edit-hidden" aria-hidden="true">
           <label>
@@ -3283,6 +3399,7 @@ function ServicesView({
                 {selectedService.name}
                 {!draft.active && <span className="inline-chip">Архив</span>}
               </h2>
+              {isAdmin && (
               <div className="actions">
                 <button className="ghost" type="button" onClick={() => saveService({ ...draft, active: !draft.active })}>
                   {draft.active ? <Archive size={16} /> : <ArchiveRestore size={16} />}
@@ -3315,6 +3432,7 @@ function ServicesView({
                   Настройки
                 </button>
               </div>
+              )}
             </div>
 
             <div className="stats-grid small">
@@ -3556,6 +3674,7 @@ function ServicesView({
               <h2>Участники</h2>
               <span className="chip">{activeMemberships.length}</span>
             </div>
+            {isAdmin && (
             <div className="add-member">
               <select
                 disabled={!inactiveUsers.length}
@@ -3575,11 +3694,12 @@ function ServicesView({
                 ))}
               </select>
             </div>
+            )}
             <div className="member-list">
               {activeMemberships.map((membership) => {
                 const user = userById(membership.userId);
                 return (
-                  <article key={membership.id} className="member-row">
+                  <article key={membership.id} className={classNames("member-row", !isAdmin && "readonly")}>
                     <div>
                       <strong>{user?.name ?? "Участник"}</strong>
                       <small>
@@ -3590,29 +3710,33 @@ function ServicesView({
                     <span className={classNames("balance", (user?.balance ?? 0) < 0 && "negative")}>
                       {money(user?.balance ?? 0, "RUB")}
                     </span>
-                    <button
-                      className="icon-button"
-                      type="button"
-                      title="Зачислить"
-                      onClick={() => openDeposit(membership)}
-                    >
-                      <Wallet size={15} />
-                    </button>
-                    <button
-                      className="icon-button danger"
-                      type="button"
-                      title="Убрать"
-                      onClick={() => mutate(`/api/services/${selectedService.id}/members/${membership.userId}`, undefined, "DELETE")}
-                    >
-                      <Trash2 size={15} />
-                    </button>
+                    {isAdmin && (
+                      <>
+                        <button
+                          className="icon-button"
+                          type="button"
+                          title="Зачислить"
+                          onClick={() => openDeposit(membership)}
+                        >
+                          <Wallet size={15} />
+                        </button>
+                        <button
+                          className="icon-button danger"
+                          type="button"
+                          title="Убрать"
+                          onClick={() => mutate(`/api/services/${selectedService.id}/members/${membership.userId}`, undefined, "DELETE")}
+                        >
+                          <Trash2 size={15} />
+                        </button>
+                      </>
+                    )}
                   </article>
                 );
               })}
               {!activeMemberships.length && <Empty label="Нет участников" />}
             </div>
           </div>
-          {depositDraft && (
+          {isAdmin && depositDraft && (
             <DepositModal
               state={state}
               depositForm={depositDraft}
@@ -3623,7 +3747,7 @@ function ServicesView({
               onClose={() => setDepositDraft(null)}
             />
           )}
-          {createOpen && (
+          {isAdmin && createOpen && (
             <ServiceCreateModal
               state={state}
               serviceForm={serviceForm}
@@ -3632,7 +3756,7 @@ function ServicesView({
               onClose={() => setCreateOpen(false)}
             />
           )}
-          {editOpen && draft && (
+          {isAdmin && editOpen && draft && (
             <ServiceEditModal
               state={state}
               draft={draft}
@@ -4014,6 +4138,337 @@ function DepositModal({
   );
 }
 
+function AccountView({
+  state,
+  currentUser,
+  pages,
+  mutate,
+  saveUser,
+  serviceById,
+  userById,
+  setToast,
+  onReload,
+  onPageChange
+}: {
+  state: AppState;
+  currentUser: User;
+  pages: AccountPages;
+  mutate: (path: string, body?: unknown, method?: string) => Promise<AppState>;
+  saveUser: (user: User & { adminPassword?: string; currentPassword?: string }) => Promise<AppState>;
+  serviceById: (id: string) => Service | undefined;
+  userById: (id: string) => User | undefined;
+  setToast: (value: string) => void;
+  onReload: () => Promise<AccountPages>;
+  onPageChange: (kind: keyof AccountPages, offset: number) => void;
+}) {
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [depositOpen, setDepositOpen] = useState(false);
+  const userServices = useMemo(() => activeServicesForUser(state, currentUser.id), [currentUser.id, state.memberships, state.services]);
+  const firstService = userServices[0];
+  const [depositDraft, setDepositDraft] = useState<DepositForm>({
+    serviceId: firstService?.id ?? "",
+    userId: currentUser.id,
+    amount: 0,
+    currency: firstService?.currency ?? "RUB",
+    comment: ""
+  });
+
+  useEffect(() => {
+    if (!userServices.length) return;
+    const serviceAllowed = userServices.some((service) => service.id === depositDraft.serviceId);
+    if (!serviceAllowed || depositDraft.userId !== currentUser.id) {
+      setDepositDraft({
+        serviceId: firstService?.id ?? "",
+        userId: currentUser.id,
+        amount: depositDraft.amount,
+        currency: firstService?.currency ?? "RUB",
+        comment: depositDraft.comment
+      });
+    }
+  }, [currentUser.id, depositDraft.amount, depositDraft.comment, depositDraft.serviceId, depositDraft.userId, firstService?.id, firstService?.currency, userServices]);
+
+  const moneyTimeline = useMemo(() => {
+    const buckets = new Map<string, { date: string; deposits: number; debits: number; ts: number }>();
+    const ensure = (iso: string) => {
+      const date = shortDate(iso);
+      const ts = new Date(iso).setHours(0, 0, 0, 0);
+      const current = buckets.get(date) ?? { date, deposits: 0, debits: 0, ts };
+      buckets.set(date, current);
+      return current;
+    };
+    for (const deposit of pages.deposits.rows.filter((item) => !item.cancelledAt && !item.reversesId)) {
+      ensure(deposit.createdAt).deposits += deposit.amountBalanceCurrency ?? deposit.amountServiceCurrency;
+    }
+    for (const debit of pages.debits.rows.filter((item) => !item.cancelledAt && !item.reversesId)) {
+      ensure(debit.createdAt).debits += debit.amountBalanceCurrency ?? debit.amount;
+    }
+    return Array.from(buckets.values())
+      .sort((a, b) => a.ts - b.ts)
+      .slice(-14);
+  }, [pages.debits.rows, pages.deposits.rows]);
+
+  const latencyChart = useMemo(() => {
+    const series: Array<{ key: string; name: string; color: string; serviceId: string }> = [];
+    const byService = new Map<string, { key: string; name: string; color: string; serviceId: string }>();
+    const points = new Map<string, Record<string, string | number>>();
+
+    for (const check of pages.latency.rows.filter((item) => item.latencyMs !== null).slice().reverse()) {
+      const service = serviceById(check.serviceId);
+      let item = byService.get(check.serviceId);
+      if (!item && series.length < latencyLineColors.length) {
+        item = {
+          key: `latency_${series.length}`,
+          name: service?.name ?? "Сервис",
+          color: latencyLineColors[series.length],
+          serviceId: check.serviceId
+        };
+        byService.set(check.serviceId, item);
+        series.push(item);
+      }
+      if (!item) continue;
+      const date = new Date(check.checkedAt);
+      date.setSeconds(0, 0);
+      const bucketId = date.toISOString();
+      const point = points.get(bucketId) ?? {
+        time: new Intl.DateTimeFormat("ru-RU", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" }).format(date)
+      };
+      point[item.key] = check.latencyMs ?? 0;
+      points.set(bucketId, point);
+    }
+
+    return {
+      series,
+      points: Array.from(points.entries())
+        .sort(([a], [b]) => new Date(a).getTime() - new Date(b).getTime())
+        .map(([, point]) => point)
+    };
+  }, [pages.latency.rows, serviceById]);
+
+  return (
+    <section className="page-grid account-page">
+      <div className="panel wide account-hero">
+        <UserAvatar user={currentUser} size="large" />
+        <div className="account-hero-main">
+          <span className="eyebrow">Профиль</span>
+          <h2>{currentUser.name}</h2>
+          <p>{currentUser.telegramUsername ? `@${currentUser.telegramUsername}` : currentUser.telegramId || "Telegram не задан"}</p>
+        </div>
+        <div className="account-hero-actions">
+          <strong>{money(currentUser.balance, "RUB")}</strong>
+          <div className="actions">
+            <button className="ghost" type="button" onClick={() => setSettingsOpen(true)}>
+              <Settings2 size={16} />
+              Аккаунт
+            </button>
+            <button className="primary" type="button" disabled={!userServices.length} onClick={() => setDepositOpen(true)}>
+              <Wallet size={16} />
+              Внести оплату
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <div className="stats-grid wide">
+        <Stat icon={Shield} label="Сервисов" value={String(userServices.length)} />
+        <Stat icon={Coins} label="Баланс" value={money(currentUser.balance, "RUB")} tone={currentUser.balance < 0 ? "bad" : "good"} />
+        <Stat icon={CircleDollarSign} label="Пополнений" value={String(pages.deposits.total)} />
+        <Stat icon={Activity} label="Замеров" value={String(pages.latency.total)} />
+      </div>
+
+      <div className="panel chart-panel wide">
+        <div className="panel-head">
+          <h2>Мои операции</h2>
+          <span className="chip">14 дней</span>
+        </div>
+        <div className="chart-wrap">
+          {moneyTimeline.length ? (
+            <ResponsiveContainer width="100%" height="100%">
+              <AreaChart data={moneyTimeline}>
+                <defs>
+                  <linearGradient id="accountDeposits" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="5%" stopColor="#47d18c" stopOpacity={0.6} />
+                    <stop offset="95%" stopColor="#47d18c" stopOpacity={0} />
+                  </linearGradient>
+                  <linearGradient id="accountDebits" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="5%" stopColor="#ff6f61" stopOpacity={0.45} />
+                    <stop offset="95%" stopColor="#ff6f61" stopOpacity={0} />
+                  </linearGradient>
+                </defs>
+                <CartesianGrid stroke="rgba(255,255,255,.06)" vertical={false} />
+                <XAxis dataKey="date" axisLine={false} tickLine={false} tick={{ fill: "#8a8f98", fontSize: 12 }} />
+                <YAxis axisLine={false} tickLine={false} tick={{ fill: "#8a8f98", fontSize: 12 }} />
+                <Tooltip contentStyle={{ background: "#111318", border: "1px solid #272a33", borderRadius: 8 }} />
+                <Area type="monotone" dataKey="deposits" stroke="#47d18c" fill="url(#accountDeposits)" name="Пополнения" />
+                <Area type="monotone" dataKey="debits" stroke="#ff6f61" fill="url(#accountDebits)" name="Списания" />
+              </AreaChart>
+            </ResponsiveContainer>
+          ) : (
+            <Empty label="Операций пока нет" />
+          )}
+        </div>
+      </div>
+
+      <div className="panel chart-panel wide">
+        <div className="panel-head">
+          <h2>Моя задержка до сервисов</h2>
+          <span className="chip">{latencyChart.series.length}</span>
+        </div>
+        <div className="chart-wrap latency-history">
+          {latencyChart.points.length && latencyChart.series.length ? (
+            <ResponsiveContainer width="100%" height="100%">
+              <LineChart data={latencyChart.points}>
+                <CartesianGrid stroke="rgba(255,255,255,.06)" vertical={false} />
+                <XAxis dataKey="time" axisLine={false} tickLine={false} tick={{ fill: "#8a8f98", fontSize: 12 }} />
+                <YAxis axisLine={false} tickLine={false} tick={{ fill: "#8a8f98", fontSize: 12 }} />
+                <Tooltip contentStyle={{ background: "#111318", border: "1px solid #272a33", borderRadius: 8 }} />
+                <Legend wrapperStyle={{ color: "#c6cad2", fontSize: 12 }} />
+                {latencyChart.series.map((series) => (
+                  <Line
+                    key={series.key}
+                    type="monotone"
+                    dataKey={series.key}
+                    name={series.name}
+                    stroke={series.color}
+                    strokeWidth={2}
+                    dot={false}
+                    connectNulls
+                  />
+                ))}
+              </LineChart>
+            </ResponsiveContainer>
+          ) : (
+            <Empty label="Замеров задержки пока нет" />
+          )}
+        </div>
+      </div>
+
+      <HistoryTable
+        title="Мои пополнения"
+        page={pages.deposits}
+        onPageChange={(offset) => onPageChange("deposits", offset)}
+        columns={["Дата", "Сервис", "Исходно", "В баланс", "Источник", "Баланс"]}
+        render={(deposit) => [
+          dateTime(deposit.createdAt),
+          serviceById(deposit.serviceId)?.name ?? "Сервис",
+          money(deposit.amountOriginal, deposit.currencyOriginal),
+          money(deposit.amountBalanceCurrency ?? deposit.amountServiceCurrency, deposit.balanceCurrency ?? "RUB"),
+          <OperationCell source={deposit.source} cancelledAt={deposit.cancelledAt} reversesId={deposit.reversesId} />,
+          money(deposit.balanceAfter, deposit.balanceCurrency ?? "RUB")
+        ]}
+      />
+
+      <HistoryTable
+        title="Мои списания"
+        page={pages.debits}
+        onPageChange={(offset) => onPageChange("debits", offset)}
+        columns={["Дата", "Сервис", "Сумма", "С баланса", "Источник", "Баланс"]}
+        render={(debit) => [
+          dateTime(debit.createdAt),
+          serviceById(debit.serviceId)?.name ?? "Сервис",
+          money(debit.amount, debit.currency),
+          money(debit.amountBalanceCurrency ?? debit.amount, debit.balanceCurrency ?? "RUB"),
+          <OperationCell source={debit.source} cancelledAt={debit.cancelledAt} reversesId={debit.reversesId} />,
+          money(debit.balanceAfter, debit.balanceCurrency ?? "RUB")
+        ]}
+      />
+
+      <HistoryTable
+        title="Мои замеры задержки"
+        page={pages.latency}
+        onPageChange={(offset) => onPageChange("latency", offset)}
+        columns={["Дата", "Сервис", "Статус", "Задержка", "Ошибка"]}
+        render={(check) => [
+          dateTime(check.checkedAt),
+          serviceById(check.serviceId)?.name ?? "Сервис",
+          healthLabels[check.status],
+          check.latencyMs === null ? "нет данных" : `${check.latencyMs} мс`,
+          check.error || "нет"
+        ]}
+      />
+
+      {settingsOpen && (
+        <AccountSettingsModal
+          currentUser={currentUser}
+          onClose={() => setSettingsOpen(false)}
+          onSave={(avatarUrl, currentPassword, password) =>
+            saveUser({ ...currentUser, avatarUrl, currentPassword, password }).then((nextState) => {
+              setSettingsOpen(false);
+              setToast("Аккаунт сохранён");
+              return nextState;
+            })
+          }
+        />
+      )}
+
+      {depositOpen && (
+        <DepositModal
+          state={state}
+          depositForm={depositDraft}
+          setDepositForm={setDepositDraft}
+          mutate={mutate}
+          serviceById={serviceById}
+          userById={userById}
+          targetMode="service"
+          serviceOptions={userServices}
+          onSaved={onReload}
+          onClose={() => setDepositOpen(false)}
+        />
+      )}
+    </section>
+  );
+}
+
+function AccountSettingsModal({
+  currentUser,
+  onClose,
+  onSave
+}: {
+  currentUser: User;
+  onClose: () => void;
+  onSave: (avatarUrl: string, currentPassword: string, password: string) => Promise<AppState>;
+}) {
+  const [avatarUrl, setAvatarUrl] = useState(currentUser.avatarUrl ?? "");
+  const [currentPassword, setCurrentPassword] = useState("");
+  const [password, setPassword] = useState("");
+
+  return (
+    <ModalShell
+      title="Аккаунт"
+      subtitle={currentUser.name}
+      onClose={onClose}
+      footer={
+        <>
+          <button className="ghost" type="button" onClick={onClose}>
+            Отмена
+          </button>
+          <button className="primary" type="button" onClick={() => onSave(avatarUrl, currentPassword, password)}>
+            <Check size={16} />
+            Сохранить
+          </button>
+        </>
+      }
+    >
+      <div className="form-grid modal-form account-settings-form">
+        <div className="account-avatar-preview">
+          <UserAvatar user={{ name: currentUser.name, avatarUrl }} size="large" />
+        </div>
+        <label className="wide-field">
+          Ссылка на аватар
+          <input autoFocus value={avatarUrl} onChange={(event) => setAvatarUrl(event.target.value)} />
+        </label>
+        <label>
+          Текущий пароль
+          <input type="password" value={currentPassword} onChange={(event) => setCurrentPassword(event.target.value)} />
+        </label>
+        <label>
+          Новый пароль
+          <input type="password" value={password} onChange={(event) => setPassword(event.target.value)} />
+        </label>
+      </div>
+    </ModalShell>
+  );
+}
+
 function PeopleView({
   state,
   userForm,
@@ -4030,7 +4485,7 @@ function PeopleView({
   userById: (id: string) => User | undefined;
   serviceById: (id: string) => Service | undefined;
   mutate: (path: string, body?: unknown, method?: string) => Promise<AppState>;
-  saveUser: (user: User & { adminPassword?: string }) => Promise<AppState>;
+  saveUser: (user: User & { adminPassword?: string; currentPassword?: string }) => Promise<AppState>;
   isAdmin: boolean;
 }) {
   const [createOpen, setCreateOpen] = useState(false);
@@ -4446,7 +4901,7 @@ function UserCard({
   user: User;
   state: AppState;
   serviceById: (id: string) => Service | undefined;
-  onSave: (user: User) => Promise<AppState>;
+  onSave: (user: User & { adminPassword?: string; currentPassword?: string }) => Promise<AppState>;
   canEditPassword: boolean;
   onDelete: () => Promise<AppState>;
 }) {
@@ -4531,7 +4986,7 @@ function UserEditModal({
   setDraft: (value: any) => void;
   wasAdmin: boolean;
   canEditPassword: boolean;
-  onSave: (user: (User | typeof blankUser) & { adminPassword?: string }) => Promise<AppState>;
+  onSave: (user: (User | typeof blankUser) & { adminPassword?: string; currentPassword?: string }) => Promise<AppState>;
   onClose: () => void;
 }) {
   const [adminPassword, setAdminPassword] = useState("");
@@ -4815,7 +5270,7 @@ function OperationCell({
   source: string;
   cancelledAt?: string | null;
   reversesId?: string | null;
-  children: ReactNode;
+  children?: ReactNode;
 }) {
   return (
     <div className="operation-cell">

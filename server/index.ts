@@ -244,6 +244,12 @@ function authUserFromRequest(req: Request) {
   return (req as Request & { authUser?: User }).authUser;
 }
 
+function requireAdmin(req: Request) {
+  const actor = authUserFromRequest(req);
+  if (!actor?.botAdmin) throw new Error("Требуются права администратора");
+  return actor;
+}
+
 function authMiddleware(req: Request, res: Response, next: NextFunction) {
   if (req.path.startsWith("/auth/")) return next();
   if (req.method === "GET" && /^\/wall\/files\/[^/]+\/download$/.test(req.path)) return next();
@@ -675,17 +681,33 @@ function validateAdminPassword(data: AppData, password: unknown) {
   }
 }
 
-function applyUserInput(data: AppData, user: User, body: Partial<User> & { adminPassword?: string }, actor?: User) {
-  const nextBotAdmin = Boolean(body.botAdmin);
+function applyUserInput(
+  data: AppData,
+  user: User,
+  body: Partial<User> & { adminPassword?: string; currentPassword?: string },
+  actor?: User
+) {
+  const isAdmin = Boolean(actor?.botAdmin);
+  const isSelf = actor?.id === user.id;
+  if (!isAdmin && !isSelf) throw new Error("Нет прав на изменение участника");
+
+  const nextBotAdmin = body.botAdmin === undefined ? user.botAdmin : Boolean(body.botAdmin);
   if (nextBotAdmin && !user.botAdmin) {
     validateAdminPassword(data, body.adminPassword);
   }
 
   const passwordInput = typeof body.password === "string" ? body.password.trim() : "";
   if (passwordInput) {
-    if (!actor?.botAdmin) throw new Error("Только администратор может менять пароль участника");
+    if (!isAdmin && user.password && String(body.currentPassword ?? "") !== user.password) {
+      throw new Error("Неверный текущий пароль");
+    }
     user.password = passwordInput;
     user.passwordSet = true;
+  }
+
+  if (!isAdmin) {
+    user.avatarUrl = String(body.avatarUrl ?? user.avatarUrl ?? "");
+    return;
   }
 
   user.name = String(body.name ?? user.name).trim() || user.name;
@@ -693,7 +715,8 @@ function applyUserInput(data: AppData, user: User, body: Partial<User> & { admin
   user.telegramId = String(body.telegramId ?? user.telegramId).trim();
   user.telegramUsername = String(body.telegramUsername ?? user.telegramUsername).trim().replace(/^@/, "");
   user.avatarUrl = String(body.avatarUrl ?? user.avatarUrl ?? "");
-  user.commandDepositsBlocked = Boolean(body.commandDepositsBlocked);
+  user.commandDepositsBlocked =
+    body.commandDepositsBlocked === undefined ? user.commandDepositsBlocked : Boolean(body.commandDepositsBlocked);
   user.botAdmin = nextBotAdmin;
   user.notes = String(body.notes ?? user.notes);
 }
@@ -924,7 +947,11 @@ app.get("/api/notifications", (req, res) => {
 app.get("/api/latency-checks", (req, res) => {
   try {
     const { offset, limit } = readPage(req.query as Record<string, unknown>, 20, 100);
-    res.json(ok(pageResult(store.read().latencyChecks, offset, limit)));
+    const actor = authUserFromRequest(req);
+    const requestedUserId = String(req.query.userId ?? "");
+    const userId = actor?.botAdmin ? requestedUserId : actor?.id ?? "";
+    const rows = userId ? store.read().latencyChecks.filter((check) => check.userId === userId) : store.read().latencyChecks;
+    res.json(ok(pageResult(rows, offset, limit)));
   } catch (error) {
     res.status(400).json(fail(error));
   }
@@ -1061,7 +1088,7 @@ app.delete("/api/wall/posts/:postId/comments/:commentId", (req, res) => {
 app.post("/api/wall/posts", (req, res) => {
   try {
     store.write((data) => {
-      const actor = getActor(data, req.body.authorId);
+      const actor = getRequestActor(req, data, req.body.authorId);
       const createdAt = nowIso();
       const input = normalizeWallPostInput(data, req.body);
       data.wallPosts.unshift({
@@ -1085,7 +1112,7 @@ app.put("/api/wall/posts/:id", (req, res) => {
     store.write((data) => {
       const post = data.wallPosts.find((item) => item.id === req.params.id);
       if (!post) throw new Error("Пост не найден");
-      const actor = getActor(data, req.body.authorId);
+      const actor = getRequestActor(req, data, req.body.authorId);
       if (!canManageWallPost(actor, post)) throw new Error("Нет прав на изменение поста");
       const previousFileIds = wallPostFileIds(data, post);
       Object.assign(post, normalizeWallPostInput(data, req.body, post), { updatedAt: nowIso() });
@@ -1103,7 +1130,7 @@ app.delete("/api/wall/posts/:id", (req, res) => {
     store.write((data) => {
       const post = data.wallPosts.find((item) => item.id === req.params.id);
       if (!post) throw new Error("Пост не найден");
-      const actor = getActor(data, req.query.userId);
+      const actor = getRequestActor(req, data, req.query.userId);
       if (!canManageWallPost(actor, post)) throw new Error("Нет прав на удаление поста");
       const previousFileIds = wallPostFileIds(data, post);
       data.wallPosts = data.wallPosts.filter((item) => item.id !== post.id);
@@ -1177,7 +1204,8 @@ app.delete("/api/wall/tags/:id", (req, res) => {
 
 app.post("/api/wall/files", async (req, res) => {
   const data = store.read();
-  const actor = data.users.find((item) => item.id === String(req.header("x-author-id") ?? req.query.authorId ?? ""));
+  const actor =
+    authUserFromRequest(req) ?? data.users.find((item) => item.id === String(req.header("x-author-id") ?? req.query.authorId ?? ""));
   if (!actor) {
     res.status(400).json(fail(new Error("Пользователь не найден")));
     return;
@@ -1242,7 +1270,7 @@ app.post("/api/wall/files", async (req, res) => {
 app.post("/api/wall/files/cleanup", (req, res) => {
   try {
     store.write((data) => {
-      getActor(data, req.query.userId ?? req.body?.userId);
+      getRequestActor(req, data, req.query.userId ?? req.body?.userId);
       cleanupUnusedWallFiles(data, normalizeStringList(req.body?.fileIds));
     });
     res.json(ok(wallListData(store.read(), req.query as Record<string, unknown>)));
@@ -1282,7 +1310,7 @@ app.delete("/api/wall/files/:id", (req, res) => {
     store.write((data) => {
       const file = data.wallFiles.find((item) => item.id === req.params.id);
       if (!file) throw new Error("Файл не найден");
-      const actor = getActor(data, req.query.userId);
+      const actor = getRequestActor(req, data, req.query.userId);
       if (!actor.botAdmin && file.uploadedBy !== actor.id) throw new Error("Нет прав на удаление файла");
 
       storageName = file.storageName;
@@ -1303,15 +1331,21 @@ app.delete("/api/wall/files/:id", (req, res) => {
   }
 });
 
-app.get("/api/database/export", (_req, res) => {
-  const payload = JSON.stringify(store.exportData(), null, 2);
-  res.setHeader("Content-Type", "application/json; charset=utf-8");
-  res.setHeader("Content-Disposition", `attachment; filename="${backupFileName()}"`);
-  res.send(payload);
+app.get("/api/database/export", (req, res) => {
+  try {
+    requireAdmin(req);
+    const payload = JSON.stringify(store.exportData(), null, 2);
+    res.setHeader("Content-Type", "application/json; charset=utf-8");
+    res.setHeader("Content-Disposition", `attachment; filename="${backupFileName()}"`);
+    res.send(payload);
+  } catch (error) {
+    res.status(403).json(fail(error));
+  }
 });
 
 app.post("/api/database/import", (req, res) => {
   try {
+    requireAdmin(req);
     store.replace(req.body);
     res.json(ok(apiState()));
   } catch (error) {
@@ -1319,8 +1353,9 @@ app.post("/api/database/import", (req, res) => {
   }
 });
 
-app.post("/api/system/update", async (_req, res) => {
+app.post("/api/system/update", async (req, res) => {
   try {
+    requireAdmin(req);
     const steps = process.platform === "win32" ? await runLocalGitUpdate() : [await runRawUbuntuUpdate()];
 
     const restart = scheduleServiceRestart();
@@ -1353,6 +1388,7 @@ app.post("/api/system/update", async (_req, res) => {
 
 app.post("/api/users", async (req, res) => {
   try {
+    const actor = requireAdmin(req);
     const body = req.body as Partial<User> & { adminPassword?: string };
     const user: User = {
       id: id("usr"),
@@ -1370,7 +1406,7 @@ app.post("/api/users", async (req, res) => {
     };
 
     const data = store.read();
-    applyUserInput(data, user, body, authUserFromRequest(req));
+    applyUserInput(data, user, body, actor);
     user.avatarUrl = await tryFetchTelegramAvatar(data, user);
     data.users.push(user);
     store.persist();
@@ -1387,8 +1423,9 @@ app.put("/api/users/:id", async (req, res) => {
     const user = data.users.find((item) => item.id === req.params.id);
     if (!user) throw new Error("Пользователь не найден");
 
-    applyUserInput(data, user, req.body, authUserFromRequest(req));
-    user.avatarUrl = await tryFetchTelegramAvatar(data, user);
+    const actor = authUserFromRequest(req);
+    applyUserInput(data, user, req.body, actor);
+    if (actor?.botAdmin) user.avatarUrl = await tryFetchTelegramAvatar(data, user);
     store.persist();
 
     res.json(ok(apiState()));
@@ -1399,6 +1436,7 @@ app.put("/api/users/:id", async (req, res) => {
 
 app.delete("/api/users/:id", (req, res) => {
   try {
+    requireAdmin(req);
     store.write((data) => {
       data.users = data.users.filter((item) => item.id !== req.params.id);
       data.memberships = data.memberships.filter((item) => item.userId !== req.params.id);
@@ -1414,6 +1452,7 @@ app.delete("/api/users/:id", (req, res) => {
 
 app.post("/api/services", (req, res) => {
   try {
+    requireAdmin(req);
     const period = String(req.body.period ?? "month") as BillingPeriod;
     const interval = Math.max(1, normalizeNumber(req.body.interval, 1));
     const anchorDay = Math.max(1, Math.min(31, normalizeNumber(req.body.anchorDay, 1)));
@@ -1455,6 +1494,7 @@ app.post("/api/services", (req, res) => {
 
 app.put("/api/services/:id", (req, res) => {
   try {
+    requireAdmin(req);
     store.write((data) => {
       const service = data.services.find((item) => item.id === req.params.id);
       if (!service) throw new Error("Сервис не найден");
@@ -1539,6 +1579,7 @@ app.post("/api/services/:id/health", async (req, res) => {
 
 app.post("/api/services/:id/maintenance", async (req, res) => {
   try {
+    requireAdmin(req);
     const data = store.read();
     const service = data.services.find((item) => item.id === req.params.id);
     if (!service) throw new Error("Сервис не найден");
@@ -1573,6 +1614,7 @@ app.post("/api/services/:id/deploy-echo", async (req, res) => {
   let deployOutput = "";
 
   try {
+    requireAdmin(req);
     const service = store.read().services.find((item) => item.id === req.params.id);
     if (!service) throw new Error("Сервис не найден");
 
@@ -1611,6 +1653,7 @@ app.post("/api/services/:id/deploy-echo", async (req, res) => {
 
 app.delete("/api/services/:id", (req, res) => {
   try {
+    requireAdmin(req);
     store.write((data) => {
       data.services = data.services.filter((item) => item.id !== req.params.id);
       data.memberships = data.memberships.filter((item) => item.serviceId !== req.params.id);
@@ -1625,6 +1668,7 @@ app.delete("/api/services/:id", (req, res) => {
 
 app.post("/api/services/:id/members", (req, res) => {
   try {
+    requireAdmin(req);
     store.write((data) => {
       const service = data.services.find((item) => item.id === req.params.id);
       const user = data.users.find((item) => item.id === req.body.userId);
@@ -1641,6 +1685,7 @@ app.post("/api/services/:id/members", (req, res) => {
 
 app.delete("/api/services/:serviceId/members/:userId", (req, res) => {
   try {
+    requireAdmin(req);
     store.write((data) => {
       const membership = data.memberships.find(
         (item) => item.serviceId === req.params.serviceId && item.userId === req.params.userId
@@ -1666,6 +1711,7 @@ app.delete("/api/services/:serviceId/members/:userId", (req, res) => {
 
 app.post("/api/auto-deposits", (req, res) => {
   try {
+    requireAdmin(req);
     store.write((data) => {
       const input = normalizeAutoDepositInput(data, req.body);
       const createdAt = nowIso();
@@ -1688,6 +1734,7 @@ app.post("/api/auto-deposits", (req, res) => {
 
 app.put("/api/auto-deposits/:id", (req, res) => {
   try {
+    requireAdmin(req);
     store.write((data) => {
       const schedule = data.autoDeposits.find((item) => item.id === req.params.id);
       if (!schedule) throw new Error("Автоплатеж не найден");
@@ -1707,6 +1754,7 @@ app.put("/api/auto-deposits/:id", (req, res) => {
 
 app.delete("/api/auto-deposits/:id", (req, res) => {
   try {
+    requireAdmin(req);
     store.write((data) => {
       data.autoDeposits = data.autoDeposits.filter((item) => item.id !== req.params.id);
     });
@@ -1719,6 +1767,7 @@ app.delete("/api/auto-deposits/:id", (req, res) => {
 
 app.post("/api/auto-deposits/:id/run", (req, res) => {
   try {
+    requireAdmin(req);
     store.write((data) => {
       const deposit = runAutoDepositSchedule(data, req.params.id, { advance: false });
       if (!deposit) throw new Error("Автоплатеж отключён");
@@ -1733,7 +1782,9 @@ app.post("/api/auto-deposits/:id/run", (req, res) => {
 app.get("/api/deposits", (req, res) => {
   try {
     const { offset, limit } = readPage(req.query as Record<string, unknown>, 20, 100);
-    const userId = String(req.query.userId ?? "");
+    const actor = authUserFromRequest(req);
+    const requestedUserId = String(req.query.userId ?? "");
+    const userId = actor?.botAdmin ? requestedUserId : actor?.id ?? "";
     const rows = userId ? store.read().deposits.filter((deposit) => deposit.userId === userId) : store.read().deposits;
     res.json(ok(pageResult(rows, offset, limit)));
   } catch (error) {
@@ -1743,10 +1794,16 @@ app.get("/api/deposits", (req, res) => {
 
 app.post("/api/deposits", (req, res) => {
   try {
+    const actor = authUserFromRequest(req);
     store.write((data) => {
+      const targetUserId = actor?.botAdmin ? String(req.body.userId) : actor?.id ?? "";
+      if (!targetUserId) throw new Error("Пользователь не найден");
+      if (!actor?.botAdmin && String(req.body.userId ?? targetUserId) !== actor?.id) {
+        throw new Error("Можно зачислять средства только себе");
+      }
       addDeposit(data, {
         serviceId: String(req.body.serviceId),
-        userId: String(req.body.userId),
+        userId: targetUserId,
         amount: normalizeNumber(req.body.amount, 0),
         currency: String(req.body.currency),
         comment: String(req.body.comment ?? ""),
@@ -1762,6 +1819,7 @@ app.post("/api/deposits", (req, res) => {
 
 app.post("/api/deposits/:id/cancel", (req, res) => {
   try {
+    requireAdmin(req);
     store.write((data) => {
       cancelDeposit(data, req.params.id, String(req.body.reason ?? ""));
     });
@@ -1775,7 +1833,9 @@ app.post("/api/deposits/:id/cancel", (req, res) => {
 app.get("/api/debits", (req, res) => {
   try {
     const { offset, limit } = readPage(req.query as Record<string, unknown>, 20, 100);
-    const userId = String(req.query.userId ?? "");
+    const actor = authUserFromRequest(req);
+    const requestedUserId = String(req.query.userId ?? "");
+    const userId = actor?.botAdmin ? requestedUserId : actor?.id ?? "";
     const rows = userId ? store.read().debits.filter((debit) => debit.userId === userId) : store.read().debits;
     res.json(ok(pageResult(rows, offset, limit)));
   } catch (error) {
@@ -1785,6 +1845,7 @@ app.get("/api/debits", (req, res) => {
 
 app.post("/api/debits/manual", async (req, res) => {
   try {
+    requireAdmin(req);
     const serviceId = String(req.body.serviceId);
     store.write((data) => {
       runDebitForService(data, serviceId, "manual");
@@ -1806,6 +1867,7 @@ app.post("/api/debits/manual", async (req, res) => {
 
 app.post("/api/debits/:id/cancel", (req, res) => {
   try {
+    requireAdmin(req);
     store.write((data) => {
       cancelDebit(data, req.params.id, String(req.body.reason ?? ""));
     });
@@ -1818,6 +1880,7 @@ app.post("/api/debits/:id/cancel", (req, res) => {
 
 app.post("/api/currencies", (req, res) => {
   try {
+    requireAdmin(req);
     const currency: Currency = {
       code: String(req.body.code ?? "").trim().toUpperCase(),
       name: String(req.body.name ?? "").trim(),
@@ -1841,6 +1904,7 @@ app.post("/api/currencies", (req, res) => {
 
 app.put("/api/currencies/:code", (req, res) => {
   try {
+    requireAdmin(req);
     store.write((data) => {
       const currency = data.currencies.find((item) => item.code === req.params.code.toUpperCase());
       if (!currency) throw new Error("Валюта не найдена");
@@ -1858,6 +1922,7 @@ app.put("/api/currencies/:code", (req, res) => {
 
 app.put("/api/settings/telegram", (req, res) => {
   try {
+    requireAdmin(req);
     store.write((data) => {
       data.settings.telegram.enabled = Boolean(req.body.enabled);
       data.settings.telegram.botToken = String(req.body.botToken ?? "");
@@ -1880,6 +1945,7 @@ app.put("/api/settings/telegram", (req, res) => {
 
 app.put("/api/settings/security", (req, res) => {
   try {
+    requireAdmin(req);
     store.write((data) => {
       validateAdminPassword(data, req.body.currentPassword);
       const nextPassword = String(req.body.newPassword ?? "").trim();
@@ -1894,8 +1960,9 @@ app.put("/api/settings/security", (req, res) => {
   }
 });
 
-app.post("/api/telegram/polling/start", async (_req, res) => {
+app.post("/api/telegram/polling/start", async (req, res) => {
   try {
+    requireAdmin(req);
     const data = store.read();
     await enableTelegramPolling(data);
     store.persist();
@@ -1907,6 +1974,7 @@ app.post("/api/telegram/polling/start", async (_req, res) => {
 
 app.post("/api/telegram/polling/stop", (_req, res) => {
   try {
+    requireAdmin(_req);
     store.write((data) => {
       disableTelegramPolling(data);
     });
@@ -1918,6 +1986,7 @@ app.post("/api/telegram/polling/stop", (_req, res) => {
 
 app.post("/api/telegram/configure", async (req, res) => {
   try {
+    requireAdmin(req);
     const data = store.read();
     await configureTelegramIntegration(data, String(req.body.webhookUrl ?? ""));
     store.persist();
@@ -1929,6 +1998,7 @@ app.post("/api/telegram/configure", async (req, res) => {
 
 app.post("/api/telegram/test", async (req, res) => {
   try {
+    requireAdmin(req);
     const data = store.read();
     const chatId = String(req.body.chatId ?? data.settings.telegram.chatId ?? "");
     const sent = await sendTelegramMessage(data, "Проверка связи VPN Pay. Команды доступны в меню.", chatId, {
