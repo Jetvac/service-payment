@@ -8,6 +8,7 @@ import { promisify } from "node:util";
 import { Client } from "ssh2";
 import { WebSocketServer } from "ws";
 import { Store } from "./store";
+import { latencyAggregator } from "./latencyAggregator";
 import type {
   AppData,
   AutoDeposit,
@@ -59,6 +60,7 @@ const realtime = new WebSocketServer({ server, path: "/api/realtime" });
 const port = Number(process.env.PORT ?? 4077);
 const store = new Store();
 const execFileAsync = promisify(execFile);
+latencyAggregator.start();
 const latencyLineColors = ["#7aa8ff", "#47d18c", "#f8c15d", "#ff8b82", "#b994ff", "#5ed4d6", "#f49ac2", "#c6cad2"];
 const wallFilesDir = path.resolve(process.cwd(), "data", "wall-files");
 const maxWallFileSize = 2 * 1024 * 1024 * 1024;
@@ -1022,9 +1024,19 @@ app.get("/api/state", (_req, res) => {
   res.json(ok(apiState()));
 });
 
-app.get("/api/dashboard", (req, res) => {
+app.get("/api/dashboard", async (req, res) => {
   try {
-    res.json(ok(dashboardData(store.read(), req.query as Record<string, unknown>)));
+    const data = store.read();
+    const payload = dashboardData(data, req.query as Record<string, unknown>);
+    if (latencyAggregator.enabled) {
+      const chart = await latencyAggregator.queryChart(data, {
+        from: req.query.latencyFrom,
+        to: req.query.latencyTo
+      });
+      payload.latencyTimeline = chart.latencyTimeline;
+      payload.latencySeries = chart.latencySeries;
+    }
+    res.json(ok(payload));
   } catch (error) {
     res.status(400).json(fail(error));
   }
@@ -1039,9 +1051,14 @@ app.get("/api/notifications", (req, res) => {
   }
 });
 
-app.get("/api/latency-checks", (req, res) => {
+app.get("/api/latency-checks", async (req, res) => {
   try {
     const { offset, limit } = readPage(req.query as Record<string, unknown>, 20, 100);
+    if (latencyAggregator.enabled) {
+      res.json(ok(await latencyAggregator.queryMinuteRows(offset, limit)));
+      return;
+    }
+
     const actor = authUserFromRequest(req);
     const requestedUserId = String(req.query.userId ?? "");
     const userId = actor?.botAdmin ? requestedUserId : actor?.id ?? "";
@@ -1052,12 +1069,80 @@ app.get("/api/latency-checks", (req, res) => {
   }
 });
 
-app.get("/api/latency-chart", (req, res) => {
+app.get("/api/latency-chart", async (req, res) => {
   try {
+    if (latencyAggregator.enabled) {
+      res.json(ok(await latencyAggregator.queryChart(store.read(), req.query as Record<string, unknown>)));
+      return;
+    }
+
     const actor = authUserFromRequest(req);
     const requestedUserId = String(req.query.userId ?? "");
     const userId = actor?.botAdmin ? requestedUserId : actor?.id ?? "";
     res.json(ok(latencyChartData(store.read(), { ...req.query, userId })));
+  } catch (error) {
+    res.status(400).json(fail(error));
+  }
+});
+
+app.post("/api/latency/measurements", async (req, res) => {
+  try {
+    const measurements = Array.isArray(req.body) ? req.body : [req.body];
+    if (measurements.length === 0) throw new Error("Нет замеров для обработки");
+    if (measurements.length > 500) throw new Error("За один запрос можно передать не более 500 замеров");
+
+    const data = store.read();
+    const fallbackChecks: LatencyCheck[] = [];
+
+    for (const measurement of measurements) {
+      const service = data.services.find((item) => item.id === String(measurement.serviceId ?? ""));
+      if (!service) throw new Error("Сервис не найден");
+
+      service.connection = { ...defaultServiceConnection(), ...(service.connection ?? {}) };
+      const status = normalizeHealthStatus(measurement.status);
+      const checkedAt = String(measurement.checkedAt ?? nowIso());
+      const latencyMs =
+        typeof measurement.latencyMs === "number" && Number.isFinite(measurement.latencyMs)
+          ? Math.max(0, Number(measurement.latencyMs))
+          : null;
+      const error = String(measurement.error ?? "").slice(0, 240);
+
+      await latencyAggregator.record({
+        serviceId: service.id,
+        latencyMs,
+        status,
+        error,
+        checkedAt
+      });
+
+      if (!latencyAggregator.enabled) {
+        fallbackChecks.push({
+          id: id("lat"),
+          serviceId: service.id,
+          userId: null,
+          status,
+          latencyMs,
+          checkedAt,
+          error,
+          createdAt: nowIso()
+        });
+      }
+
+      if (service.connection.lastStatus !== "maintenance" || status === "maintenance") {
+        service.connection.lastStatus = status;
+        service.connection.lastLatencyMs = latencyMs;
+        service.connection.lastCheckedAt = checkedAt;
+        service.connection.lastError = error;
+      }
+    }
+
+    if (!latencyAggregator.enabled && fallbackChecks.length > 0) {
+      data.latencyChecks.unshift(...fallbackChecks.reverse());
+      data.latencyChecks = data.latencyChecks.slice(0, 2000);
+    }
+
+    store.persist();
+    res.json(ok(apiState()));
   } catch (error) {
     res.status(400).json(fail(error));
   }
@@ -1649,7 +1734,7 @@ app.post("/api/services/:id/health", async (req, res) => {
     const checkedAt = String(req.body.checkedAt ?? nowIso());
     const latencyMs =
       typeof req.body.latencyMs === "number" && Number.isFinite(req.body.latencyMs)
-        ? Math.max(0, Math.round(req.body.latencyMs))
+        ? Math.max(0, Number(req.body.latencyMs))
         : null;
     const error = String(req.body.error ?? "").slice(0, 240);
     const user = data.users.find((item) => item.id === String(req.body.userId ?? ""));
@@ -1665,8 +1750,18 @@ app.post("/api/services/:id/health", async (req, res) => {
       createdAt: nowIso()
     };
 
-    data.latencyChecks.unshift(check);
-    data.latencyChecks = data.latencyChecks.slice(0, 2000);
+    await latencyAggregator.record({
+      serviceId: service.id,
+      latencyMs,
+      status,
+      error,
+      checkedAt
+    });
+
+    if (!latencyAggregator.enabled) {
+      data.latencyChecks.unshift(check);
+      data.latencyChecks = data.latencyChecks.slice(0, 2000);
+    }
 
     if (service.connection.lastStatus !== "maintenance" || status === "maintenance") {
       service.connection.lastStatus = status;
