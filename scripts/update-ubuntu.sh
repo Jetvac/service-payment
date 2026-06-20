@@ -18,11 +18,18 @@ TIMESCALE_VOLUME="${TIMESCALE_VOLUME:-${APP_BASE_NAME}-timescaledb-data}"
 TIMESCALE_DB="${TIMESCALE_DB:-${APP_BASE_NAME//-/_}}"
 TIMESCALE_USER="${TIMESCALE_USER:-${APP_BASE_NAME//-/_}}"
 TIMESCALE_PASSWORD="${TIMESCALE_PASSWORD:-}"
-TIMESCALE_PORT="${TIMESCALE_PORT:-15432}"
+TIMESCALE_PORT="${TIMESCALE_PORT:-29432}"
 APP_ENV_FILE="${APP_ENV_FILE:-/etc/${APP_BASE_NAME}.env}"
+SYNC_TMP_DIR=""
 
 log() {
   printf '\n==> %s\n' "$*"
+}
+
+cleanup_sync_tmp_dir() {
+  if [[ -n "${SYNC_TMP_DIR:-}" && -d "${SYNC_TMP_DIR}" ]]; then
+    rm -rf "${SYNC_TMP_DIR}"
+  fi
 }
 
 require_command() {
@@ -63,15 +70,15 @@ load_app_env() {
 }
 
 sync_source() {
-  local tmp_dir source_dir
-  tmp_dir="$(mktemp -d)"
-  source_dir="${tmp_dir}/source"
-  trap 'rm -rf "${tmp_dir}"' EXIT
+  local source_dir
+  SYNC_TMP_DIR="$(mktemp -d)"
+  source_dir="${SYNC_TMP_DIR}/source"
+  trap cleanup_sync_tmp_dir EXIT
 
   log "Downloading ${REPO_SLUG}@${BRANCH}"
-  curl -fsSL "${ARCHIVE_URL}" -o "${tmp_dir}/source.tar.gz"
+  curl -fsSL "${ARCHIVE_URL}" -o "${SYNC_TMP_DIR}/source.tar.gz"
   mkdir -p "${source_dir}"
-  tar -xzf "${tmp_dir}/source.tar.gz" -C "${source_dir}" --strip-components=1
+  tar -xzf "${SYNC_TMP_DIR}/source.tar.gz" -C "${source_dir}" --strip-components=1
 
   log "Updating source files in ${APP_DIR}"
   mkdir -p "${APP_DIR}"
@@ -88,9 +95,9 @@ build_app() {
   cd "${APP_DIR}"
 
   if [[ -f package-lock.json ]]; then
-    npm ci
+    npm ci --include=dev
   else
-    npm install
+    npm install --include=dev
   fi
 
   npm run build
@@ -148,6 +155,33 @@ timescale_container_running() {
   [[ "$(docker inspect -f '{{.State.Running}}' "${TIMESCALE_CONTAINER_NAME}" 2>/dev/null || true)" == "true" ]]
 }
 
+port_is_free() {
+  local port
+  port="$1"
+  if command -v ss >/dev/null 2>&1; then
+    ! ss -H -ltn "sport = :${port}" | grep -q .
+    return
+  fi
+  if command -v lsof >/dev/null 2>&1; then
+    ! lsof -nP -iTCP:"${port}" -sTCP:LISTEN >/dev/null 2>&1
+    return
+  fi
+  return 0
+}
+
+select_timescale_port() {
+  local candidate
+  for candidate in "${TIMESCALE_PORT}" 29432 39432 49432 59432 $(seq 25000 25150); do
+    if port_is_free "${candidate}"; then
+      TIMESCALE_PORT="${candidate}"
+      return
+    fi
+  done
+
+  echo "Could not find a free local port for TimescaleDB" >&2
+  exit 1
+}
+
 wait_for_timescale() {
   log "Waiting for TimescaleDB to accept connections"
   for _ in $(seq 1 90); do
@@ -191,6 +225,7 @@ setup_timescale_db() {
       docker start "${TIMESCALE_CONTAINER_NAME}" >/dev/null
     fi
   else
+    select_timescale_port
     log "Creating TimescaleDB container ${TIMESCALE_CONTAINER_NAME}"
     docker run -d \
       --name "${TIMESCALE_CONTAINER_NAME}" \
@@ -257,14 +292,7 @@ ensure_psql() {
     return 0
   fi
 
-  if [[ "${EUID}" -eq 0 ]] && command -v apt-get >/dev/null 2>&1; then
-    log "Installing PostgreSQL client for TimescaleDB migrations"
-    apt-get update
-    apt-get install -y postgresql-client
-    return 0
-  fi
-
-  echo "psql is required to apply the TimescaleDB schema. Install postgresql-client or run update as root." >&2
+  echo "psql is not installed; will use Docker psql when the local TimescaleDB container is available." >&2
   return 1
 }
 
@@ -281,6 +309,13 @@ apply_timescale_schema() {
   if [[ ! -f "${schema_file}" ]]; then
     echo "TimescaleDB schema file not found: ${schema_file}" >&2
     exit 1
+  fi
+
+  if command -v docker >/dev/null 2>&1 && timescale_container_exists && timescale_container_running; then
+    log "Applying TimescaleDB latency schema through Docker"
+    docker exec -i -e PGPASSWORD="${TIMESCALE_PASSWORD}" "${TIMESCALE_CONTAINER_NAME}" \
+      psql -U "${TIMESCALE_USER}" -d "${TIMESCALE_DB}" -v ON_ERROR_STOP=1 <"${schema_file}"
+    return
   fi
 
   if ! ensure_psql; then

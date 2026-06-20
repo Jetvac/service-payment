@@ -22,7 +22,7 @@ TIMESCALE_VOLUME="${TIMESCALE_VOLUME:-${APP_NAME}-timescaledb-data}"
 TIMESCALE_DB="${TIMESCALE_DB:-${APP_NAME//-/_}}"
 TIMESCALE_USER="${TIMESCALE_USER:-${APP_NAME//-/_}}"
 TIMESCALE_PASSWORD="${TIMESCALE_PASSWORD:-}"
-TIMESCALE_PORT="${TIMESCALE_PORT:-15432}"
+TIMESCALE_PORT="${TIMESCALE_PORT:-29432}"
 APP_ENV_FILE="${APP_ENV_FILE:-/etc/${APP_NAME}.env}"
 
 log() {
@@ -104,9 +104,9 @@ build_app() {
   cd "${APP_DIR}"
 
   if [[ -f package-lock.json ]]; then
-    npm ci
+    npm ci --include=dev
   else
-    npm install
+    npm install --include=dev
   fi
 
   npm run build
@@ -155,6 +155,33 @@ timescale_container_running() {
   [[ "$(docker inspect -f '{{.State.Running}}' "${TIMESCALE_CONTAINER_NAME}" 2>/dev/null || true)" == "true" ]]
 }
 
+port_is_free() {
+  local port
+  port="$1"
+  if command -v ss >/dev/null 2>&1; then
+    ! ss -H -ltn "sport = :${port}" | grep -q .
+    return
+  fi
+  if command -v lsof >/dev/null 2>&1; then
+    ! lsof -nP -iTCP:"${port}" -sTCP:LISTEN >/dev/null 2>&1
+    return
+  fi
+  return 0
+}
+
+select_timescale_port() {
+  local candidate
+  for candidate in "${TIMESCALE_PORT}" 29432 39432 49432 59432 $(seq 25000 25150); do
+    if port_is_free "${candidate}"; then
+      TIMESCALE_PORT="${candidate}"
+      return
+    fi
+  done
+
+  echo "Could not find a free local port for TimescaleDB" >&2
+  exit 1
+}
+
 wait_for_timescale() {
   log "Waiting for TimescaleDB to accept connections"
   for _ in $(seq 1 90); do
@@ -191,6 +218,7 @@ setup_timescale_db() {
       docker start "${TIMESCALE_CONTAINER_NAME}" >/dev/null
     fi
   else
+    select_timescale_port
     log "Creating TimescaleDB container ${TIMESCALE_CONTAINER_NAME}"
     docker run -d \
       --name "${TIMESCALE_CONTAINER_NAME}" \
@@ -238,9 +266,8 @@ ensure_psql() {
     return 0
   fi
 
-  log "Installing PostgreSQL client for TimescaleDB migrations"
-  apt-get update
-  apt-get install -y postgresql-client
+  echo "psql is not installed; will use Docker psql when the local TimescaleDB container is available." >&2
+  return 1
 }
 
 apply_timescale_schema() {
@@ -258,7 +285,17 @@ apply_timescale_schema() {
     exit 1
   fi
 
-  ensure_psql
+  if command -v docker >/dev/null 2>&1 && timescale_container_exists && timescale_container_running; then
+    log "Applying TimescaleDB latency schema through Docker"
+    docker exec -i -e PGPASSWORD="${TIMESCALE_PASSWORD}" "${TIMESCALE_CONTAINER_NAME}" \
+      psql -U "${TIMESCALE_USER}" -d "${TIMESCALE_DB}" -v ON_ERROR_STOP=1 <"${schema_file}"
+    return
+  fi
+
+  if ! ensure_psql; then
+    log "Skipping TimescaleDB schema: psql is unavailable"
+    return
+  fi
   log "Applying TimescaleDB latency schema"
   psql "${database_url}" -v ON_ERROR_STOP=1 -f "${schema_file}"
 }
