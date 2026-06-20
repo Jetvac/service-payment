@@ -39,7 +39,9 @@ BEGIN
 EXCEPTION
   WHEN duplicate_object THEN NULL;
   WHEN OTHERS THEN
-    IF SQLSTATE != '42710' THEN
+    IF SQLSTATE = '42710' OR SQLERRM ILIKE '%policy already exists%' OR SQLERRM ILIKE '%already exists for "measurements_5min"%' THEN
+      RAISE NOTICE 'Continuous aggregate refresh policy for measurements_5min already exists, skipping';
+    ELSE
       RAISE;
     END IF;
 END
@@ -100,7 +102,9 @@ BEGIN
 EXCEPTION
   WHEN duplicate_object THEN NULL;
   WHEN OTHERS THEN
-    IF SQLSTATE != '42710' THEN
+    IF SQLSTATE = '42710' OR SQLERRM ILIKE '%policy already exists%' OR SQLERRM ILIKE '%already exists for "measurements_1hour"%' THEN
+      RAISE NOTICE 'Continuous aggregate refresh policy for measurements_1hour already exists, skipping';
+    ELSE
       RAISE;
     END IF;
 END
