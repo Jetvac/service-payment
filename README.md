@@ -66,6 +66,16 @@ curl -fsSL https://raw.githubusercontent.com/Jetvac/service-payment/main/scripts
 
 Полезные переменные: `APP_DIR=/opt/service-payment`, `PORT=4077`, `BRANCH=main`, `ENABLE_UFW=true`.
 
+## Echo-сервер для замера задержки
+
+Для ручного точечного развёртывания WebSocket echo-сервера на VPN-сервере используйте:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Jetvac/service-payment/main/scripts/deploy-echo-server.sh | sudo bash
+```
+
+Скрипт собирает `LazyDoomSlayer/rust-websocket-server`, устанавливает systemd-сервис `rust-websocket-echo-server.service` и открывает `8765/tcp` в UFW, если UFW активен. В настройках сервиса приложения укажите порт `8765` и путь `/echo`.
+
 ## Обновление сервера
 
 Если сервер уже развёрнут, обновить приложение можно без авторизации в GitHub через raw-скрипт:
