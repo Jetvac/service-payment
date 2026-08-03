@@ -101,7 +101,7 @@ export type Deposit = {
   amountBalanceCurrency: number;
   balanceCurrency: string;
   comment: string;
-  source: "manual" | "telegram" | "auto" | "reversal";
+  source: "manual" | "telegram" | "auto" | "payment" | "reversal";
   createdAt: string;
   balanceAfter: number;
   cancelledAt?: string | null;
@@ -150,7 +150,7 @@ export type Notification = {
   id: string;
   serviceId: string;
   userId: string | null;
-  kind: "low_balance" | "period_summary" | "telegram_reply" | "latency_report" | "system";
+  kind: "low_balance" | "period_summary" | "telegram_reply" | "latency_report" | "payment" | "system";
   message: string;
   status: "sent" | "skipped" | "failed";
   createdAt: string;
@@ -216,9 +216,11 @@ export type ServiceSummary = {
 export type TelegramSettings = {
   enabled: boolean;
   botToken: string;
+  botTokenSet?: boolean;
   chatId: string;
   notificationTopicId: string;
   webhookSecret: string;
+  webhookSecretSet?: boolean;
   lowBalanceNotifications: boolean;
   monthlySummary: boolean;
   pollingEnabled: boolean;
@@ -230,7 +232,46 @@ export type TelegramSettings = {
 export type SecuritySettings = {
   adminPassword: string;
   adminPasswordSet?: boolean;
-  sessions?: Record<string, { userId: string; createdAt: string }>;
+  sessions?: Record<string, { userId: string; createdAt: string; expiresAt?: string }>;
+};
+
+export type PaymentMethod = "manual" | "sbp" | "sberbank";
+export type PaymentStatus = "pending" | "succeeded" | "canceled" | "failed";
+
+export type PaymentSettings = {
+  enabled: boolean;
+  provider: "yookassa";
+  manualEnabled: boolean;
+  sbpEnabled: boolean;
+  sberPayEnabled: boolean;
+  shopId: string;
+  secretKey: string;
+  secretKeySet?: boolean;
+  recipientName: string;
+  bankName: string;
+  phone: string;
+  account: string;
+  paymentPurpose: string;
+};
+
+export type PaymentIntent = {
+  id: string;
+  userId: string;
+  serviceId: string;
+  amount: number;
+  currency: string;
+  method: PaymentMethod;
+  provider: "manual" | "yookassa";
+  status: PaymentStatus;
+  externalId: string;
+  confirmationUrl: string;
+  description: string;
+  comment: string;
+  depositId: string | null;
+  failureReason: string;
+  createdAt: string;
+  updatedAt: string;
+  paidAt: string | null;
 };
 
 export type AppCounts = {
@@ -238,6 +279,7 @@ export type AppCounts = {
   debits: number;
   latencyChecks: number;
   notifications: number;
+  payments: number;
 };
 
 export type AppState = {
@@ -250,7 +292,8 @@ export type AppState = {
   debits: Debit[];
   latencyChecks: LatencyCheck[];
   notifications: Notification[];
-  settings: { telegram: TelegramSettings; security: SecuritySettings };
+  payments: PaymentIntent[];
+  settings: { telegram: TelegramSettings; security: SecuritySettings; payments: PaymentSettings };
   summaries: ServiceSummary[];
   counts: AppCounts;
   serverTime: string;

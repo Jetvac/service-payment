@@ -65,6 +65,9 @@ import type {
   Deposit,
   LatencyCheck,
   Notification as AppNotification,
+  PaymentIntent,
+  PaymentMethod,
+  PaymentSettings,
   Service,
   ServiceConnectionSettings,
   ServiceHealthStatus,
@@ -77,7 +80,7 @@ import type {
 } from "./types";
 import type { AutoDeposit } from "./types";
 
-type View = "dashboard" | "wall" | "services" | "people" | "ledger" | "bot" | "account";
+type View = "dashboard" | "wall" | "pay" | "services" | "people" | "ledger" | "bot" | "account";
 
 type DepositForm = {
   serviceId: string;
@@ -107,8 +110,11 @@ type ApiResult = {
 };
 
 type SystemUpdateResult = {
-  steps: Array<{ command: string; output: string }>;
-  restart: { scheduled: boolean; serviceUnit?: string; reason?: string };
+  scheduled: boolean;
+  pid?: number;
+  logPath?: string;
+  steps?: Array<{ command: string; output: string }>;
+  restart?: { scheduled: boolean; serviceUnit?: string; reason?: string };
 };
 
 type ClientHealth = {
@@ -200,6 +206,7 @@ const operationSourceNames: Record<string, string> = {
   manual: "Ручной",
   telegram: "Telegram",
   auto: "Авто",
+  payment: "Банк",
   reversal: "Коррекция"
 };
 
@@ -216,6 +223,7 @@ const latencyLineColors = ["#7aa8ff", "#47d18c", "#f8c15d", "#ff8b82", "#b994ff"
 const navItems = [
   { id: "dashboard", label: "Обзор", icon: Gauge },
   { id: "wall", label: "Стена", icon: BookOpen },
+  { id: "pay", label: "Внести оплату", icon: Wallet },
   { id: "services", label: "Сервисы", icon: Shield },
   { id: "people", label: "Участники", icon: Users },
   { id: "ledger", label: "История", icon: History },
@@ -908,12 +916,21 @@ function ModalShell({
   footer: ReactNode;
   onClose: () => void;
 }) {
+  useEffect(() => {
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    document.addEventListener("keydown", closeOnEscape);
+    return () => document.removeEventListener("keydown", closeOnEscape);
+  }, [onClose]);
+
   return (
     <div className="modal-backdrop" role="presentation" onMouseDown={onClose}>
       <section
         className={classNames("modal-panel", wide && "wide-modal")}
         role="dialog"
         aria-modal="true"
+        aria-label={title}
         onMouseDown={(event) => event.stopPropagation()}
       >
         <div className="modal-head">
@@ -1353,11 +1370,17 @@ export default function App() {
 
   const mutate = async (path: string, body?: unknown, method = "POST") => {
     try {
-      const nextState = await api(path, {
+      const result = await api<AppState | { state: AppState }>(path, {
         method,
         body: body === undefined ? undefined : JSON.stringify(body)
       });
-      setState(nextState);
+      const nextState = "state" in result ? result.state : result;
+      setState((current) => ({
+        ...nextState,
+        payments: nextState.payments.length || path.startsWith("/api/payments")
+          ? nextState.payments
+          : current?.payments ?? []
+      }));
       setToast("Сохранено");
       return nextState;
     } catch (error) {
@@ -1378,7 +1401,7 @@ export default function App() {
       const url = URL.createObjectURL(blob);
       const link = document.createElement("a");
       const disposition = response.headers.get("content-disposition") ?? "";
-      const fileName = disposition.match(/filename="([^"]+)"/)?.[1] ?? `service-payment-backup-${Date.now()}.json`;
+      const fileName = disposition.match(/filename="([^"]+)"/)?.[1] ?? `service-payment-backup-${Date.now()}.sqlite`;
 
       link.href = url;
       link.download = fileName;
@@ -1394,8 +1417,22 @@ export default function App() {
 
   const importDatabase = async (file: File) => {
     try {
-      const backup = JSON.parse(await file.text());
-      await mutate("/api/database/import", backup);
+      if (file.name.toLowerCase().endsWith(".json")) {
+        await mutate("/api/database/import", JSON.parse(await file.text()));
+      } else {
+        const token = window.localStorage.getItem(authTokenStorageKey);
+        const response = await fetch("/api/database/import", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/vnd.sqlite3",
+            ...(token ? { "x-auth-token": token } : {})
+          },
+          body: file
+        });
+        const result = (await response.json()) as ApiResult;
+        if (!response.ok || !result.ok) throw new Error(result.error || "Не удалось восстановить базу");
+        setState(result.payload as AppState);
+      }
       setToast("База загружена");
     } catch (error) {
       setToast(error instanceof Error ? error.message : "Ошибка загрузки базы");
@@ -1409,7 +1446,7 @@ export default function App() {
         method: "POST",
         body: JSON.stringify({})
       });
-      setToast(result.restart.scheduled ? `Обновлено, перезапуск: ${result.restart.serviceUnit}` : `Обновлено: ${result.restart.reason}`);
+      setToast(result.scheduled ? "Обновление выполняется; сайт перезапустится автоматически" : "Обновление установлено");
       return result;
     } catch (error) {
       setToast(error instanceof Error ? error.message : "Ошибка обновления");
@@ -1601,6 +1638,14 @@ export default function App() {
         serviceById={serviceById}
       />
     ),
+    pay: (
+      <PaymentView
+        state={state}
+        currentUser={currentUser}
+        onState={setState}
+        setToast={setToast}
+      />
+    ),
     services: (
       <ServicesView
         state={state}
@@ -1673,12 +1718,10 @@ export default function App() {
         pages={accountPages}
         latencyGraph={accountLatencyChart}
         latencyPeriod={accountLatencyPeriod}
-        mutate={mutate}
         saveUser={saveUser}
         serviceById={serviceById}
-        userById={userById}
         setToast={setToast}
-        onReload={() => loadAccountData()}
+        onPay={() => setView("pay")}
         onLatencyPeriodChange={applyAccountLatencyPeriod}
         onPageChange={(kind, offset) => {
           const nextDepositOffset = kind === "deposits" ? offset : accountOffsets.deposits;
@@ -4381,6 +4424,163 @@ function ServiceEditModal({
   );
 }
 
+function PaymentView({
+  state,
+  currentUser,
+  onState,
+  setToast
+}: {
+  state: AppState;
+  currentUser: User;
+  onState: (state: AppState) => void;
+  setToast: (message: string) => void;
+}) {
+  const services = activeServicesForUser(state, currentUser.id);
+  const [serviceId, setServiceId] = useState(services[0]?.id ?? "");
+  const [amount, setAmount] = useState(600);
+  const [comment, setComment] = useState("");
+  const [method, setMethod] = useState<PaymentMethod>("manual");
+  const [submitting, setSubmitting] = useState(false);
+  const settings = state.settings.payments;
+  const methods: Array<{ id: PaymentMethod; title: string; note: string; enabled: boolean }> = [
+    { id: "manual", title: "Без банка", note: "Зачислить сразу без банковского подтверждения", enabled: settings.manualEnabled },
+    { id: "sbp", title: "СБП", note: "Оплатить в приложении любого банка", enabled: settings.enabled && settings.sbpEnabled },
+    { id: "sberbank", title: "СберБанк Онлайн", note: "Перейти к подтверждению в СберБанке", enabled: settings.enabled && settings.sberPayEnabled }
+  ];
+
+  useEffect(() => {
+    if (!services.some((service) => service.id === serviceId)) setServiceId(services[0]?.id ?? "");
+  }, [serviceId, services]);
+
+  useEffect(() => {
+    if (!methods.find((item) => item.id === method)?.enabled) {
+      const firstEnabled = methods.find((item) => item.enabled);
+      if (firstEnabled) setMethod(firstEnabled.id);
+    }
+  }, [method, settings.enabled, settings.manualEnabled, settings.sbpEnabled, settings.sberPayEnabled]);
+
+  const submit = async () => {
+    setSubmitting(true);
+    try {
+      const result = await api<{ payment: PaymentIntent; state: AppState }>("/api/payments", {
+        method: "POST",
+        body: JSON.stringify({ serviceId, amount, method, comment })
+      });
+      onState(result.state);
+      if (result.payment.confirmationUrl) {
+        window.location.assign(result.payment.confirmationUrl);
+        return;
+      }
+      setToast("Оплата зачислена");
+      setAmount(600);
+      setComment("");
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : "Не удалось создать платёж");
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const refreshPayment = async (payment: PaymentIntent) => {
+    try {
+      const result = await api<{ payment: PaymentIntent; state: AppState }>(`/api/payments/${payment.id}/refresh`, { method: "POST" });
+      onState(result.state);
+      setToast(result.payment.status === "succeeded" ? "Оплата подтверждена" : "Статус обновлён");
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : "Не удалось проверить платёж");
+    }
+  };
+
+  const statusLabel: Record<PaymentIntent["status"], string> = {
+    pending: "Ожидает оплаты",
+    succeeded: "Зачислен",
+    canceled: "Отменён",
+    failed: "Ошибка"
+  };
+
+  return (
+    <section className="payment-layout">
+      <div className="panel payment-card">
+        <div className="payment-heading">
+          <span className="payment-icon"><Wallet size={22} /></span>
+          <div>
+            <h2>Внести оплату</h2>
+            <p>Выберите сервис, сумму и удобный способ.</p>
+          </div>
+        </div>
+
+        {!services.length ? (
+          <Empty label="Нет подключённых сервисов" />
+        ) : (
+          <div className="payment-form">
+            <label>
+              Сервис
+              <select value={serviceId} onChange={(event) => setServiceId(event.target.value)}>
+                {services.map((service) => <option key={service.id} value={service.id}>{service.name}</option>)}
+              </select>
+            </label>
+            <label>
+              Сумма, ₽
+              <input type="number" min="0.01" max="1000000" step="0.01" value={amount} onChange={(event) => setAmount(Number(event.target.value))} />
+            </label>
+            <fieldset className="payment-methods">
+              <legend>Способ оплаты</legend>
+              {methods.map((item) => (
+                <button
+                  key={item.id}
+                  className={classNames("payment-method", method === item.id && "selected")}
+                  type="button"
+                  disabled={!item.enabled}
+                  onClick={() => setMethod(item.id)}
+                >
+                  <span>{item.id === "manual" ? <Coins size={20} /> : <CreditCard size={20} />}</span>
+                  <strong>{item.title}</strong>
+                  <small>{item.enabled ? item.note : "Недоступно"}</small>
+                  {method === item.id && <Check size={18} />}
+                </button>
+              ))}
+            </fieldset>
+            <label>
+              Комментарий
+              <input value={comment} maxLength={500} placeholder={settings.paymentPurpose || "Назначение платежа"} onChange={(event) => setComment(event.target.value)} />
+            </label>
+            <button className="primary payment-submit" type="button" disabled={submitting || amount <= 0 || !serviceId || !methods.find((item) => item.id === method)?.enabled} onClick={() => void submit()}>
+              {submitting ? <RefreshCcw className="spin" size={18} /> : <CreditCard size={18} />}
+              {method === "manual" ? "Зачислить без банка" : `Оплатить ${money(amount, "RUB")}`}
+            </button>
+          </div>
+        )}
+      </div>
+
+      <aside className="panel payment-details">
+        <div className="panel-head"><h2>Получатель</h2><span className="chip">настраивает админ</span></div>
+        <dl>
+          <div><dt>Получатель</dt><dd>{settings.recipientName || "Не указан"}</dd></div>
+          <div><dt>Банк</dt><dd>{settings.bankName || "Не указан"}</dd></div>
+          <div><dt>Телефон СБП</dt><dd>{settings.phone || "Не указан"}</dd></div>
+          <div><dt>Счёт</dt><dd>{settings.account || "Не указан"}</dd></div>
+        </dl>
+        <p className="muted-copy">Онлайн-платежи подтверждаются сервером через ЮKassa. Повторная доставка уведомления не создаст двойное зачисление.</p>
+      </aside>
+
+      <div className="panel payment-history">
+        <div className="panel-head"><h2>Последние оплаты</h2><span className="chip">{state.payments.length}</span></div>
+        <div className="payment-list">
+          {state.payments.slice(0, 12).map((payment) => (
+            <div className="payment-row" key={payment.id}>
+              <span className={classNames("payment-status-dot", payment.status)} />
+              <div><strong>{money(payment.amount, payment.currency)}</strong><small>{services.find((service) => service.id === payment.serviceId)?.name ?? "Сервис"} · {payment.method === "manual" ? "без банка" : payment.method === "sbp" ? "СБП" : "СберБанк"}</small></div>
+              <div className="payment-row-status"><span className="chip">{statusLabel[payment.status]}</span><small>{dateTime(payment.createdAt)}</small></div>
+              {payment.status === "pending" && <button className="ghost compact" type="button" onClick={() => void refreshPayment(payment)}><RefreshCcw size={14} />Проверить</button>}
+            </div>
+          ))}
+          {!state.payments.length && <Empty label="Оплат пока нет" />}
+        </div>
+      </div>
+    </section>
+  );
+}
+
 function DepositModal({
   state,
   depositForm,
@@ -4426,7 +4626,7 @@ function DepositModal({
             type="button"
             disabled={!depositUserId || depositForm.amount <= 0}
             onClick={() =>
-              mutate("/api/deposits", { ...depositForm, userId: depositUserId })
+              mutate("/api/payments", { ...depositForm, userId: depositUserId, method: "manual" })
                 .then(() => onSaved?.())
                 .then(onClose)
             }
@@ -4513,12 +4713,10 @@ function AccountView({
   pages,
   latencyGraph,
   latencyPeriod,
-  mutate,
   saveUser,
   serviceById,
-  userById,
   setToast,
-  onReload,
+  onPay,
   onLatencyPeriodChange,
   onPageChange
 }: {
@@ -4527,41 +4725,16 @@ function AccountView({
   pages: AccountPages;
   latencyGraph: LatencyChartData;
   latencyPeriod: LatencyPeriodRange;
-  mutate: (path: string, body?: unknown, method?: string) => Promise<AppState>;
   saveUser: (user: User & { adminPassword?: string; currentPassword?: string }) => Promise<AppState>;
   serviceById: (id: string) => Service | undefined;
-  userById: (id: string) => User | undefined;
   setToast: (value: string) => void;
-  onReload: () => Promise<AccountPages>;
+  onPay: () => void;
   onLatencyPeriodChange: (period: LatencyPeriodRange) => void;
   onPageChange: (kind: keyof AccountPages, offset: number) => void;
 }) {
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [depositOpen, setDepositOpen] = useState(false);
   const [latencyPeriodOpen, setLatencyPeriodOpen] = useState(false);
   const userServices = useMemo(() => activeServicesForUser(state, currentUser.id), [currentUser.id, state.memberships, state.services]);
-  const firstService = userServices[0];
-  const [depositDraft, setDepositDraft] = useState<DepositForm>({
-    serviceId: firstService?.id ?? "",
-    userId: currentUser.id,
-    amount: 0,
-    currency: firstService?.currency ?? "RUB",
-    comment: ""
-  });
-
-  useEffect(() => {
-    if (!userServices.length) return;
-    const serviceAllowed = userServices.some((service) => service.id === depositDraft.serviceId);
-    if (!serviceAllowed || depositDraft.userId !== currentUser.id) {
-      setDepositDraft({
-        serviceId: firstService?.id ?? "",
-        userId: currentUser.id,
-        amount: depositDraft.amount,
-        currency: firstService?.currency ?? "RUB",
-        comment: depositDraft.comment
-      });
-    }
-  }, [currentUser.id, depositDraft.amount, depositDraft.comment, depositDraft.serviceId, depositDraft.userId, firstService?.id, firstService?.currency, userServices]);
 
   const moneyTimeline = useMemo(() => {
     const buckets = new Map<string, { date: string; deposits: number; debits: number; ts: number }>();
@@ -4636,7 +4809,7 @@ function AccountView({
               <Settings2 size={16} />
               Аккаунт
             </button>
-            <button className="primary" type="button" disabled={!userServices.length} onClick={() => setDepositOpen(true)}>
+            <button className="primary" type="button" disabled={!userServices.length} onClick={onPay}>
               <Wallet size={16} />
               Внести оплату
             </button>
@@ -4792,20 +4965,6 @@ function AccountView({
         />
       )}
 
-      {depositOpen && (
-        <DepositModal
-          state={state}
-          depositForm={depositDraft}
-          setDepositForm={setDepositDraft}
-          mutate={mutate}
-          serviceById={serviceById}
-          userById={userById}
-          targetMode="service"
-          serviceOptions={userServices}
-          onSaved={onReload}
-          onClose={() => setDepositOpen(false)}
-        />
-      )}
     </section>
   );
 }
@@ -5750,6 +5909,7 @@ function BotView({
   updateApplication: () => Promise<SystemUpdateResult>;
 }) {
   const [telegram, setTelegram] = useState(state.settings.telegram);
+  const [payments, setPayments] = useState<PaymentSettings>(state.settings.payments);
   const [telegramOpen, setTelegramOpen] = useState(false);
   const [currencyOpen, setCurrencyOpen] = useState(false);
   const [securityOpen, setSecurityOpen] = useState(false);
@@ -5762,6 +5922,10 @@ function BotView({
     setTelegram(state.settings.telegram);
     setPublicWebhookUrl(`${window.location.origin.replace(/\/$/, "")}/api/telegram/webhook/${state.settings.telegram.webhookSecret}`);
   }, [state.settings.telegram]);
+
+  useEffect(() => {
+    setPayments((current) => ({ ...state.settings.payments, secretKey: current.secretKey }));
+  }, [state.settings.payments]);
 
   const saveAndConfigure = () =>
     saveTelegram(telegram).then(() => mutate("/api/telegram/configure", { webhookUrl: publicWebhookUrl }));
@@ -5871,6 +6035,28 @@ function BotView({
 
       <div className="panel wide">
         <div className="panel-head">
+          <div><h2>Приём оплаты</h2><p className="panel-subtitle">Реквизиты видны пользователю; секрет ЮKassa остаётся только на сервере.</p></div>
+          <button className="primary" type="button" onClick={() => mutate("/api/settings/payments", payments, "PUT").then(() => setPayments((current) => ({ ...current, secretKey: "" })))}>
+            <Check size={16} />Сохранить
+          </button>
+        </div>
+        <div className="form-grid payment-settings-form">
+          <label className="toggle-row"><input type="checkbox" checked={payments.manualEnabled} onChange={(event) => setPayments({ ...payments, manualEnabled: event.target.checked })} />Без банка</label>
+          <label className="toggle-row"><input type="checkbox" checked={payments.enabled} onChange={(event) => setPayments({ ...payments, enabled: event.target.checked })} />ЮKassa включена</label>
+          <label className="toggle-row"><input type="checkbox" checked={payments.sbpEnabled} onChange={(event) => setPayments({ ...payments, sbpEnabled: event.target.checked })} />СБП</label>
+          <label className="toggle-row"><input type="checkbox" checked={payments.sberPayEnabled} onChange={(event) => setPayments({ ...payments, sberPayEnabled: event.target.checked })} />СберБанк Онлайн</label>
+          <label>Shop ID<input value={payments.shopId} onChange={(event) => setPayments({ ...payments, shopId: event.target.value })} /></label>
+          <label>Секретный ключ<input type="password" value={payments.secretKey} placeholder={payments.secretKeySet ? "Ключ сохранён" : "Укажите ключ"} onChange={(event) => setPayments({ ...payments, secretKey: event.target.value })} /></label>
+          <label>Получатель<input value={payments.recipientName} onChange={(event) => setPayments({ ...payments, recipientName: event.target.value })} /></label>
+          <label>Банк<input value={payments.bankName} onChange={(event) => setPayments({ ...payments, bankName: event.target.value })} /></label>
+          <label>Телефон СБП<input value={payments.phone} onChange={(event) => setPayments({ ...payments, phone: event.target.value })} /></label>
+          <label>Счёт зачисления<input value={payments.account} onChange={(event) => setPayments({ ...payments, account: event.target.value })} /></label>
+          <label className="wide-field">Назначение платежа<input value={payments.paymentPurpose} onChange={(event) => setPayments({ ...payments, paymentPurpose: event.target.value })} /></label>
+        </div>
+      </div>
+
+      <div className="panel wide">
+        <div className="panel-head">
           <h2>Система</h2>
           <span className="chip">backup / update</span>
         </div>
@@ -5883,7 +6069,7 @@ function BotView({
             <Upload size={16} />
             Загрузить БД
             <input
-              accept="application/json,.json"
+              accept="application/vnd.sqlite3,.sqlite,.db,application/json,.json"
               type="file"
               onChange={(event) => {
                 const file = event.currentTarget.files?.[0];

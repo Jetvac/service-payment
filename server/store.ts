@@ -1,16 +1,37 @@
 import fs from "node:fs";
 import path from "node:path";
-import type { AppData } from "./types";
-import { BALANCE_CURRENCY, buildNextAutoDepositDate, defaultServiceConnection, normalizeNumber, roundMoney, seedData } from "./domain";
+import Database from "better-sqlite3";
+import type { AppData, WallFile } from "./types";
+import {
+  BALANCE_CURRENCY,
+  buildNextAutoDepositDate,
+  defaultPaymentSettings,
+  defaultServiceConnection,
+  normalizeNumber,
+  nowIso,
+  roundMoney,
+  seedData
+} from "./domain";
+import { hashPassword, isPasswordHash, sessionExpiresAt, sessionIsActive } from "./security";
 
-const dataDir = path.resolve(process.cwd(), "data");
-const dataFile = path.join(dataDir, "db.json");
+const dataDir = path.resolve(process.env.APP_DATA_DIR || path.join(process.cwd(), "data"));
+const legacyDataFile = path.join(dataDir, "db.json");
+const wallFilesDir = path.join(dataDir, "wall-files");
+const databaseFile = path.resolve(process.env.APP_DATABASE_PATH || path.join(dataDir, "service-payment.sqlite"));
+
+function cloneData(data: AppData) {
+  return JSON.parse(JSON.stringify(data)) as AppData;
+}
 
 export class Store {
+  private db: Database.Database;
   private data: AppData;
 
   constructor() {
+    fs.mkdirSync(dataDir, { recursive: true });
+    this.db = this.openDatabase();
     this.data = this.load();
+    this.migrateLegacyFiles();
   }
 
   read() {
@@ -18,13 +39,14 @@ export class Store {
   }
 
   exportData() {
-    const { wallFiles: _wallFiles, wallPosts: _wallPosts, wallTags: _wallTags, wallComments: _wallComments, ...paymentData } = this.data;
-    return JSON.parse(JSON.stringify(paymentData)) as Omit<AppData, "wallFiles" | "wallPosts" | "wallTags" | "wallComments">;
+    return cloneData(this.data);
   }
 
   write(mutator: (data: AppData) => void) {
-    mutator(this.data);
-    this.persist();
+    const next = cloneData(this.data);
+    mutator(next);
+    this.persistData(next);
+    this.data = next;
     return this.data;
   }
 
@@ -35,30 +57,151 @@ export class Store {
       wallTags: this.data.wallTags ?? [],
       wallComments: this.data.wallComments ?? []
     };
-    this.data = {
+    const next = {
       ...this.migrate(this.normalizeImport(raw)),
       ...wallData
     };
-    this.persist();
+    this.persistData(next);
+    this.data = next;
     return this.data;
   }
 
   persist() {
-    fs.mkdirSync(dataDir, { recursive: true });
-    fs.writeFileSync(dataFile, JSON.stringify(this.data, null, 2), "utf-8");
+    this.persistData(this.data);
   }
 
   private load(): AppData {
-    fs.mkdirSync(dataDir, { recursive: true });
-
-    if (!fs.existsSync(dataFile)) {
-      const initial = seedData();
-      fs.writeFileSync(dataFile, JSON.stringify(initial, null, 2), "utf-8");
-      return initial;
+    const row = this.db.prepare("SELECT data FROM app_state WHERE id = 1").get() as { data?: string } | undefined;
+    if (row?.data) {
+      const migrated = this.migrate(JSON.parse(row.data) as AppData);
+      this.persistData(migrated);
+      return migrated;
     }
 
-    const parsed = JSON.parse(fs.readFileSync(dataFile, "utf-8")) as AppData;
-    return this.migrate(parsed);
+    const initial = fs.existsSync(legacyDataFile)
+      ? this.migrate(JSON.parse(fs.readFileSync(legacyDataFile, "utf-8")) as AppData)
+      : this.migrate(seedData());
+    this.persistData(initial);
+    return initial;
+  }
+
+  private openDatabase() {
+    const db = new Database(databaseFile, { timeout: 5000 });
+    db.pragma("journal_mode = WAL");
+    db.pragma("synchronous = FULL");
+    db.pragma("foreign_keys = ON");
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS app_state (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        data TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS wall_file_blobs (
+        file_id TEXT PRIMARY KEY,
+        content BLOB NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_wall_file_blobs_updated_at ON wall_file_blobs(updated_at);
+    `);
+    return db;
+  }
+
+  private persistData(data: AppData) {
+    this.db
+      .prepare(
+        `INSERT INTO app_state (id, data, updated_at) VALUES (1, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at`
+      )
+      .run(JSON.stringify(data), new Date().toISOString());
+  }
+
+  saveWallFile(file: WallFile, content: Buffer) {
+    const next = cloneData(this.data);
+    next.wallFiles = next.wallFiles.filter((item) => item.id !== file.id);
+    next.wallFiles.unshift(file);
+    const save = this.db.transaction(() => {
+      this.db
+        .prepare(
+          `INSERT INTO wall_file_blobs (file_id, content, updated_at) VALUES (?, ?, ?)
+           ON CONFLICT(file_id) DO UPDATE SET content = excluded.content, updated_at = excluded.updated_at`
+        )
+        .run(file.id, content, new Date().toISOString());
+      this.persistData(next);
+    });
+    save();
+    this.data = next;
+    return file;
+  }
+
+  readWallFile(fileId: string) {
+    const row = this.db.prepare("SELECT content FROM wall_file_blobs WHERE file_id = ?").get(fileId) as { content?: Buffer } | undefined;
+    return row?.content ? Buffer.from(row.content) : null;
+  }
+
+  deleteWallFileBlob(fileId: string) {
+    this.db.prepare("DELETE FROM wall_file_blobs WHERE file_id = ?").run(fileId);
+  }
+
+  async backupTo(destination: string) {
+    fs.mkdirSync(path.dirname(destination), { recursive: true });
+    await this.db.backup(destination);
+    return destination;
+  }
+
+  replaceWithDatabase(sourceFile: string) {
+    const candidate = new Database(sourceFile, { readonly: true, fileMustExist: true });
+    try {
+      const row = candidate.prepare("SELECT data FROM app_state WHERE id = 1").get() as { data?: string } | undefined;
+      if (!row?.data) throw new Error("В резервной копии отсутствует состояние приложения");
+      this.migrate(JSON.parse(row.data) as AppData);
+    } finally {
+      candidate.close();
+    }
+
+    const rollbackFile = `${databaseFile}.rollback`;
+    this.db.pragma("wal_checkpoint(TRUNCATE)");
+    this.db.close();
+    fs.copyFileSync(databaseFile, rollbackFile);
+
+    try {
+      fs.copyFileSync(sourceFile, databaseFile);
+      fs.rmSync(`${databaseFile}-wal`, { force: true });
+      fs.rmSync(`${databaseFile}-shm`, { force: true });
+      this.db = this.openDatabase();
+      this.data = this.load();
+      fs.rmSync(rollbackFile, { force: true });
+      return this.data;
+    } catch (error) {
+      try {
+        if (this.db?.open) this.db.close();
+      } catch {
+        // ignore failed candidate close before restoring the known-good database
+      }
+      fs.copyFileSync(rollbackFile, databaseFile);
+      fs.rmSync(`${databaseFile}-wal`, { force: true });
+      fs.rmSync(`${databaseFile}-shm`, { force: true });
+      this.db = this.openDatabase();
+      this.data = this.load();
+      throw error;
+    }
+  }
+
+  getDatabasePath() {
+    return databaseFile;
+  }
+
+  private migrateLegacyFiles() {
+    if (!fs.existsSync(wallFilesDir)) return;
+    const insert = this.db.prepare("INSERT OR IGNORE INTO wall_file_blobs (file_id, content, updated_at) VALUES (?, ?, ?)");
+    const migrateAll = this.db.transaction(() => {
+      for (const file of this.data.wallFiles) {
+        if (!file.storageName) continue;
+        const legacyPath = path.join(wallFilesDir, file.storageName);
+        if (!fs.existsSync(legacyPath)) continue;
+        insert.run(file.id, fs.readFileSync(legacyPath), new Date().toISOString());
+      }
+    });
+    migrateAll();
   }
 
   private normalizeImport(raw: unknown): AppData {
@@ -90,6 +233,7 @@ export class Store {
       debits: Array.isArray(backup.debits) ? backup.debits : [],
       latencyChecks: Array.isArray(backup.latencyChecks) ? backup.latencyChecks : [],
       notifications: Array.isArray(backup.notifications) ? backup.notifications : [],
+      payments: Array.isArray(backup.payments) ? backup.payments : [],
       wallTags: Array.isArray(backup.wallTags) ? backup.wallTags : [],
       wallFiles: Array.isArray(backup.wallFiles) ? backup.wallFiles : [],
       wallPosts: Array.isArray(backup.wallPosts) ? backup.wallPosts : [],
@@ -104,6 +248,10 @@ export class Store {
         security: {
           ...fallback.settings.security,
           ...(backup.settings?.security ?? {})
+        },
+        payments: {
+          ...fallback.settings.payments,
+          ...(backup.settings?.payments ?? {})
         }
       }
     } as AppData;
@@ -156,7 +304,8 @@ export class Store {
       user.telegramId ??= "";
       user.telegramUsername ??= "";
       user.avatarUrl ??= "";
-      user.password = String(user.password || "admin");
+      user.password = String(user.password || process.env.INITIAL_ADMIN_PASSWORD || "admin");
+      if (!isPasswordHash(user.password)) user.password = hashPassword(user.password);
       user.passwordSet = Boolean(user.password);
       const legacyBalances = (data.memberships ?? []).filter(
         (membership) => membership.userId === user.id && typeof membership.balance === "number"
@@ -180,6 +329,7 @@ export class Store {
     }
 
     data.notifications ??= [];
+    data.payments ??= [];
     data.wallTags ??= [];
     data.wallFiles ??= [];
     data.wallPosts ??= [];
@@ -191,15 +341,53 @@ export class Store {
     data.memberships ??= [];
     data.settings ??= seedData().settings;
     data.settings.telegram ??= seedData().settings.telegram;
-    data.settings.security ??= { adminPassword: "admin", adminPasswordSet: true };
-    data.settings.security.adminPassword = String(data.settings.security.adminPassword || "admin");
+    data.settings.security ??= { adminPassword: process.env.INITIAL_ADMIN_PASSWORD || "admin", adminPasswordSet: true };
+    data.settings.security.adminPassword = String(
+      data.settings.security.adminPassword || process.env.INITIAL_ADMIN_PASSWORD || "admin"
+    );
+    if (!isPasswordHash(data.settings.security.adminPassword)) {
+      data.settings.security.adminPassword = hashPassword(data.settings.security.adminPassword);
+    }
     data.settings.security.adminPasswordSet = Boolean(data.settings.security.adminPassword);
     data.settings.security.sessions ??= {};
+    for (const [token, session] of Object.entries(data.settings.security.sessions)) {
+      if (!sessionIsActive(session) || !data.users.some((user) => user.id === session.userId)) {
+        delete data.settings.security.sessions[token];
+        continue;
+      }
+      session.expiresAt ??= sessionExpiresAt(new Date(session.createdAt));
+    }
     data.settings.telegram.pollingEnabled ??= false;
     data.settings.telegram.notificationTopicId ??= "";
     data.settings.telegram.updateOffset ??= 0;
     data.settings.telegram.lastUpdateAt ??= null;
     data.settings.telegram.lastError ??= "";
+    data.settings.telegram.botTokenSet = Boolean(data.settings.telegram.botToken);
+    data.settings.telegram.webhookSecretSet = Boolean(data.settings.telegram.webhookSecret);
+    data.settings.payments = { ...defaultPaymentSettings(), ...(data.settings.payments ?? {}) };
+    data.settings.payments.secretKeySet = Boolean(data.settings.payments.secretKey);
+
+    for (const payment of data.payments) {
+      payment.id = String(payment.id ?? "");
+      payment.userId = String(payment.userId ?? "");
+      payment.serviceId = String(payment.serviceId ?? "");
+      payment.amount = roundMoney(Math.max(0, normalizeNumber(payment.amount, 0)));
+      payment.currency = String(payment.currency ?? BALANCE_CURRENCY).toUpperCase();
+      payment.method = ["manual", "sbp", "sberbank"].includes(payment.method) ? payment.method : "manual";
+      payment.provider = payment.method === "manual" ? "manual" : "yookassa";
+      payment.status = ["pending", "succeeded", "canceled", "failed"].includes(payment.status)
+        ? payment.status
+        : "pending";
+      payment.externalId = String(payment.externalId ?? "");
+      payment.confirmationUrl = String(payment.confirmationUrl ?? "");
+      payment.description = String(payment.description ?? "").slice(0, 128);
+      payment.comment = String(payment.comment ?? "").slice(0, 500);
+      payment.depositId = payment.depositId ? String(payment.depositId) : null;
+      payment.failureReason = String(payment.failureReason ?? "").slice(0, 500);
+      payment.createdAt = String(payment.createdAt ?? nowIso());
+      payment.updatedAt = String(payment.updatedAt ?? payment.createdAt);
+      payment.paidAt = payment.paidAt ? String(payment.paidAt) : null;
+    }
 
     for (const membership of data.memberships) {
       delete membership.balance;
@@ -273,8 +461,6 @@ export class Store {
       check.createdAt = String(check.createdAt ?? check.checkedAt);
       check.error = String(check.error ?? "").slice(0, 240);
     }
-
-    data.latencyChecks = data.latencyChecks.slice(0, 2000);
 
     for (const tag of data.wallTags) {
       tag.id = String(tag.id ?? "");

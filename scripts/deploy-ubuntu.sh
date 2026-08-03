@@ -24,6 +24,7 @@ TIMESCALE_USER="${TIMESCALE_USER:-${APP_NAME//-/_}}"
 TIMESCALE_PASSWORD="${TIMESCALE_PASSWORD:-}"
 TIMESCALE_PORT="${TIMESCALE_PORT:-29432}"
 APP_ENV_FILE="${APP_ENV_FILE:-/etc/${APP_NAME}.env}"
+INITIAL_ADMIN_PASSWORD="${INITIAL_ADMIN_PASSWORD:-}"
 
 log() {
   printf '\n==> %s\n' "$*"
@@ -38,7 +39,17 @@ require_root() {
 install_base_packages() {
   log "Installing base packages"
   apt-get update
-  apt-get install -y ca-certificates curl gnupg git openssl sudo
+  apt-get install -y ca-certificates curl gnupg git openssl sudo build-essential python3
+}
+
+load_existing_env() {
+  if [[ -f "${APP_ENV_FILE}" ]]; then
+    log "Loading existing application settings"
+    set -a
+    # shellcheck disable=SC1090
+    source "${APP_ENV_FILE}"
+    set +a
+  fi
 }
 
 node_is_supported() {
@@ -239,6 +250,9 @@ setup_timescale_db() {
 }
 
 write_app_env() {
+  if [[ -z "${INITIAL_ADMIN_PASSWORD}" ]]; then
+    INITIAL_ADMIN_PASSWORD="$(random_password)"
+  fi
   log "Writing app environment ${APP_ENV_FILE}"
   mkdir -p "$(dirname "${APP_ENV_FILE}")"
   {
@@ -246,6 +260,15 @@ write_app_env() {
     echo "NODE_ENV=production"
     echo "PORT=$(shell_escape_env_value "${PORT}")"
     echo "APP_SERVICE_NAME=$(shell_escape_env_value "${APP_NAME}")"
+    echo "APP_DATA_DIR=$(shell_escape_env_value "${APP_DIR}/data")"
+    echo "INITIAL_ADMIN_PASSWORD=$(shell_escape_env_value "${INITIAL_ADMIN_PASSWORD}")"
+    if [[ -n "${DOMAIN}" ]]; then
+      if [[ "${ENABLE_SSL}" == "true" ]]; then
+        echo "PUBLIC_BASE_URL=$(shell_escape_env_value "https://${DOMAIN}")"
+      else
+        echo "PUBLIC_BASE_URL=$(shell_escape_env_value "http://${DOMAIN}")"
+      fi
+    fi
     if [[ -n "${TIMESCALE_DATABASE_URL:-}" ]]; then
       echo "TIMESCALE_DATABASE_URL=$(shell_escape_env_value "${TIMESCALE_DATABASE_URL}")"
       echo "DATABASE_URL=$(shell_escape_env_value "${DATABASE_URL:-${TIMESCALE_DATABASE_URL}}")"
@@ -363,7 +386,7 @@ server {
     listen 80;
     server_name ${server_name};
 
-    client_max_body_size 5m;
+    client_max_body_size 64m;
 
     location / {
         proxy_pass http://127.0.0.1:${PORT};
@@ -440,6 +463,7 @@ Systemd unit:  ${APP_NAME}.service
 Env file:      ${APP_ENV_FILE}
 Local URL:     http://127.0.0.1:${PORT}
 Public URL:    ${public_url}
+Initial admin password: ${INITIAL_ADMIN_PASSWORD}
 
 Useful commands:
   sudo systemctl status ${APP_NAME}
@@ -451,6 +475,7 @@ EOF
 
 main() {
   require_root "$@"
+  load_existing_env
   install_base_packages
   install_node
   ensure_app_user

@@ -3,6 +3,7 @@ import http from "node:http";
 import express, { type NextFunction, type Request, type Response } from "express";
 import { execFile, spawn } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { Client } from "ssh2";
@@ -15,6 +16,8 @@ import type {
   BillingPeriod,
   Currency,
   LatencyCheck,
+  PaymentIntent,
+  PaymentMethod,
   Service,
   ServiceConnectionSettings,
   ServiceHealthStatus,
@@ -53,6 +56,8 @@ import {
   sendServiceMaintenanceNotice,
   sendTelegramMessage
 } from "./telegram";
+import { assertStrongPassword, hashPassword, sessionExpiresAt, sessionIsActive, verifyPassword } from "./security";
+import { createYooKassaPayment, getYooKassaPayment, mapYooKassaStatus, type YooKassaPayment } from "./payments";
 
 const app = express();
 const server = http.createServer(app);
@@ -60,12 +65,21 @@ const realtime = new WebSocketServer({ server, path: "/api/realtime" });
 const port = Number(process.env.PORT ?? 4077);
 const store = new Store();
 const execFileAsync = promisify(execFile);
-latencyAggregator.start();
+if (process.env.DISABLE_BACKGROUND_JOBS !== "true") latencyAggregator.start();
 const latencyLineColors = ["#7aa8ff", "#47d18c", "#f8c15d", "#ff8b82", "#b994ff", "#5ed4d6", "#f49ac2", "#c6cad2"];
 const wallFilesDir = path.resolve(process.cwd(), "data", "wall-files");
-const maxWallFileSize = 2 * 1024 * 1024 * 1024;
+const maxWallFileSize = Math.max(1, Number(process.env.MAX_UPLOAD_MB ?? 50)) * 1024 * 1024;
 
 app.use(express.json({ limit: "25mb" }));
+app.disable("x-powered-by");
+app.set("trust proxy", 1);
+app.use((_req, res, next) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("Referrer-Policy", "same-origin");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+  next();
+});
 
 function broadcastRealtime(payload: unknown) {
   const message = JSON.stringify(payload);
@@ -79,7 +93,7 @@ realtime.on("connection", (socket, request) => {
   const token = url.searchParams.get("token") ?? "";
   const data = store.read();
   const session = token ? data.settings.security.sessions?.[token] : undefined;
-  if (!session || !data.users.some((user) => user.id === session.userId)) {
+  if (!sessionIsActive(session) || !data.users.some((user) => user.id === session?.userId)) {
     socket.close(1008, "auth required");
   }
 });
@@ -238,7 +252,8 @@ function authUsers(data: AppData) {
 function issueAuthToken(data: AppData, user: User) {
   const token = `sess_${crypto.randomBytes(24).toString("hex")}`;
   data.settings.security.sessions ??= {};
-  data.settings.security.sessions[token] = { userId: user.id, createdAt: nowIso() };
+  const createdAt = nowIso();
+  data.settings.security.sessions[token] = { userId: user.id, createdAt, expiresAt: sessionExpiresAt(new Date(createdAt)) };
   return token;
 }
 
@@ -254,13 +269,15 @@ function requireAdmin(req: Request) {
 
 function authMiddleware(req: Request, res: Response, next: NextFunction) {
   if (req.path.startsWith("/auth/")) return next();
+  if (req.method === "GET" && req.path === "/health") return next();
   if (req.method === "GET" && /^\/wall\/files\/[^/]+\/download$/.test(req.path)) return next();
   if (req.path.startsWith("/telegram/webhook/")) return next();
+  if (req.path === "/payments/yookassa/webhook") return next();
 
   const token = String(req.header("x-auth-token") ?? "");
   const data = store.read();
   const session = token ? data.settings.security.sessions?.[token] : undefined;
-  const user = session ? data.users.find((item) => item.id === session.userId) : undefined;
+  const user = sessionIsActive(session) ? data.users.find((item) => item.id === session?.userId) : undefined;
 
   if (!user) {
     res.status(401).json(fail(new Error("Требуется вход")));
@@ -575,7 +592,7 @@ function dashboardData(data: AppData, query: Record<string, unknown>) {
   };
 }
 
-function publicData(data: AppData) {
+function publicData(data: AppData, viewer?: User) {
   const services = data.services.map((service) => {
     const source = data.services.find((item) => item.id === service.id);
     const connection = { ...defaultServiceConnection(), ...(service.connection ?? {}) };
@@ -583,6 +600,11 @@ function publicData(data: AppData) {
     connection.passwordSet = Boolean(source?.connection?.password);
     return { ...service, connection };
   });
+
+  const telegram = { ...data.settings.telegram, botToken: "", webhookSecret: "" };
+  telegram.botTokenSet = Boolean(data.settings.telegram.botToken);
+  telegram.webhookSecretSet = Boolean(data.settings.telegram.webhookSecret);
+  const payments = { ...data.settings.payments, secretKey: "", secretKeySet: Boolean(data.settings.payments.secretKey) };
 
   return {
     currencies: data.currencies,
@@ -594,27 +616,30 @@ function publicData(data: AppData) {
     debits: [],
     latencyChecks: [],
     notifications: [],
+    payments: viewer?.botAdmin ? data.payments : data.payments.filter((payment) => payment.userId === viewer?.id),
     settings: {
-      telegram: data.settings.telegram,
+      telegram,
       security: {
         adminPassword: "",
         adminPasswordSet: Boolean(data.settings.security?.adminPassword),
         sessions: {}
-      }
+      },
+      payments
     }
   };
 }
 
-function apiState() {
+function apiState(viewer?: User) {
   const data = store.read();
   return {
-    ...publicData(data),
+    ...publicData(data, viewer),
     summaries: computeSummaries(data),
     counts: {
       deposits: data.deposits.length,
       debits: data.debits.length,
       latencyChecks: data.latencyChecks.length,
-      notifications: data.notifications.length
+      notifications: data.notifications.length,
+      payments: data.payments.length
     },
     serverTime: nowIso()
   };
@@ -622,7 +647,7 @@ function apiState() {
 
 function backupFileName() {
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-  return `service-payment-backup-${stamp}.json`;
+  return `service-payment-backup-${stamp}.sqlite`;
 }
 
 function npmCommand() {
@@ -699,6 +724,30 @@ function scheduleServiceRestart() {
   return { scheduled: true, serviceUnit };
 }
 
+function scheduleUbuntuUpdate() {
+  const scriptPath = path.resolve(process.cwd(), "scripts", "update-ubuntu.sh");
+  if (!fs.existsSync(scriptPath)) throw new Error("Скрипт обновления не найден");
+  const logDir = path.resolve(process.env.APP_DATA_DIR || path.join(process.cwd(), "data"), "logs");
+  fs.mkdirSync(logDir, { recursive: true });
+  const logPath = path.join(logDir, "update.log");
+  const output = fs.openSync(logPath, "a");
+  const child = spawn("bash", [scriptPath], {
+    cwd: process.cwd(),
+    detached: true,
+    stdio: ["ignore", output, output],
+    env: {
+      ...process.env,
+      APP_DIR: process.cwd(),
+      APP_SERVICE_NAME: serviceUnitName(),
+      BRANCH: process.env.UPDATE_BRANCH || "main",
+      RESTART_SERVICE: "true"
+    }
+  });
+  child.unref();
+  fs.closeSync(output);
+  return { scheduled: true, pid: child.pid, logPath };
+}
+
 function normalizeConnectionInput(body: Partial<ServiceConnectionSettings> | undefined, fallback?: ServiceConnectionSettings) {
   const base = { ...defaultServiceConnection(), ...(fallback ?? {}) };
   const input = body ?? {};
@@ -773,7 +822,7 @@ async function tryFetchTelegramAvatar(data: AppData, user: User) {
 
 function validateAdminPassword(data: AppData, password: unknown) {
   const expected = data.settings.security?.adminPassword || "admin";
-  if (String(password ?? "") !== expected) {
+  if (!verifyPassword(expected, String(password ?? ""))) {
     throw new Error("Неверный пароль администратора");
   }
 }
@@ -795,10 +844,11 @@ function applyUserInput(
 
   const passwordInput = typeof body.password === "string" ? body.password.trim() : "";
   if (passwordInput) {
-    if (!isAdmin && user.password && String(body.currentPassword ?? "") !== user.password) {
+    assertStrongPassword(passwordInput);
+    if (!isAdmin && user.password && !verifyPassword(user.password, String(body.currentPassword ?? ""))) {
       throw new Error("Неверный текущий пароль");
     }
-    user.password = passwordInput;
+    user.password = hashPassword(passwordInput);
     user.passwordSet = true;
   }
 
@@ -990,21 +1040,80 @@ function normalizeAutoDepositInput(data: AppData, body: Partial<AutoDeposit>, fa
   };
 }
 
+function paymentDescription(data: AppData, user: User, serviceId: string) {
+  const service = data.services.find((item) => item.id === serviceId);
+  return `Пополнение ${service?.name ?? "сервиса"}: ${user.name}`.slice(0, 128);
+}
+
+function applyProviderPayment(data: AppData, intent: PaymentIntent, payment: YooKassaPayment) {
+  if (intent.externalId && payment.id !== intent.externalId) throw new Error("Платёж провайдера не совпадает с заявкой");
+  if (payment.metadata?.payment_intent_id !== intent.id) throw new Error("Метаданные платежа не совпадают с заявкой");
+  if (payment.metadata?.user_id !== intent.userId || payment.metadata?.service_id !== intent.serviceId) {
+    throw new Error("Получатель платежа не совпадает с заявкой");
+  }
+  if (payment.amount.currency !== intent.currency || Number(payment.amount.value) !== intent.amount) {
+    throw new Error("Сумма платежа не совпадает с заявкой");
+  }
+
+  intent.externalId = payment.id;
+  intent.status = mapYooKassaStatus(payment);
+  intent.updatedAt = nowIso();
+  intent.failureReason = payment.cancellation_details?.reason ?? "";
+  if (intent.status === "succeeded" && !intent.depositId) {
+    const deposit = addDeposit(data, {
+      serviceId: intent.serviceId,
+      userId: intent.userId,
+      amount: intent.amount,
+      currency: intent.currency,
+      comment: intent.comment || intent.description,
+      source: "payment"
+    });
+    intent.depositId = deposit.id;
+    intent.paidAt = nowIso();
+    addNotification(data, {
+      serviceId: intent.serviceId,
+      userId: intent.userId,
+      kind: "payment",
+      message: `Платёж ${intent.amount.toFixed(2)} ${intent.currency} подтверждён`,
+      status: "sent"
+    });
+  }
+  return intent;
+}
+
+const loginAttempts = new Map<string, { count: number; resetAt: number }>();
+
+app.get("/api/health", (_req, res) => {
+  res.json({ ok: true, status: "ready", serverTime: nowIso() });
+});
+
 app.get("/api/auth/users", (_req, res) => {
   res.json(ok(authUsers(store.read())));
 });
 
 app.post("/api/auth/login", (req, res) => {
   try {
+    const attemptKey = `${req.ip}:${String(req.body.userId ?? "")}`;
+    const current = loginAttempts.get(attemptKey);
+    if (current && current.resetAt > Date.now() && current.count >= 8) {
+      res.setHeader("Retry-After", String(Math.ceil((current.resetAt - Date.now()) / 1000)));
+      throw new Error("Слишком много попыток. Повторите вход через несколько минут");
+    }
     const data = store.read();
     const user = data.users.find((item) => item.id === String(req.body.userId ?? ""));
     if (!user) throw new Error("Пользователь не найден");
     if (!user.password) throw new Error("Пароль не задан");
-    if (String(req.body.password ?? "") !== user.password) throw new Error("Неверный пароль");
+    if (!verifyPassword(user.password, String(req.body.password ?? ""))) {
+      const next = current && current.resetAt > Date.now() ? current : { count: 0, resetAt: Date.now() + 10 * 60_000 };
+      next.count += 1;
+      loginAttempts.set(attemptKey, next);
+      throw new Error("Неверный пароль");
+    }
 
     const token = issueAuthToken(data, user);
     store.persist();
-    res.json(ok({ token, userId: user.id, state: apiState() }));
+    loginAttempts.delete(attemptKey);
+    res.json(ok({ token, userId: user.id, state: apiState(user) }));
   } catch (error) {
     res.status(401).json(fail(error));
   }
@@ -1020,8 +1129,173 @@ app.post("/api/auth/logout", (req, res) => {
 
 app.use("/api", authMiddleware);
 
-app.get("/api/state", (_req, res) => {
-  res.json(ok(apiState()));
+app.get("/api/state", (req, res) => {
+  res.json(ok(apiState(authUserFromRequest(req))));
+});
+
+app.get("/api/payments", (req, res) => {
+  const actor = authUserFromRequest(req)!;
+  const payments = (actor.botAdmin ? store.read().payments : store.read().payments.filter((item) => item.userId === actor.id))
+    .slice()
+    .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+  res.json(ok(payments));
+});
+
+app.post("/api/payments", async (req, res) => {
+  try {
+    const actor = authUserFromRequest(req)!;
+    const data = store.read();
+    const userId = actor.botAdmin && req.body.userId ? String(req.body.userId) : actor.id;
+    const user = data.users.find((item) => item.id === userId);
+    if (!user) throw new Error("Пользователь не найден");
+    const serviceId = String(req.body.serviceId ?? "");
+    const amount = roundMoney(normalizeNumber(req.body.amount, 0));
+    if (amount <= 0 || amount > 1_000_000) throw new Error("Укажите сумму от 0,01 до 1 000 000");
+    const method = String(req.body.method ?? "manual") as PaymentMethod;
+    if (!["manual", "sbp", "sberbank"].includes(method)) throw new Error("Способ оплаты не поддерживается");
+    const currency = method === "manual" ? String(req.body.currency ?? "RUB").toUpperCase() : "RUB";
+    if (!data.currencies.some((item) => item.code === currency)) throw new Error("Валюта не найдена");
+    const settings = data.settings.payments;
+    if (method === "manual" && !settings.manualEnabled) throw new Error("Ручное пополнение отключено");
+    if (method === "sbp" && (!settings.enabled || !settings.sbpEnabled)) throw new Error("Оплата через СБП отключена");
+    if (method === "sberbank" && (!settings.enabled || !settings.sberPayEnabled)) throw new Error("Оплата через СберБанк Онлайн отключена");
+
+    const createdAt = nowIso();
+    const intent: PaymentIntent = {
+      id: id("pay"),
+      userId,
+      serviceId,
+      amount,
+      currency,
+      method,
+      provider: method === "manual" ? "manual" : "yookassa",
+      status: method === "manual" ? "succeeded" : "pending",
+      externalId: "",
+      confirmationUrl: "",
+      description: paymentDescription(data, user, serviceId),
+      comment: String(req.body.comment ?? "").trim().slice(0, 500),
+      depositId: null,
+      failureReason: "",
+      createdAt,
+      updatedAt: createdAt,
+      paidAt: method === "manual" ? createdAt : null
+    };
+
+    store.write((current) => {
+      if (method === "manual") {
+        const deposit = addDeposit(current, {
+          serviceId,
+          userId,
+          amount,
+          currency,
+          comment: intent.comment || "Ручное пополнение",
+          source: "manual"
+        });
+        intent.depositId = deposit.id;
+      } else {
+        const membership = current.memberships.find(
+          (item) => item.serviceId === serviceId && item.userId === userId && item.active
+        );
+        if (!membership) throw new Error("Пользователь не закреплён за сервисом");
+      }
+      current.payments.unshift(intent);
+    });
+
+    if (method !== "manual") {
+      try {
+        const baseUrl = String(process.env.PUBLIC_BASE_URL || `${req.protocol}://${req.get("host")}`).replace(/\/$/, "");
+        const providerPayment = await createYooKassaPayment(settings, intent, `${baseUrl}/?payment=${intent.id}`);
+        store.write((current) => {
+          const currentIntent = current.payments.find((item) => item.id === intent.id);
+          if (!currentIntent) throw new Error("Заявка на оплату не найдена");
+          currentIntent.externalId = providerPayment.id;
+          currentIntent.confirmationUrl = providerPayment.confirmation?.confirmation_url ?? "";
+          currentIntent.status = mapYooKassaStatus(providerPayment);
+          currentIntent.updatedAt = nowIso();
+        });
+      } catch (error) {
+        store.write((current) => {
+          const currentIntent = current.payments.find((item) => item.id === intent.id);
+          if (currentIntent) {
+            currentIntent.status = "failed";
+            currentIntent.failureReason = error instanceof Error ? error.message : "Ошибка платёжного провайдера";
+            currentIntent.updatedAt = nowIso();
+          }
+        });
+        throw error;
+      }
+    }
+
+    const saved = store.read().payments.find((item) => item.id === intent.id)!;
+    res.json(ok({ payment: saved, state: apiState(actor) }));
+  } catch (error) {
+    res.status(400).json(fail(error));
+  }
+});
+
+app.post("/api/payments/:id/refresh", async (req, res) => {
+  try {
+    const actor = authUserFromRequest(req)!;
+    const data = store.read();
+    const intent = data.payments.find((item) => item.id === req.params.id);
+    if (!intent || (!actor.botAdmin && intent.userId !== actor.id)) throw new Error("Платёж не найден");
+    if (intent.provider !== "yookassa") throw new Error("Ручной платёж уже обработан");
+    const providerPayment = await getYooKassaPayment(data.settings.payments, intent.externalId);
+    store.write((current) => {
+      const currentIntent = current.payments.find((item) => item.id === intent.id)!;
+      applyProviderPayment(current, currentIntent, providerPayment);
+    });
+    res.json(ok({ payment: store.read().payments.find((item) => item.id === intent.id), state: apiState(actor) }));
+  } catch (error) {
+    res.status(400).json(fail(error));
+  }
+});
+
+app.post("/api/payments/yookassa/webhook", async (req, res) => {
+  try {
+    const paymentId = String(req.body?.object?.id ?? "");
+    if (!paymentId) throw new Error("Платёж не указан");
+    const data = store.read();
+    const intent = data.payments.find((item) => item.externalId === paymentId);
+    if (!intent) throw new Error("Заявка на оплату не найдена");
+    const verified = await getYooKassaPayment(data.settings.payments, paymentId);
+    store.write((current) => {
+      const currentIntent = current.payments.find((item) => item.id === intent.id)!;
+      applyProviderPayment(current, currentIntent, verified);
+    });
+    res.json({ ok: true });
+  } catch (error) {
+    res.status(400).json(fail(error));
+  }
+});
+
+app.put("/api/settings/payments", (req, res) => {
+  try {
+    const actor = requireAdmin(req);
+    store.write((data) => {
+      const current = data.settings.payments;
+      const secretKey = String(req.body.secretKey ?? "").trim();
+      data.settings.payments = {
+        ...current,
+        enabled: Boolean(req.body.enabled),
+        provider: "yookassa",
+        manualEnabled: Boolean(req.body.manualEnabled),
+        sbpEnabled: Boolean(req.body.sbpEnabled),
+        sberPayEnabled: Boolean(req.body.sberPayEnabled),
+        shopId: String(req.body.shopId ?? current.shopId).trim(),
+        secretKey: secretKey || current.secretKey,
+        secretKeySet: Boolean(secretKey || current.secretKey),
+        recipientName: String(req.body.recipientName ?? current.recipientName).trim(),
+        bankName: String(req.body.bankName ?? current.bankName).trim(),
+        phone: String(req.body.phone ?? current.phone).trim(),
+        account: String(req.body.account ?? current.account).trim(),
+        paymentPurpose: String(req.body.paymentPurpose ?? current.paymentPurpose).trim().slice(0, 200)
+      };
+    });
+    res.json(ok(apiState(actor)));
+  } catch (error) {
+    res.status(400).json(fail(error));
+  }
 });
 
 app.get("/api/dashboard", async (req, res) => {
@@ -1115,18 +1389,16 @@ app.post("/api/latency/measurements", async (req, res) => {
         checkedAt
       });
 
-      if (!latencyAggregator.enabled) {
-        fallbackChecks.push({
-          id: id("lat"),
-          serviceId: service.id,
-          userId: null,
-          status,
-          latencyMs,
-          checkedAt,
-          error,
-          createdAt: nowIso()
-        });
-      }
+      fallbackChecks.push({
+        id: id("lat"),
+        serviceId: service.id,
+        userId: null,
+        status,
+        latencyMs,
+        checkedAt,
+        error,
+        createdAt: nowIso()
+      });
 
       if (service.connection.lastStatus !== "maintenance" || status === "maintenance") {
         service.connection.lastStatus = status;
@@ -1136,9 +1408,8 @@ app.post("/api/latency/measurements", async (req, res) => {
       }
     }
 
-    if (!latencyAggregator.enabled && fallbackChecks.length > 0) {
+    if (fallbackChecks.length > 0) {
       data.latencyChecks.unshift(...fallbackChecks.reverse());
-      data.latencyChecks = data.latencyChecks.slice(0, 2000);
     }
 
     store.persist();
@@ -1404,36 +1675,28 @@ app.post("/api/wall/files", async (req, res) => {
 
   const contentLength = Number(req.header("content-length") ?? 0);
   if (contentLength > maxWallFileSize) {
-    res.status(413).json(fail(new Error("Файл больше 2 ГБ")));
+    res.status(413).json(fail(new Error(`Файл больше ${Math.round(maxWallFileSize / 1024 / 1024)} МБ`)));
     return;
   }
 
   const fileId = id("wfile");
   const originalName = safeFileName(decodeHeaderValue(req.header("x-file-name"), "file"));
   const storageName = `${fileId}_${originalName}`;
-  const filePath = path.join(wallFilesDir, storageName);
   let received = 0;
 
   try {
-    fs.mkdirSync(wallFilesDir, { recursive: true });
+    const chunks: Buffer[] = [];
     await new Promise<void>((resolve, reject) => {
-      const output = fs.createWriteStream(filePath);
-      const failUpload = (error: Error) => {
-        output.destroy();
-        fs.rmSync(filePath, { force: true });
-        reject(error);
-      };
-
       req.on("data", (chunk: Buffer) => {
         received += chunk.length;
         if (received > maxWallFileSize) {
-          req.destroy(new Error("Файл больше 2 ГБ"));
+          reject(new Error(`Файл больше ${Math.round(maxWallFileSize / 1024 / 1024)} МБ`));
+          return;
         }
+        chunks.push(Buffer.from(chunk));
       });
-      req.on("error", failUpload);
-      output.on("error", failUpload);
-      output.on("finish", resolve);
-      req.pipe(output);
+      req.on("end", resolve);
+      req.on("error", reject);
     });
 
     const file: WallFile = {
@@ -1447,23 +1710,23 @@ app.post("/api/wall/files", async (req, res) => {
       createdAt: nowIso()
     };
 
-    store.write((current) => {
-      current.wallFiles.unshift(file);
-    });
+    store.saveWallFile(file, Buffer.concat(chunks));
 
     res.json(ok(publicWallFile(file)));
   } catch (error) {
-    fs.rmSync(filePath, { force: true });
-    res.status(400).json(fail(error));
+    res.status(received > maxWallFileSize ? 413 : 400).json(fail(error));
   }
 });
 
 app.post("/api/wall/files/cleanup", (req, res) => {
   try {
+    const before = new Set(store.read().wallFiles.map((file) => file.id));
     store.write((data) => {
       getRequestActor(req, data, req.query.userId ?? req.body?.userId);
       cleanupUnusedWallFiles(data, normalizeStringList(req.body?.fileIds));
     });
+    const after = new Set(store.read().wallFiles.map((file) => file.id));
+    for (const fileId of before) if (!after.has(fileId)) store.deleteWallFileBlob(fileId);
     res.json(ok(wallListData(store.read(), req.query as Record<string, unknown>)));
   } catch (error) {
     res.status(400).json(fail(error));
@@ -1480,16 +1743,20 @@ app.get("/api/wall/files/:id/download", (req, res) => {
         if (!current.wallFiles.some((item) => item.id === file!.id)) current.wallFiles.unshift(file!);
       });
     }
-    const filePath = path.join(wallFilesDir, file.storageName);
-    if (!fs.existsSync(filePath)) throw new Error("Файл отсутствует на сервере");
+    let content = store.readWallFile(file.id);
+    if (!content && file.storageName) {
+      const legacyPath = path.join(wallFilesDir, file.storageName);
+      if (fs.existsSync(legacyPath)) content = fs.readFileSync(legacyPath);
+    }
+    if (!content) throw new Error("Файл отсутствует в базе данных");
 
     res.setHeader("Content-Type", file.mimeType || "application/octet-stream");
-    res.setHeader("Content-Length", String(file.size));
+    res.setHeader("Content-Length", String(content.length));
     res.setHeader(
       "Content-Disposition",
       `inline; filename="${safeFileName(file.originalName).replace(/"/g, "")}"; filename*=UTF-8''${encodeURIComponent(file.originalName)}`
     );
-    fs.createReadStream(filePath).pipe(res);
+    res.send(content);
   } catch (error) {
     res.status(404).json(fail(error));
   }
@@ -1515,6 +1782,7 @@ app.delete("/api/wall/files/:id", (req, res) => {
       }
     });
 
+    store.deleteWallFileBlob(req.params.id);
     if (storageName) removeWallFileFromDisk({ storageName });
     res.json(ok(wallListData(store.read(), req.query as Record<string, unknown>)));
   } catch (error) {
@@ -1522,47 +1790,76 @@ app.delete("/api/wall/files/:id", (req, res) => {
   }
 });
 
-app.get("/api/database/export", (req, res) => {
+app.get("/api/database/export", async (req, res) => {
+  let tempDir = "";
   try {
     requireAdmin(req);
-    const payload = JSON.stringify(store.exportData(), null, 2);
-    res.setHeader("Content-Type", "application/json; charset=utf-8");
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "service-payment-export-"));
+    const destination = path.join(tempDir, backupFileName());
+    await store.backupTo(destination);
+    res.setHeader("Content-Type", "application/vnd.sqlite3");
     res.setHeader("Content-Disposition", `attachment; filename="${backupFileName()}"`);
-    res.send(payload);
+    res.sendFile(destination, () => fs.rmSync(tempDir, { recursive: true, force: true }));
   } catch (error) {
+    if (tempDir) fs.rmSync(tempDir, { recursive: true, force: true });
     res.status(403).json(fail(error));
   }
 });
 
-app.post("/api/database/import", (req, res) => {
+app.post("/api/database/import", async (req, res) => {
+  let tempDir = "";
   try {
     requireAdmin(req);
-    store.replace(req.body);
-    res.json(ok(apiState()));
+    if (req.is("application/json")) {
+      store.replace(req.body);
+    } else {
+      tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "service-payment-import-"));
+      const source = path.join(tempDir, "import.sqlite");
+      const maxBackupSize = Math.max(100, Number(process.env.MAX_BACKUP_MB ?? 2048)) * 1024 * 1024;
+      let received = 0;
+      await new Promise<void>((resolve, reject) => {
+        const output = fs.createWriteStream(source, { flags: "wx" });
+        req.on("data", (chunk: Buffer) => {
+          received += chunk.length;
+          if (received > maxBackupSize) {
+            output.destroy(new Error("Резервная копия слишком большая"));
+            return;
+          }
+        });
+        req.on("error", reject);
+        output.on("error", reject);
+        output.on("finish", resolve);
+        req.pipe(output);
+      });
+      store.replaceWithDatabase(source);
+    }
+    res.json(ok(apiState(authUserFromRequest(req))));
   } catch (error) {
     res.status(400).json(fail(error));
+  } finally {
+    if (tempDir) fs.rmSync(tempDir, { recursive: true, force: true });
   }
 });
 
 app.post("/api/system/update", async (req, res) => {
   try {
     requireAdmin(req);
-    const steps = process.platform === "win32" ? await runLocalGitUpdate() : [await runRawUbuntuUpdate()];
-
-    const restart = scheduleServiceRestart();
+    const update = process.platform === "win32"
+      ? { scheduled: false, steps: await runLocalGitUpdate(), restart: scheduleServiceRestart() }
+      : scheduleUbuntuUpdate();
     store.write((data) => {
       addNotification(data, {
         serviceId: data.services[0]?.id ?? "",
         userId: null,
         kind: "system",
-        message: restart.scheduled
-          ? `Обновление установлено. Перезапуск: ${restart.serviceUnit}`
-          : `Обновление установлено. ${restart.reason}`,
+        message: update.scheduled
+          ? "Безопасное обновление запущено. После сборки сервис перезапустится автоматически"
+          : "Обновление установлено; перезапуск запланирован",
         status: "sent"
       });
     });
 
-    res.json(ok({ steps, restart }));
+    res.status(202).json(ok(update));
   } catch (error) {
     const data = store.read();
     addNotification(data, {
@@ -1758,10 +2055,7 @@ app.post("/api/services/:id/health", async (req, res) => {
       checkedAt
     });
 
-    if (!latencyAggregator.enabled) {
-      data.latencyChecks.unshift(check);
-      data.latencyChecks = data.latencyChecks.slice(0, 2000);
-    }
+    data.latencyChecks.unshift(check);
 
     if (service.connection.lastStatus !== "maintenance" || status === "maintenance") {
       service.connection.lastStatus = status;
@@ -2126,10 +2420,14 @@ app.put("/api/settings/telegram", (req, res) => {
     requireAdmin(req);
     store.write((data) => {
       data.settings.telegram.enabled = Boolean(req.body.enabled);
-      data.settings.telegram.botToken = String(req.body.botToken ?? "");
+      const botToken = String(req.body.botToken ?? "").trim();
+      if (botToken) data.settings.telegram.botToken = botToken;
       data.settings.telegram.chatId = String(req.body.chatId ?? "");
       data.settings.telegram.notificationTopicId = String(req.body.notificationTopicId ?? "");
-      data.settings.telegram.webhookSecret = String(req.body.webhookSecret ?? data.settings.telegram.webhookSecret);
+      const webhookSecret = String(req.body.webhookSecret ?? "").trim();
+      if (webhookSecret) data.settings.telegram.webhookSecret = webhookSecret;
+      data.settings.telegram.botTokenSet = Boolean(data.settings.telegram.botToken);
+      data.settings.telegram.webhookSecretSet = Boolean(data.settings.telegram.webhookSecret);
       data.settings.telegram.lowBalanceNotifications = Boolean(req.body.lowBalanceNotifications);
       data.settings.telegram.monthlySummary = Boolean(req.body.monthlySummary);
       data.settings.telegram.pollingEnabled = Boolean(req.body.pollingEnabled);
@@ -2150,8 +2448,8 @@ app.put("/api/settings/security", (req, res) => {
     store.write((data) => {
       validateAdminPassword(data, req.body.currentPassword);
       const nextPassword = String(req.body.newPassword ?? "").trim();
-      if (!nextPassword) throw new Error("Укажите новый пароль администратора");
-      data.settings.security.adminPassword = nextPassword;
+      assertStrongPassword(nextPassword);
+      data.settings.security.adminPassword = hashPassword(nextPassword);
       data.settings.security.adminPasswordSet = true;
     });
 
@@ -2189,7 +2487,10 @@ app.post("/api/telegram/configure", async (req, res) => {
   try {
     requireAdmin(req);
     const data = store.read();
-    await configureTelegramIntegration(data, String(req.body.webhookUrl ?? ""));
+    const baseUrl = String(process.env.PUBLIC_BASE_URL || `${req.protocol}://${req.get("host")}`).replace(/\/$/, "");
+    const secret = data.settings.telegram.webhookSecret;
+    if (!secret) throw new Error("Сначала сохраните webhook secret");
+    await configureTelegramIntegration(data, `${baseUrl}/api/telegram/webhook/${encodeURIComponent(secret)}`);
     store.persist();
     res.json(ok(apiState()));
   } catch (error) {
@@ -2318,63 +2619,65 @@ function processDueAutoDeposits() {
   });
 }
 
-setInterval(() => {
-  processDueServices().catch((error) => {
-    const data = store.read();
-    addNotification(data, {
-      serviceId: data.services[0]?.id ?? "",
-      userId: null,
-      kind: "system",
-      message: error instanceof Error ? error.message : "Ошибка планировщика",
-      status: "failed"
-    });
-    store.persist();
-  });
-}, 60_000);
-
-processDueServices().catch(() => undefined);
-setInterval(() => {
-  try {
-    processDueAutoDeposits();
-  } catch (error) {
-    const data = store.read();
-    addNotification(data, {
-      serviceId: data.services[0]?.id ?? "",
-      userId: null,
-      kind: "system",
-      message: error instanceof Error ? error.message : "Ошибка планировщика автоплатежей",
-      status: "failed"
-    });
-    store.persist();
-  }
-}, 60_000);
-processDueAutoDeposits();
-
-let telegramPollingBusy = false;
-setInterval(() => {
-  if (telegramPollingBusy) return;
-  telegramPollingBusy = true;
-  const data = store.read();
-  pollTelegramUpdates(data)
-    .then((count) => {
-      if (count > 0 || data.settings.telegram.lastError) store.persist();
-    })
-    .catch((error) => {
-      const current = store.read();
-      current.settings.telegram.lastError = error instanceof Error ? error.message : "Telegram polling error";
-      addNotification(current, {
-        serviceId: current.services[0]?.id ?? "",
+if (process.env.DISABLE_BACKGROUND_JOBS !== "true") {
+  setInterval(() => {
+    processDueServices().catch((error) => {
+      const data = store.read();
+      addNotification(data, {
+        serviceId: data.services[0]?.id ?? "",
         userId: null,
         kind: "system",
-        message: current.settings.telegram.lastError,
+        message: error instanceof Error ? error.message : "Ошибка планировщика",
         status: "failed"
       });
       store.persist();
-    })
-    .finally(() => {
-      telegramPollingBusy = false;
     });
-}, 4_000);
+  }, 60_000);
+
+  processDueServices().catch(() => undefined);
+  setInterval(() => {
+    try {
+      processDueAutoDeposits();
+    } catch (error) {
+      const data = store.read();
+      addNotification(data, {
+        serviceId: data.services[0]?.id ?? "",
+        userId: null,
+        kind: "system",
+        message: error instanceof Error ? error.message : "Ошибка планировщика автоплатежей",
+        status: "failed"
+      });
+      store.persist();
+    }
+  }, 60_000);
+  processDueAutoDeposits();
+
+  let telegramPollingBusy = false;
+  setInterval(() => {
+    if (telegramPollingBusy) return;
+    telegramPollingBusy = true;
+    const data = store.read();
+    pollTelegramUpdates(data)
+      .then((count) => {
+        if (count > 0 || data.settings.telegram.lastError) store.persist();
+      })
+      .catch((error) => {
+        const current = store.read();
+        current.settings.telegram.lastError = error instanceof Error ? error.message : "Telegram polling error";
+        addNotification(current, {
+          serviceId: current.services[0]?.id ?? "",
+          userId: null,
+          kind: "system",
+          message: current.settings.telegram.lastError,
+          status: "failed"
+        });
+        store.persist();
+      })
+      .finally(() => {
+        telegramPollingBusy = false;
+      });
+  }, 4_000);
+}
 
 const distDir = path.resolve(process.cwd(), "dist");
 app.use(express.static(distDir));

@@ -7,12 +7,15 @@
     "dev": "concurrently \"npm:dev:server\" \"npm:dev:client\"",
     "dev:client": "vite --host 0.0.0.0",
     "dev:server": "tsx watch server/index.ts",
+    "test": "tsx --test server/**/*.test.ts",
+    "test:e2e": "playwright test",
     "build": "tsc --noEmit && vite build",
     "start": "tsx server/index.ts"
   },
   "dependencies": {
     "@types/ws": "^8.18.1",
     "@vitejs/plugin-react": "^5.1.1",
+    "better-sqlite3": "^13.0.2",
     "concurrently": "^10.0.3",
     "express": "^5.2.1",
     "lucide-react": "^0.468.0",
@@ -26,6 +29,8 @@
     "ws": "^8.21.0"
   },
   "devDependencies": {
+    "@playwright/test": "^1.62.1",
+    "@types/better-sqlite3": "^9.6.0",
     "@types/express": "^5.0.6",
     "@types/node": "^25.0.2",
     "@types/pg": "^8.20.0",

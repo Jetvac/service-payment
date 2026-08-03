@@ -6,6 +6,7 @@ import type {
   Deposit,
   Membership,
   Notification,
+  PaymentSettings,
   Service,
   ServiceConnectionSettings,
   ServiceSummary,
@@ -48,8 +49,27 @@ export function defaultServiceConnection(): ServiceConnectionSettings {
   };
 }
 
+export function defaultPaymentSettings(): PaymentSettings {
+  return {
+    enabled: true,
+    provider: "yookassa",
+    manualEnabled: true,
+    sbpEnabled: false,
+    sberPayEnabled: false,
+    shopId: "",
+    secretKey: "",
+    secretKeySet: false,
+    recipientName: "",
+    bankName: "",
+    phone: "",
+    account: "",
+    paymentPurpose: "Оплата VPN-сервиса"
+  };
+}
+
 export function seedData(): AppData {
   const createdAt = nowIso();
+  const initialPassword = process.env.INITIAL_ADMIN_PASSWORD || "admin";
   const userA = id("usr");
   const userB = id("usr");
   const serviceId = id("svc");
@@ -70,7 +90,7 @@ export function seedData(): AppData {
         avatarUrl: "",
         commandDepositsBlocked: false,
         botAdmin: true,
-        password: "admin",
+        password: initialPassword,
         passwordSet: true,
         notes: "",
         createdAt
@@ -84,7 +104,7 @@ export function seedData(): AppData {
         avatarUrl: "",
         commandDepositsBlocked: false,
         botAdmin: false,
-        password: "admin",
+        password: initialPassword,
         passwordSet: true,
         notes: "",
         createdAt
@@ -123,6 +143,7 @@ export function seedData(): AppData {
     debits: [],
     latencyChecks: [],
     notifications: [],
+    payments: [],
     wallTags: [],
     wallFiles: [],
     wallPosts: [],
@@ -142,9 +163,10 @@ export function seedData(): AppData {
         lastError: ""
       },
       security: {
-        adminPassword: "admin",
+        adminPassword: initialPassword,
         adminPasswordSet: true
-      }
+      },
+      payments: defaultPaymentSettings()
     }
   };
 }
@@ -406,7 +428,6 @@ export function addNotification(
   };
 
   data.notifications.unshift(notification);
-  data.notifications = data.notifications.slice(0, 200);
   return notification;
 }
 
@@ -476,9 +497,13 @@ export function advanceChargeDate(service: Service, from: Date) {
   const { period, interval, anchorDay, anchorHour, shiftDays } = service.billing;
 
   if (period === "month") {
-    const base = new Date(from);
-    base.setMonth(base.getMonth() + Math.max(1, interval || 1));
-    return buildNextChargeDate(base, period, interval, anchorDay, anchorHour, shiftDays);
+    return buildMonthlyDate(
+      from.getFullYear(),
+      from.getMonth() + Math.max(1, interval || 1),
+      anchorDay,
+      anchorHour,
+      shiftDays
+    );
   }
 
   const next = new Date(from);
