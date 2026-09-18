@@ -6,21 +6,16 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { Client } from "ssh2";
 import { WebSocketServer } from "ws";
 import { Store } from "./store";
-import { latencyAggregator } from "./latencyAggregator";
 import type {
   AppData,
   AutoDeposit,
   BillingPeriod,
   Currency,
-  LatencyCheck,
   PaymentIntent,
   PaymentMethod,
   Service,
-  ServiceConnectionSettings,
-  ServiceHealthStatus,
   User,
   WallComment,
   WallFile,
@@ -36,7 +31,6 @@ import {
   cancelDebit,
   cancelDeposit,
   computeSummaries,
-  defaultServiceConnection,
   ensureMembership,
   id,
   normalizeNumber,
@@ -53,7 +47,6 @@ import {
   pollTelegramUpdates,
   sendLowBalanceWarnings,
   sendServiceBalanceSummary,
-  sendServiceMaintenanceNotice,
   sendTelegramMessage
 } from "./telegram";
 import { assertStrongPassword, hashPassword, sessionExpiresAt, sessionIsActive, verifyPassword } from "./security";
@@ -65,9 +58,7 @@ const realtime = new WebSocketServer({ server, path: "/api/realtime" });
 const port = Number(process.env.PORT ?? 4077);
 const store = new Store();
 const execFileAsync = promisify(execFile);
-if (process.env.DISABLE_BACKGROUND_JOBS !== "true") latencyAggregator.start();
-const latencyLineColors = ["#7aa8ff", "#47d18c", "#f8c15d", "#ff8b82", "#b994ff", "#5ed4d6", "#f49ac2", "#c6cad2"];
-const wallFilesDir = path.resolve(process.cwd(), "data", "wall-files");
+const wallFilesDir = path.resolve(process.env.APP_DATA_DIR || path.join(process.cwd(), "data"), "wall-files");
 const maxWallFileSize = Math.max(1, Number(process.env.MAX_UPLOAD_MB ?? 50)) * 1024 * 1024;
 
 app.use(express.json({ limit: "25mb" }));
@@ -401,107 +392,12 @@ function plainDate(value: string) {
   }).format(new Date(value));
 }
 
-function readTime(value: unknown) {
-  const raw = String(value ?? "");
-  if (!raw) return null;
-  const time = new Date(raw).getTime();
-  return Number.isFinite(time) ? time : null;
-}
-
-function latencyBucketSize(rangeMs: number) {
-  const hour = 60 * 60 * 1000;
-  const day = 24 * hour;
-  if (rangeMs <= 2 * day) return 30 * 60 * 1000;
-  if (rangeMs <= 14 * day) return 6 * hour;
-  if (rangeMs <= 90 * day) return day;
-  if (rangeMs <= 370 * day) return 7 * day;
-  return 31 * day;
-}
-
-function latencyBucketLabel(bucketTime: number, bucketSize: number) {
-  const date = new Date(bucketTime);
-  const day = 24 * 60 * 60 * 1000;
-  if (bucketSize < day) {
-    return new Intl.DateTimeFormat("ru-RU", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" }).format(date);
-  }
-  return new Intl.DateTimeFormat("ru-RU", { day: "2-digit", month: "2-digit", year: "2-digit" }).format(date);
-}
-
-function latencyChartData(data: AppData, query: Record<string, unknown>) {
-  const from = readTime(query.from);
-  const to = readTime(query.to);
-  const rangeMs = Math.max(1, (to ?? Date.now()) - (from ?? ((to ?? Date.now()) - 7 * 24 * 60 * 60 * 1000)));
-  const bucketSize = latencyBucketSize(rangeMs);
-  const userId = String(query.userId ?? "");
-  const knownUserIds = new Set(data.users.map((user) => user.id));
-  const checks = data.latencyChecks
-    .filter((check) => !check.userId || knownUserIds.has(check.userId))
-    .filter((check) => !userId || check.userId === userId)
-    .filter((check) => {
-      const checkedAt = new Date(check.checkedAt).getTime();
-      return (!from || checkedAt >= from) && (!to || checkedAt <= to);
-    });
-
-  const latencySeries: Array<{ key: string; name: string; color: string }> = [];
-  const latencySeriesByPair = new Map<string, { key: string; name: string; color: string }>();
-  const latencyBuckets = new Map<string, { time: string; ts: number; sums: Record<string, { sum: number; count: number }> }>();
-
-  for (const check of checks.filter((item) => item.latencyMs !== null).slice(0, 5000).reverse()) {
-    const user = data.users.find((item) => item.id === check.userId);
-    const service = data.services.find((item) => item.id === check.serviceId);
-    const pair = `${check.userId ?? "unknown"}:${check.serviceId}`;
-    let series = latencySeriesByPair.get(pair);
-    if (!series && latencySeries.length < latencyLineColors.length) {
-      series = {
-        key: `latency_${latencySeries.length}`,
-        name: userId ? service?.name ?? "Сервис" : `${user?.name ?? "Не выбран"} · ${service?.name ?? "Сервис"}`,
-        color: latencyLineColors[latencySeries.length]
-      };
-      latencySeriesByPair.set(pair, series);
-      latencySeries.push(series);
-    }
-    if (!series) continue;
-
-    const checkedAt = new Date(check.checkedAt).getTime();
-    const bucketTime = Math.floor(checkedAt / bucketSize) * bucketSize;
-    const bucketId = String(bucketTime);
-    const bucket =
-      latencyBuckets.get(bucketId) ??
-      {
-        time: latencyBucketLabel(bucketTime, bucketSize),
-        ts: bucketTime,
-        sums: {}
-      };
-    const current = bucket.sums[series.key] ?? { sum: 0, count: 0 };
-    current.sum += check.latencyMs ?? 0;
-    current.count += 1;
-    bucket.sums[series.key] = current;
-    latencyBuckets.set(bucketId, bucket);
-  }
-
-  return {
-    latencyTimeline: Array.from(latencyBuckets.values())
-      .sort((a, b) => a.ts - b.ts)
-      .slice(-160)
-      .map((bucket) => {
-        const point: Record<string, string | number> = { time: bucket.time };
-        for (const series of latencySeries) {
-          const value = bucket.sums[series.key];
-          if (value) point[series.key] = Math.round(value.sum / value.count);
-        }
-        return point;
-      }),
-    latencySeries
-  };
-}
-
 function dashboardData(data: AppData, query: Record<string, unknown>) {
   const notificationPage = readPage(
     { offset: query.notificationOffset, limit: query.notificationLimit },
     8,
     50
   );
-  const latencyPage = readPage({ offset: query.latencyOffset, limit: query.latencyLimit }, 20, 100);
   const rate = (code: string) => data.currencies.find((currency) => currency.code === code)?.rateToRub ?? 1;
 
   const byDate = new Map<string, { date: string; deposits: number; debits: number }>();
@@ -518,89 +414,13 @@ function dashboardData(data: AppData, query: Record<string, unknown>) {
     ensure(debit.createdAt).debits += debit.amountBalanceCurrency ?? debit.amount * rate(debit.currency);
   }
 
-  const latencySeries: Array<{ key: string; name: string; color: string }> = [];
-  const latencySeriesByPair = new Map<string, { key: string; name: string; color: string }>();
-  const latencyBuckets = new Map<string, { time: string; ts: number; sums: Record<string, { sum: number; count: number }> }>();
-  const knownUserIds = new Set(data.users.map((user) => user.id));
-  const knownLatencyChecks = data.latencyChecks.filter((check) => !check.userId || knownUserIds.has(check.userId));
-
-  for (const check of knownLatencyChecks.filter((item) => item.latencyMs !== null).slice(0, 240).reverse()) {
-    const user = data.users.find((item) => item.id === check.userId);
-    const service = data.services.find((item) => item.id === check.serviceId);
-    const pair = `${check.userId ?? "unknown"}:${check.serviceId}`;
-    let series = latencySeriesByPair.get(pair);
-    if (!series && latencySeries.length < latencyLineColors.length) {
-      series = {
-        key: `latency_${latencySeries.length}`,
-        name: `${user?.name ?? "Не выбран"} · ${service?.name ?? "Сервис"}`,
-        color: latencyLineColors[latencySeries.length]
-      };
-      latencySeriesByPair.set(pair, series);
-      latencySeries.push(series);
-    }
-    if (!series) continue;
-
-    const bucketDate = new Date(check.checkedAt);
-    bucketDate.setSeconds(0, 0);
-    const bucketId = bucketDate.toISOString();
-    const bucket =
-      latencyBuckets.get(bucketId) ??
-      {
-        time: new Intl.DateTimeFormat("ru-RU", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" }).format(bucketDate),
-        ts: bucketDate.getTime(),
-        sums: {}
-      };
-    const current = bucket.sums[series.key] ?? { sum: 0, count: 0 };
-    current.sum += check.latencyMs ?? 0;
-    current.count += 1;
-    bucket.sums[series.key] = current;
-    latencyBuckets.set(bucketId, bucket);
-  }
-
-  const selectedLatencyChart = latencyChartData(data, { from: query.latencyFrom, to: query.latencyTo });
-  const latencyStats = new Map<string, { name: string; sum: number; count: number }>();
-  for (const check of knownLatencyChecks) {
-    if (check.latencyMs === null || !check.userId) continue;
-    const user = data.users.find((item) => item.id === check.userId);
-    if (!user) continue;
-    const current = latencyStats.get(check.userId) ?? { name: user?.name ?? "Участник", sum: 0, count: 0 };
-    current.sum += check.latencyMs;
-    current.count += 1;
-    latencyStats.set(check.userId, current);
-  }
-
   return {
     chart: Array.from(byDate.values()).reverse().slice(-14),
-    latencyTimeline: selectedLatencyChart.latencyTimeline.length ? selectedLatencyChart.latencyTimeline : Array.from(latencyBuckets.values())
-      .sort((a, b) => a.ts - b.ts)
-      .slice(-40)
-      .map((bucket) => {
-        const point: Record<string, string | number> = { time: bucket.time };
-        for (const series of latencySeries) {
-          const value = bucket.sums[series.key];
-          if (value) point[series.key] = Math.round(value.sum / value.count);
-        }
-        return point;
-      }),
-    latencySeries: selectedLatencyChart.latencySeries.length ? selectedLatencyChart.latencySeries : latencySeries,
-    latencyByUser: Array.from(latencyStats.values())
-      .map((item) => ({ name: item.name, avg: Math.round(item.sum / item.count), count: item.count }))
-      .sort((a, b) => b.count - a.count)
-      .slice(0, 10),
-    latencyRecent: pageResult(knownLatencyChecks, latencyPage.offset, latencyPage.limit),
     notifications: pageResult(data.notifications, notificationPage.offset, notificationPage.limit)
   };
 }
 
 function publicData(data: AppData, viewer?: User) {
-  const services = data.services.map((service) => {
-    const source = data.services.find((item) => item.id === service.id);
-    const connection = { ...defaultServiceConnection(), ...(service.connection ?? {}) };
-    connection.password = "";
-    connection.passwordSet = Boolean(source?.connection?.password);
-    return { ...service, connection };
-  });
-
   const telegram = { ...data.settings.telegram, botToken: "", webhookSecret: "" };
   telegram.botTokenSet = Boolean(data.settings.telegram.botToken);
   telegram.webhookSecretSet = Boolean(data.settings.telegram.webhookSecret);
@@ -609,12 +429,11 @@ function publicData(data: AppData, viewer?: User) {
   return {
     currencies: data.currencies,
     users: data.users.map(publicUser),
-    services,
+    services: data.services,
     memberships: data.memberships,
     autoDeposits: data.autoDeposits,
     deposits: [],
     debits: [],
-    latencyChecks: [],
     notifications: [],
     payments: viewer?.botAdmin ? data.payments : data.payments.filter((payment) => payment.userId === viewer?.id),
     settings: {
@@ -637,7 +456,6 @@ function apiState(viewer?: User) {
     counts: {
       deposits: data.deposits.length,
       debits: data.debits.length,
-      latencyChecks: data.latencyChecks.length,
       notifications: data.notifications.length,
       payments: data.payments.length
     },
@@ -677,20 +495,6 @@ async function runUpdateStep(command: string, args: string[]) {
   };
 }
 
-async function runRawUbuntuUpdate() {
-  const branch = process.env.UPDATE_BRANCH || "main";
-  const updateUrl =
-    process.env.UPDATE_SCRIPT_URL || `https://raw.githubusercontent.com/Jetvac/service-payment/${branch}/scripts/update-ubuntu.sh`;
-  const script = [
-    "set -Eeuo pipefail",
-    `curl -fsSL ${shellQuote(updateUrl)} | APP_DIR=${shellQuote(process.cwd())} APP_SERVICE_NAME=${shellQuote(
-      serviceUnitName()
-    )} BRANCH=${shellQuote(branch)} RESTART_SERVICE=false bash`
-  ].join("; ");
-
-  return runUpdateStep("bash", ["-lc", script]);
-}
-
 async function runLocalGitUpdate() {
   const steps = [];
   steps.push(await runUpdateStep("git", ["remote", "set-url", "origin", "https://github.com/Jetvac/service-payment.git"]));
@@ -724,59 +528,11 @@ function scheduleServiceRestart() {
   return { scheduled: true, serviceUnit };
 }
 
-function scheduleUbuntuUpdate() {
-  const scriptPath = path.resolve(process.cwd(), "scripts", "update-ubuntu.sh");
-  if (!fs.existsSync(scriptPath)) throw new Error("Скрипт обновления не найден");
-  const logDir = path.resolve(process.env.APP_DATA_DIR || path.join(process.cwd(), "data"), "logs");
-  fs.mkdirSync(logDir, { recursive: true });
-  const logPath = path.join(logDir, "update.log");
-  const output = fs.openSync(logPath, "a");
-  const child = spawn("bash", [scriptPath], {
-    cwd: process.cwd(),
-    detached: true,
-    stdio: ["ignore", output, output],
-    env: {
-      ...process.env,
-      APP_DIR: process.cwd(),
-      APP_SERVICE_NAME: serviceUnitName(),
-      BRANCH: process.env.UPDATE_BRANCH || "main",
-      RESTART_SERVICE: "true"
-    }
-  });
-  child.unref();
-  fs.closeSync(output);
-  return { scheduled: true, pid: child.pid, logPath };
-}
-
-function normalizeConnectionInput(body: Partial<ServiceConnectionSettings> | undefined, fallback?: ServiceConnectionSettings) {
-  const base = { ...defaultServiceConnection(), ...(fallback ?? {}) };
-  const input = body ?? {};
-  const passwordInput = typeof input.password === "string" ? input.password : "";
-  const websocketPath = String(input.websocketPath ?? base.websocketPath ?? "/echo").trim() || "/echo";
-
-  return {
-    ...base,
-    enabled: Boolean(input.enabled ?? base.enabled),
-    host: String(input.host ?? base.host ?? "").trim(),
-    port: Math.max(1, Math.min(65535, normalizeNumber(input.port, base.port || 8765))),
-    sshPort: Math.max(1, Math.min(65535, normalizeNumber(input.sshPort, base.sshPort || 22))),
-    user: String(input.user ?? base.user ?? "").trim(),
-    password: passwordInput ? passwordInput : base.password,
-    passwordSet: Boolean(passwordInput || base.password),
-    websocketPath: websocketPath.startsWith("/") ? websocketPath : `/${websocketPath}`,
-    useTls: Boolean(input.useTls ?? base.useTls),
-    lastStatus: base.lastStatus,
-    lastLatencyMs: base.lastLatencyMs,
-    lastCheckedAt: base.lastCheckedAt,
-    lastError: base.lastError,
-    lastDeployStatus: base.lastDeployStatus,
-    lastDeployAt: base.lastDeployAt,
-    lastDeployOutput: base.lastDeployOutput
-  };
-}
-
-function normalizeHealthStatus(value: unknown): ServiceHealthStatus {
-  return value === "online" || value === "offline" || value === "unknown" || value === "maintenance" ? value : "unknown";
+async function scheduleUbuntuUpdate() {
+  const updateUnit = serviceUnitName().replace(/\.service$/, "-update.service");
+  await execFileAsync("sudo", ["-n", "systemctl", "start", "--no-block", updateUnit]);
+  const logPath = path.resolve(process.cwd(), "data", "logs", "update.log");
+  return { scheduled: true, logPath };
 }
 
 async function telegramJson(token: string, method: string, body: Record<string, unknown>) {
@@ -866,139 +622,6 @@ function applyUserInput(
     body.commandDepositsBlocked === undefined ? user.commandDepositsBlocked : Boolean(body.commandDepositsBlocked);
   user.botAdmin = nextBotAdmin;
   user.notes = String(body.notes ?? user.notes);
-}
-
-const echoServerRepoUrl = "https://github.com/LazyDoomSlayer/rust-websocket-server.git";
-const echoServerServiceName = "rust-websocket-echo-server";
-
-function buildEchoServerDeployScript(password: string) {
-  const passwordBase64 = Buffer.from(password, "utf8").toString("base64");
-  const unitFile = `[Unit]
-Description=Rust WebSocket Echo Server
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/${echoServerServiceName}
-Restart=always
-RestartSec=3
-
-[Install]
-WantedBy=multi-user.target
-`;
-
-  return [
-    "set -Eeuo pipefail",
-    "export DEBIAN_FRONTEND=noninteractive",
-    `SUDO_PASSWORD="$(printf '%s' ${shellQuote(passwordBase64)} | base64 -d)"`,
-    "run_sudo() { if [ \"$(id -u)\" -eq 0 ]; then \"$@\"; else printf '%s\\n' \"$SUDO_PASSWORD\" | sudo -S -p '' \"$@\"; fi; }",
-    "echo 'Checking sudo access'",
-    "run_sudo true",
-    "echo 'Installing system dependencies'",
-    "run_sudo apt-get update -y",
-    "run_sudo apt-get install -y ca-certificates curl git build-essential pkg-config libssl-dev",
-    "if ! command -v cargo >/dev/null 2>&1; then echo 'Installing Rust toolchain'; curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal; fi",
-    "if [ -f \"$HOME/.cargo/env\" ]; then . \"$HOME/.cargo/env\"; fi",
-    "if ! command -v cargo >/dev/null 2>&1; then echo 'cargo not found after rustup installation'; exit 1; fi",
-    "APP_DIR='/opt/rust-websocket-server'",
-    `REPO_URL=${shellQuote(echoServerRepoUrl)}`,
-    "echo 'Fetching repository'",
-    "if [ -d \"$APP_DIR/.git\" ]; then run_sudo chown -R \"$(id -un):$(id -gn)\" \"$APP_DIR\" || true; git -C \"$APP_DIR\" fetch --depth 1 origin main; git -C \"$APP_DIR\" reset --hard FETCH_HEAD; else run_sudo rm -rf \"$APP_DIR\"; run_sudo mkdir -p \"$APP_DIR\"; run_sudo chown \"$(id -un):$(id -gn)\" \"$APP_DIR\"; git clone --depth 1 \"$REPO_URL\" \"$APP_DIR\"; fi",
-    "cd \"$APP_DIR\"",
-    "echo 'Building release binary'",
-    "cargo build --release",
-    "BIN=\"$(find target/release -maxdepth 1 -type f -perm /111 \\( -name 'rust-websocket-server' -o -name 'rust-websocket-echo-server' \\) | head -n 1)\"",
-    "if [ -z \"$BIN\" ]; then echo 'Release binary not found'; find target/release -maxdepth 1 -type f -print; exit 1; fi",
-    "echo 'Installing binary'",
-    `run_sudo install -m 755 "$BIN" /usr/local/bin/${echoServerServiceName}`,
-    `printf '%s' ${shellQuote(unitFile)} | run_sudo tee /etc/systemd/system/${echoServerServiceName}.service >/dev/null`,
-    "run_sudo systemctl daemon-reload",
-    `run_sudo systemctl enable ${echoServerServiceName}.service`,
-    `run_sudo systemctl restart ${echoServerServiceName}.service`,
-    "if command -v ufw >/dev/null 2>&1 && run_sudo ufw status | grep -qi active; then run_sudo ufw allow 8765/tcp || true; fi",
-    "sleep 1",
-    `run_sudo systemctl --no-pager --full status ${echoServerServiceName}.service | sed -n '1,18p' || true`,
-    "echo 'Echo server is deployed on ws://0.0.0.0:8765/echo'"
-  ].join("\n");
-}
-
-function appendOutput(current: string, chunk: Buffer | string) {
-  return (current + chunk.toString()).slice(-12000);
-}
-
-function runSshScript(service: Service, script: string) {
-  const connection = service.connection;
-  return new Promise<string>((resolve, reject) => {
-    const client = new Client();
-    let output = "";
-    let settled = false;
-    let streamStarted = false;
-
-    const finish = (error?: Error, result = output) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timeout);
-      client.end();
-      if (error) {
-        (error as Error & { output?: string }).output = result;
-        reject(error);
-      } else {
-        resolve(result);
-      }
-    };
-
-    const timeout = setTimeout(() => {
-      finish(new Error("SSH deploy timeout"), output);
-    }, 10 * 60 * 1000);
-
-    client
-      .on("ready", () => {
-        client.exec("bash -s", { pty: true }, (error, stream) => {
-          if (error) {
-            finish(error);
-            return;
-          }
-
-          streamStarted = true;
-          stream
-            .on("close", (code: number | null) => {
-              if (code === 0) {
-                finish(undefined, output);
-              } else {
-                finish(new Error(`SSH deploy failed with exit code ${code ?? "unknown"}`), output);
-              }
-            })
-            .on("data", (chunk: Buffer) => {
-              output = appendOutput(output, chunk);
-            })
-            .stderr.on("data", (chunk: Buffer) => {
-              output = appendOutput(output, chunk);
-            });
-
-          stream.end(script);
-        });
-      })
-      .on("error", (error) => {
-        finish(error, streamStarted ? output : appendOutput(output, error.message));
-      })
-      .connect({
-        host: connection.host,
-        port: connection.sshPort || 22,
-        username: connection.user,
-        password: connection.password,
-        readyTimeout: 20000
-      });
-  });
-}
-
-async function deployEchoServer(service: Service) {
-  const connection = { ...defaultServiceConnection(), ...(service.connection ?? {}) };
-  if (!connection.host.trim()) throw new Error("Укажите IP / host сервиса");
-  if (!connection.user.trim()) throw new Error("Укажите SSH user");
-  if (!connection.password) throw new Error("Укажите SSH pass и сохраните сервис");
-
-  return runSshScript({ ...service, connection }, buildEchoServerDeployScript(connection.password));
 }
 
 function normalizeAutoDepositInput(data: AppData, body: Partial<AutoDeposit>, fallback?: AutoDeposit) {
@@ -1302,14 +925,6 @@ app.get("/api/dashboard", async (req, res) => {
   try {
     const data = store.read();
     const payload = dashboardData(data, req.query as Record<string, unknown>);
-    if (latencyAggregator.enabled) {
-      const chart = await latencyAggregator.queryChart(data, {
-        from: req.query.latencyFrom,
-        to: req.query.latencyTo
-      });
-      payload.latencyTimeline = chart.latencyTimeline;
-      payload.latencySeries = chart.latencySeries;
-    }
     res.json(ok(payload));
   } catch (error) {
     res.status(400).json(fail(error));
@@ -1320,100 +935,6 @@ app.get("/api/notifications", (req, res) => {
   try {
     const { offset, limit } = readPage(req.query as Record<string, unknown>, 20, 100);
     res.json(ok(pageResult(store.read().notifications, offset, limit)));
-  } catch (error) {
-    res.status(400).json(fail(error));
-  }
-});
-
-app.get("/api/latency-checks", async (req, res) => {
-  try {
-    const { offset, limit } = readPage(req.query as Record<string, unknown>, 20, 100);
-    if (latencyAggregator.enabled) {
-      res.json(ok(await latencyAggregator.queryMinuteRows(offset, limit)));
-      return;
-    }
-
-    const actor = authUserFromRequest(req);
-    const requestedUserId = String(req.query.userId ?? "");
-    const userId = actor?.botAdmin ? requestedUserId : actor?.id ?? "";
-    const rows = userId ? store.read().latencyChecks.filter((check) => check.userId === userId) : store.read().latencyChecks;
-    res.json(ok(pageResult(rows, offset, limit)));
-  } catch (error) {
-    res.status(400).json(fail(error));
-  }
-});
-
-app.get("/api/latency-chart", async (req, res) => {
-  try {
-    if (latencyAggregator.enabled) {
-      res.json(ok(await latencyAggregator.queryChart(store.read(), req.query as Record<string, unknown>)));
-      return;
-    }
-
-    const actor = authUserFromRequest(req);
-    const requestedUserId = String(req.query.userId ?? "");
-    const userId = actor?.botAdmin ? requestedUserId : actor?.id ?? "";
-    res.json(ok(latencyChartData(store.read(), { ...req.query, userId })));
-  } catch (error) {
-    res.status(400).json(fail(error));
-  }
-});
-
-app.post("/api/latency/measurements", async (req, res) => {
-  try {
-    const measurements = Array.isArray(req.body) ? req.body : [req.body];
-    if (measurements.length === 0) throw new Error("Нет замеров для обработки");
-    if (measurements.length > 500) throw new Error("За один запрос можно передать не более 500 замеров");
-
-    const data = store.read();
-    const fallbackChecks: LatencyCheck[] = [];
-
-    for (const measurement of measurements) {
-      const service = data.services.find((item) => item.id === String(measurement.serviceId ?? ""));
-      if (!service) throw new Error("Сервис не найден");
-
-      service.connection = { ...defaultServiceConnection(), ...(service.connection ?? {}) };
-      const status = normalizeHealthStatus(measurement.status);
-      const checkedAt = String(measurement.checkedAt ?? nowIso());
-      const latencyMs =
-        typeof measurement.latencyMs === "number" && Number.isFinite(measurement.latencyMs)
-          ? Math.max(0, Number(measurement.latencyMs))
-          : null;
-      const error = String(measurement.error ?? "").slice(0, 240);
-
-      await latencyAggregator.record({
-        serviceId: service.id,
-        latencyMs,
-        status,
-        error,
-        checkedAt
-      });
-
-      fallbackChecks.push({
-        id: id("lat"),
-        serviceId: service.id,
-        userId: null,
-        status,
-        latencyMs,
-        checkedAt,
-        error,
-        createdAt: nowIso()
-      });
-
-      if (service.connection.lastStatus !== "maintenance" || status === "maintenance") {
-        service.connection.lastStatus = status;
-        service.connection.lastLatencyMs = latencyMs;
-        service.connection.lastCheckedAt = checkedAt;
-        service.connection.lastError = error;
-      }
-    }
-
-    if (fallbackChecks.length > 0) {
-      data.latencyChecks.unshift(...fallbackChecks.reverse());
-    }
-
-    store.persist();
-    res.json(ok(apiState()));
   } catch (error) {
     res.status(400).json(fail(error));
   }
@@ -1846,7 +1367,7 @@ app.post("/api/system/update", async (req, res) => {
     requireAdmin(req);
     const update = process.platform === "win32"
       ? { scheduled: false, steps: await runLocalGitUpdate(), restart: scheduleServiceRestart() }
-      : scheduleUbuntuUpdate();
+      : await scheduleUbuntuUpdate();
     store.write((data) => {
       addNotification(data, {
         serviceId: data.services[0]?.id ?? "",
@@ -1929,7 +1450,6 @@ app.delete("/api/users/:id", (req, res) => {
       data.users = data.users.filter((item) => item.id !== req.params.id);
       data.memberships = data.memberships.filter((item) => item.userId !== req.params.id);
       data.autoDeposits = data.autoDeposits.filter((item) => item.userId !== req.params.id);
-      data.latencyChecks = data.latencyChecks.filter((item) => item.userId !== req.params.id);
     });
 
     res.json(ok(apiState()));
@@ -1955,7 +1475,6 @@ app.post("/api/services", (req, res) => {
       monthlyCost: roundMoney(Math.max(0, normalizeNumber(req.body.monthlyCost, 0))),
       currency: String(req.body.currency ?? "RUB"),
       active: true,
-      connection: normalizeConnectionInput(req.body.connection),
       billing: {
         period,
         interval,
@@ -1993,7 +1512,6 @@ app.put("/api/services/:id", (req, res) => {
       service.monthlyCost = roundMoney(Math.max(0, normalizeNumber(req.body.monthlyCost, service.monthlyCost)));
       service.currency = String(req.body.currency ?? service.currency);
       service.active = Boolean(req.body.active);
-      service.connection = normalizeConnectionInput(req.body.connection, service.connection);
       service.billing.period = String(req.body.period ?? service.billing.period) as BillingPeriod;
       service.billing.interval = Math.max(1, normalizeNumber(req.body.interval, service.billing.interval));
       service.billing.autoDebit = Boolean(req.body.autoDebit);
@@ -2017,132 +1535,6 @@ app.put("/api/services/:id", (req, res) => {
     res.json(ok(apiState()));
   } catch (error) {
     res.status(400).json(fail(error));
-  }
-});
-
-app.post("/api/services/:id/health", async (req, res) => {
-  try {
-    const data = store.read();
-    const service = data.services.find((item) => item.id === req.params.id);
-    if (!service) throw new Error("Сервис не найден");
-
-    service.connection = { ...defaultServiceConnection(), ...(service.connection ?? {}) };
-    const status = normalizeHealthStatus(req.body.status);
-    const checkedAt = String(req.body.checkedAt ?? nowIso());
-    const latencyMs =
-      typeof req.body.latencyMs === "number" && Number.isFinite(req.body.latencyMs)
-        ? Math.max(0, Number(req.body.latencyMs))
-        : null;
-    const error = String(req.body.error ?? "").slice(0, 240);
-    const user = data.users.find((item) => item.id === String(req.body.userId ?? ""));
-
-    const check: LatencyCheck = {
-      id: id("lat"),
-      serviceId: service.id,
-      userId: user?.id ?? null,
-      status,
-      latencyMs,
-      checkedAt,
-      error,
-      createdAt: nowIso()
-    };
-
-    await latencyAggregator.record({
-      serviceId: service.id,
-      latencyMs,
-      status,
-      error,
-      checkedAt
-    });
-
-    data.latencyChecks.unshift(check);
-
-    if (service.connection.lastStatus !== "maintenance" || status === "maintenance") {
-      service.connection.lastStatus = status;
-      service.connection.lastLatencyMs = latencyMs;
-      service.connection.lastCheckedAt = checkedAt;
-      service.connection.lastError = error;
-    }
-
-    store.persist();
-
-    res.json(ok(apiState()));
-  } catch (error) {
-    res.status(400).json(fail(error));
-  }
-});
-
-app.post("/api/services/:id/maintenance", async (req, res) => {
-  try {
-    requireAdmin(req);
-    const data = store.read();
-    const service = data.services.find((item) => item.id === req.params.id);
-    if (!service) throw new Error("Сервис не найден");
-
-    const maintenance = Boolean(req.body.maintenance);
-    service.connection = { ...defaultServiceConnection(), ...(service.connection ?? {}) };
-    service.connection.lastStatus = maintenance ? "maintenance" : "unknown";
-    service.connection.lastLatencyMs = null;
-    service.connection.lastCheckedAt = nowIso();
-    service.connection.lastError = maintenance ? "Плановое обслуживание" : "";
-
-    try {
-      await sendServiceMaintenanceNotice(data, service, maintenance);
-    } catch (notifyError) {
-      addNotification(data, {
-        serviceId: service.id,
-        userId: null,
-        kind: "system",
-        message: `Telegram maintenance notice failed: ${notifyError instanceof Error ? notifyError.message : String(notifyError)}`,
-        status: "failed"
-      });
-    }
-
-    store.persist();
-    res.json(ok(apiState()));
-  } catch (error) {
-    res.status(400).json(fail(error));
-  }
-});
-
-app.post("/api/services/:id/deploy-echo", async (req, res) => {
-  let deployOutput = "";
-
-  try {
-    requireAdmin(req);
-    const service = store.read().services.find((item) => item.id === req.params.id);
-    if (!service) throw new Error("Сервис не найден");
-
-    deployOutput = await deployEchoServer(service);
-
-    store.write((data) => {
-      const target = data.services.find((item) => item.id === req.params.id);
-      if (!target) throw new Error("Сервис не найден");
-      target.connection = { ...defaultServiceConnection(), ...(target.connection ?? {}) };
-      target.connection.enabled = true;
-      target.connection.port = 8765;
-      target.connection.websocketPath = "/echo";
-      target.connection.lastDeployStatus = "success";
-      target.connection.lastDeployAt = nowIso();
-      target.connection.lastDeployOutput = deployOutput.slice(-8000);
-      target.connection.lastStatus = "unknown";
-      target.connection.lastError = "";
-    });
-
-    res.json(ok(apiState()));
-  } catch (error) {
-    const output = (error as Error & { output?: string }).output || (error instanceof Error ? error.message : String(error));
-
-    store.write((data) => {
-      const target = data.services.find((item) => item.id === req.params.id);
-      if (!target) return;
-      target.connection = { ...defaultServiceConnection(), ...(target.connection ?? {}) };
-      target.connection.lastDeployStatus = "failed";
-      target.connection.lastDeployAt = nowIso();
-      target.connection.lastDeployOutput = output.slice(-8000);
-    });
-
-    res.json(ok(apiState()));
   }
 });
 

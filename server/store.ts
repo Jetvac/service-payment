@@ -6,7 +6,6 @@ import {
   BALANCE_CURRENCY,
   buildNextAutoDepositDate,
   defaultPaymentSettings,
-  defaultServiceConnection,
   normalizeNumber,
   nowIso,
   roundMoney,
@@ -30,8 +29,13 @@ export class Store {
   constructor() {
     fs.mkdirSync(dataDir, { recursive: true });
     this.db = this.openDatabase();
-    this.data = this.load();
-    this.migrateLegacyFiles();
+    try {
+      this.data = this.load();
+      this.migrateLegacyFiles();
+    } catch (error) {
+      this.db.close();
+      throw error;
+    }
   }
 
   read() {
@@ -51,16 +55,13 @@ export class Store {
   }
 
   replace(raw: unknown) {
-    const wallData = {
-      wallFiles: this.data.wallFiles ?? [],
-      wallPosts: this.data.wallPosts ?? [],
-      wallTags: this.data.wallTags ?? [],
-      wallComments: this.data.wallComments ?? []
-    };
-    const next = {
-      ...this.migrate(this.normalizeImport(raw)),
-      ...wallData
-    };
+    const next = this.migrate(this.normalizeImport(raw));
+    // Older financial-only JSON backups omitted the entire wall section.
+    const backup = raw as Record<string, unknown>;
+    for (const key of ["wallFiles", "wallPosts", "wallTags", "wallComments"] as const) {
+      if (!(key in backup)) (next[key] as unknown[]) = cloneData(this.data)[key];
+    }
+    this.validateFiles(this.db, next);
     this.persistData(next);
     this.data = next;
     return this.data;
@@ -86,6 +87,7 @@ export class Store {
   }
 
   private openDatabase() {
+    fs.mkdirSync(path.dirname(databaseFile), { recursive: true });
     const db = new Database(databaseFile, { timeout: 5000 });
     db.pragma("journal_mode = WAL");
     db.pragma("synchronous = FULL");
@@ -143,46 +145,62 @@ export class Store {
   }
 
   async backupTo(destination: string) {
+    this.validateFiles(this.db, this.data);
     fs.mkdirSync(path.dirname(destination), { recursive: true });
     await this.db.backup(destination);
+    const copy = new Database(destination, { readonly: true, fileMustExist: true });
+    try {
+      const row = copy.prepare("SELECT data FROM app_state WHERE id = 1").get() as { data: string };
+      this.validateFiles(copy, JSON.parse(row.data));
+    } finally {
+      copy.close();
+    }
     return destination;
   }
 
   replaceWithDatabase(sourceFile: string) {
     const candidate = new Database(sourceFile, { readonly: true, fileMustExist: true });
     try {
+      if (candidate.pragma("integrity_check", { simple: true }) !== "ok") {
+        throw new Error("Резервная копия повреждена");
+      }
       const row = candidate.prepare("SELECT data FROM app_state WHERE id = 1").get() as { data?: string } | undefined;
       if (!row?.data) throw new Error("В резервной копии отсутствует состояние приложения");
-      this.migrate(JSON.parse(row.data) as AppData);
+      const next = this.migrate(this.normalizeImport(JSON.parse(row.data)));
+      this.validateFiles(candidate, next);
+      // Copy into the existing connection: both state and blobs commit together.
+      // Any read/write failure rolls back without replacing the live database file.
+      this.db.transaction(() => {
+        this.db.prepare("DELETE FROM wall_file_blobs").run();
+        const insert = this.db.prepare("INSERT INTO wall_file_blobs (file_id, content, updated_at) VALUES (?, ?, ?)");
+        if (candidate.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'wall_file_blobs'").get()) {
+          for (const blob of candidate.prepare("SELECT file_id, content, updated_at FROM wall_file_blobs").iterate() as Iterable<{ file_id: string; content: Buffer; updated_at: string }>) {
+            insert.run(blob.file_id, blob.content, blob.updated_at);
+          }
+        }
+        this.persistData(next);
+      })();
+      this.data = next;
+      return this.data;
     } finally {
       candidate.close();
     }
+  }
 
-    const rollbackFile = `${databaseFile}.rollback`;
-    this.db.pragma("wal_checkpoint(TRUNCATE)");
+  close() {
     this.db.close();
-    fs.copyFileSync(databaseFile, rollbackFile);
+  }
 
-    try {
-      fs.copyFileSync(sourceFile, databaseFile);
-      fs.rmSync(`${databaseFile}-wal`, { force: true });
-      fs.rmSync(`${databaseFile}-shm`, { force: true });
-      this.db = this.openDatabase();
-      this.data = this.load();
-      fs.rmSync(rollbackFile, { force: true });
-      return this.data;
-    } catch (error) {
-      try {
-        if (this.db?.open) this.db.close();
-      } catch {
-        // ignore failed candidate close before restoring the known-good database
+  private validateFiles(db: Database.Database, data: AppData) {
+    if (!data.wallFiles.length) return;
+    const get = db.prepare("SELECT length(content) AS size FROM wall_file_blobs WHERE file_id = ?");
+    const ids = new Set<string>();
+    for (const file of data.wallFiles) {
+      const row = get.get(file.id) as { size: number } | undefined;
+      if (!file.id || ids.has(file.id) || !row || row.size !== file.size) {
+        throw new Error(`Отсутствует или повреждён файл: ${file.originalName}. Нужна полная SQLite-копия с файлами`);
       }
-      fs.copyFileSync(rollbackFile, databaseFile);
-      fs.rmSync(`${databaseFile}-wal`, { force: true });
-      fs.rmSync(`${databaseFile}-shm`, { force: true });
-      this.db = this.openDatabase();
-      this.data = this.load();
-      throw error;
+      ids.add(file.id);
     }
   }
 
@@ -196,8 +214,11 @@ export class Store {
     const migrateAll = this.db.transaction(() => {
       for (const file of this.data.wallFiles) {
         if (!file.storageName) continue;
-        const legacyPath = path.join(wallFilesDir, file.storageName);
-        if (!fs.existsSync(legacyPath)) continue;
+        if (this.readWallFile(file.id)) continue;
+        const legacyPath = path.resolve(wallFilesDir, file.storageName);
+        if (path.dirname(legacyPath) !== wallFilesDir || !fs.existsSync(legacyPath)) {
+          throw new Error(`Не найден старый файл: ${file.originalName}`);
+        }
         insert.run(file.id, fs.readFileSync(legacyPath), new Date().toISOString());
       }
     });
@@ -220,6 +241,9 @@ export class Store {
     ) {
       throw new Error("Файл не похож на backup Service Payment");
     }
+    for (const key of ["autoDeposits", "deposits", "debits", "notifications", "payments", "wallTags", "wallFiles", "wallPosts", "wallComments"] as const) {
+      if (key in backup && !Array.isArray(backup[key])) throw new Error(`Некорректный раздел: ${key}`);
+    }
 
     return {
       ...fallback,
@@ -231,7 +255,6 @@ export class Store {
       autoDeposits: Array.isArray(backup.autoDeposits) ? backup.autoDeposits : [],
       deposits: Array.isArray(backup.deposits) ? backup.deposits : [],
       debits: Array.isArray(backup.debits) ? backup.debits : [],
-      latencyChecks: Array.isArray(backup.latencyChecks) ? backup.latencyChecks : [],
       notifications: Array.isArray(backup.notifications) ? backup.notifications : [],
       payments: Array.isArray(backup.payments) ? backup.payments : [],
       wallTags: Array.isArray(backup.wallTags) ? backup.wallTags : [],
@@ -269,32 +292,7 @@ export class Store {
       service.notes ??= "";
       service.active ??= true;
       service.monthlyCost = roundMoney(service.monthlyCost);
-      const connection = { ...defaultServiceConnection(), ...(service.connection ?? {}) };
-      connection.enabled = Boolean(connection.enabled);
-      connection.host = String(connection.host ?? "").trim();
-      connection.port = Math.max(1, Math.min(65535, normalizeNumber(connection.port, 8765)));
-      connection.sshPort = Math.max(1, Math.min(65535, normalizeNumber(connection.sshPort, 22)));
-      connection.user = String(connection.user ?? "").trim();
-      connection.password = String(connection.password ?? "");
-      connection.passwordSet = Boolean(connection.password);
-      connection.websocketPath = String(connection.websocketPath ?? "/echo").trim() || "/echo";
-      if (!connection.websocketPath.startsWith("/")) connection.websocketPath = `/${connection.websocketPath}`;
-      connection.useTls = Boolean(connection.useTls);
-      connection.lastStatus = ["online", "offline", "unknown", "maintenance"].includes(connection.lastStatus)
-        ? connection.lastStatus
-        : "unknown";
-      connection.lastLatencyMs =
-        typeof connection.lastLatencyMs === "number" && Number.isFinite(connection.lastLatencyMs)
-          ? Math.max(0, Math.round(connection.lastLatencyMs))
-          : null;
-      connection.lastCheckedAt ??= null;
-      connection.lastError = String(connection.lastError ?? "");
-      connection.lastDeployStatus = ["success", "failed", "unknown"].includes(connection.lastDeployStatus)
-        ? connection.lastDeployStatus
-        : "unknown";
-      connection.lastDeployAt ??= null;
-      connection.lastDeployOutput = String(connection.lastDeployOutput ?? "").slice(-8000);
-      service.connection = connection;
+      delete (service as unknown as Record<string, unknown>).connection;
     }
 
     for (const user of data.users) {
@@ -337,7 +335,8 @@ export class Store {
     data.autoDeposits ??= [];
     data.deposits ??= [];
     data.debits ??= [];
-    data.latencyChecks ??= [];
+    delete (data as unknown as Record<string, unknown>).latencyChecks;
+    data.notifications = data.notifications.filter((item) => (item.kind as string) !== "latency_report");
     data.memberships ??= [];
     data.settings ??= seedData().settings;
     data.settings.telegram ??= seedData().settings.telegram;
@@ -447,19 +446,6 @@ export class Store {
       } else {
         debit.balanceAfter = roundMoney(debit.balanceAfter);
       }
-    }
-
-    for (const check of data.latencyChecks) {
-      check.userId = check.userId ? String(check.userId) : null;
-      check.serviceId = String(check.serviceId ?? "");
-      check.status = ["online", "offline", "unknown", "maintenance"].includes(check.status) ? check.status : "unknown";
-      check.latencyMs =
-        typeof check.latencyMs === "number" && Number.isFinite(check.latencyMs)
-          ? Math.max(0, Math.round(check.latencyMs))
-          : null;
-      check.checkedAt = String(check.checkedAt ?? check.createdAt ?? new Date().toISOString());
-      check.createdAt = String(check.createdAt ?? check.checkedAt);
-      check.error = String(check.error ?? "").slice(0, 240);
     }
 
     for (const tag of data.wallTags) {

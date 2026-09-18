@@ -15,14 +15,6 @@ SETUP_NGINX="${SETUP_NGINX:-false}"
 ENABLE_SSL="${ENABLE_SSL:-false}"
 EMAIL="${EMAIL:-}"
 ENABLE_UFW="${ENABLE_UFW:-false}"
-SETUP_TIMESCALE="${SETUP_TIMESCALE:-true}"
-TIMESCALE_IMAGE="${TIMESCALE_IMAGE:-timescale/timescaledb-ha:pg17-all}"
-TIMESCALE_CONTAINER_NAME="${TIMESCALE_CONTAINER_NAME:-${APP_NAME}-timescaledb}"
-TIMESCALE_VOLUME="${TIMESCALE_VOLUME:-${APP_NAME}-timescaledb-data}"
-TIMESCALE_DB="${TIMESCALE_DB:-${APP_NAME//-/_}}"
-TIMESCALE_USER="${TIMESCALE_USER:-${APP_NAME//-/_}}"
-TIMESCALE_PASSWORD="${TIMESCALE_PASSWORD:-}"
-TIMESCALE_PORT="${TIMESCALE_PORT:-29432}"
 APP_ENV_FILE="${APP_ENV_FILE:-/etc/${APP_NAME}.env}"
 INITIAL_ADMIN_PASSWORD="${INITIAL_ADMIN_PASSWORD:-}"
 
@@ -56,7 +48,7 @@ node_is_supported() {
   command -v node >/dev/null 2>&1 || return 1
   node -e '
     const [major, minor] = process.versions.node.split(".").map(Number);
-    process.exit(major > 20 || (major === 20 && minor >= 19) ? 0 : 1);
+    process.exit(major > 22 || (major === 22 && minor >= 12) ? 0 : 1);
   '
 }
 
@@ -136,120 +128,11 @@ shell_escape_env_value() {
   printf "'%s'" "${value//\'/\'\\\'\'}"
 }
 
-url_encode() {
-  node -e 'console.log(encodeURIComponent(process.argv[1]))' "$1"
-}
-
-timescale_database_url() {
-  local encoded_password
-  encoded_password="$(url_encode "${TIMESCALE_PASSWORD}")"
-  printf 'postgresql://%s:%s@127.0.0.1:%s/%s' "${TIMESCALE_USER}" "${encoded_password}" "${TIMESCALE_PORT}" "${TIMESCALE_DB}"
-}
-
-install_docker() {
-  if command -v docker >/dev/null 2>&1; then
-    log "Docker is already installed"
-  else
-    log "Installing Docker"
-    apt-get update
-    apt-get install -y docker.io
-  fi
-
-  systemctl enable --now docker
-}
-
-timescale_container_exists() {
-  docker inspect "${TIMESCALE_CONTAINER_NAME}" >/dev/null 2>&1
-}
-
-timescale_container_running() {
-  [[ "$(docker inspect -f '{{.State.Running}}' "${TIMESCALE_CONTAINER_NAME}" 2>/dev/null || true)" == "true" ]]
-}
-
-port_is_free() {
-  local port
-  port="$1"
-  if command -v ss >/dev/null 2>&1; then
-    ! ss -H -ltn "sport = :${port}" | grep -q .
-    return
-  fi
-  if command -v lsof >/dev/null 2>&1; then
-    ! lsof -nP -iTCP:"${port}" -sTCP:LISTEN >/dev/null 2>&1
-    return
-  fi
-  return 0
-}
-
-select_timescale_port() {
-  local candidate
-  for candidate in "${TIMESCALE_PORT}" 29432 39432 49432 59432 $(seq 25000 25150); do
-    if port_is_free "${candidate}"; then
-      TIMESCALE_PORT="${candidate}"
-      return
-    fi
-  done
-
-  echo "Could not find a free local port for TimescaleDB" >&2
-  exit 1
-}
-
-wait_for_timescale() {
-  log "Waiting for TimescaleDB to accept connections"
-  for _ in $(seq 1 90); do
-    if docker exec -e PGPASSWORD="${TIMESCALE_PASSWORD}" "${TIMESCALE_CONTAINER_NAME}" \
-      pg_isready -U "${TIMESCALE_USER}" -d "${TIMESCALE_DB}" >/dev/null 2>&1; then
-      return
-    fi
-    sleep 2
-  done
-
-  docker logs --tail 120 "${TIMESCALE_CONTAINER_NAME}" >&2 || true
-  echo "TimescaleDB did not become ready in time" >&2
-  exit 1
-}
-
-setup_timescale_db() {
-  if [[ "${SETUP_TIMESCALE}" != "true" ]]; then
-    log "Skipping TimescaleDB container setup"
-    return
-  fi
-
-  install_docker
-  if [[ -z "${TIMESCALE_PASSWORD}" ]]; then
-    TIMESCALE_PASSWORD="$(random_password)"
-  fi
-
-  docker volume create "${TIMESCALE_VOLUME}" >/dev/null
-  docker run --rm -v "${TIMESCALE_VOLUME}:/data" alpine sh -c "chown -R 1000:1000 /data && chmod 700 /data"
-  docker pull "${TIMESCALE_IMAGE}"
-
-  if timescale_container_exists; then
-    log "TimescaleDB container ${TIMESCALE_CONTAINER_NAME} already exists"
-    if ! timescale_container_running; then
-      docker start "${TIMESCALE_CONTAINER_NAME}" >/dev/null
-    fi
-  else
-    select_timescale_port
-    log "Creating TimescaleDB container ${TIMESCALE_CONTAINER_NAME}"
-    docker run -d \
-      --name "${TIMESCALE_CONTAINER_NAME}" \
-      --restart unless-stopped \
-      -p "127.0.0.1:${TIMESCALE_PORT}:5432" \
-      -e POSTGRES_DB="${TIMESCALE_DB}" \
-      -e POSTGRES_USER="${TIMESCALE_USER}" \
-      -e POSTGRES_PASSWORD="${TIMESCALE_PASSWORD}" \
-      -e TIMESCALEDB_TELEMETRY=off \
-      -e PGDATA=/home/postgres/pgdata/data \
-      -v "${TIMESCALE_VOLUME}:/home/postgres/pgdata/data" \
-      "${TIMESCALE_IMAGE}" >/dev/null
-  fi
-
-  wait_for_timescale
-  TIMESCALE_DATABASE_URL="$(timescale_database_url)"
-  DATABASE_URL="${DATABASE_URL:-${TIMESCALE_DATABASE_URL}}"
-}
-
 write_app_env() {
+  if [[ -f "${APP_ENV_FILE}" ]]; then
+    log "Preserving existing environment ${APP_ENV_FILE}"
+    return
+  fi
   if [[ -z "${INITIAL_ADMIN_PASSWORD}" ]]; then
     INITIAL_ADMIN_PASSWORD="$(random_password)"
   fi
@@ -269,58 +152,8 @@ write_app_env() {
         echo "PUBLIC_BASE_URL=$(shell_escape_env_value "http://${DOMAIN}")"
       fi
     fi
-    if [[ -n "${TIMESCALE_DATABASE_URL:-}" ]]; then
-      echo "TIMESCALE_DATABASE_URL=$(shell_escape_env_value "${TIMESCALE_DATABASE_URL}")"
-      echo "DATABASE_URL=$(shell_escape_env_value "${DATABASE_URL:-${TIMESCALE_DATABASE_URL}}")"
-      echo "TIMESCALE_CONTAINER_NAME=$(shell_escape_env_value "${TIMESCALE_CONTAINER_NAME}")"
-      echo "TIMESCALE_DB=$(shell_escape_env_value "${TIMESCALE_DB}")"
-      echo "TIMESCALE_USER=$(shell_escape_env_value "${TIMESCALE_USER}")"
-      echo "TIMESCALE_PASSWORD=$(shell_escape_env_value "${TIMESCALE_PASSWORD}")"
-      echo "TIMESCALE_PORT=$(shell_escape_env_value "${TIMESCALE_PORT}")"
-      echo "TIMESCALE_VOLUME=$(shell_escape_env_value "${TIMESCALE_VOLUME}")"
-      echo "TIMESCALE_IMAGE=$(shell_escape_env_value "${TIMESCALE_IMAGE}")"
-    fi
   } >"${APP_ENV_FILE}"
   chmod 640 "${APP_ENV_FILE}"
-}
-
-ensure_psql() {
-  if command -v psql >/dev/null 2>&1; then
-    return 0
-  fi
-
-  echo "psql is not installed; will use Docker psql when the local TimescaleDB container is available." >&2
-  return 1
-}
-
-apply_timescale_schema() {
-  local database_url schema_file
-  database_url="${TIMESCALE_DATABASE_URL:-${DATABASE_URL:-}}"
-  schema_file="${APP_DIR}/db/timescale_latency.sql"
-
-  if [[ -z "${database_url}" ]]; then
-    log "Skipping TimescaleDB schema: TIMESCALE_DATABASE_URL/DATABASE_URL is not set"
-    return
-  fi
-
-  if [[ ! -f "${schema_file}" ]]; then
-    echo "TimescaleDB schema file not found: ${schema_file}" >&2
-    exit 1
-  fi
-
-  if command -v docker >/dev/null 2>&1 && timescale_container_exists && timescale_container_running; then
-    log "Applying TimescaleDB latency schema through Docker"
-    docker exec -i -e PGPASSWORD="${TIMESCALE_PASSWORD}" "${TIMESCALE_CONTAINER_NAME}" \
-      psql -U "${TIMESCALE_USER}" -d "${TIMESCALE_DB}" -v ON_ERROR_STOP=1 <"${schema_file}"
-    return
-  fi
-
-  if ! ensure_psql; then
-    log "Skipping TimescaleDB schema: psql is unavailable"
-    return
-  fi
-  log "Applying TimescaleDB latency schema"
-  psql "${database_url}" -v ON_ERROR_STOP=1 -f "${schema_file}"
 }
 
 install_systemd_service() {
@@ -386,7 +219,7 @@ server {
     listen 80;
     server_name ${server_name};
 
-    client_max_body_size 64m;
+    client_max_body_size 2048m;
 
     location / {
         proxy_pass http://127.0.0.1:${PORT};
@@ -481,11 +314,10 @@ main() {
   ensure_app_user
   checkout_repo
   build_app
-  setup_timescale_db
   write_app_env
-  apply_timescale_schema
   install_systemd_service
   install_restart_sudoers
+  APP_SERVICE_NAME="${APP_NAME}" bash "${APP_DIR}/scripts/install-update-service.sh"
   install_nginx
   install_ssl
   configure_ufw

@@ -9,6 +9,7 @@ export default defineConfig({
   testDir: "./tests",
   outputDir: path.join(os.tmpdir(), "service-payment-playwright-results"),
   timeout: 30_000,
+  workers: 1,
   expect: { timeout: 7_000 },
   retries: process.env.CI ? 1 : 0,
   reporter: process.env.CI ? "github" : "list",
@@ -22,7 +23,7 @@ export default defineConfig({
     { name: "mobile-chromium", use: { ...devices["Pixel 7"] } }
   ],
   webServer: {
-    command: "npm start",
+    command: "node --import tsx server/index.ts",
     url: "http://127.0.0.1:4190/api/health",
     reuseExistingServer: false,
     timeout: 60_000,

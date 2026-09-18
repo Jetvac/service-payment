@@ -37,7 +37,6 @@ import {
   Trash2,
   Upload,
   Wallet,
-  Wrench,
   X,
   UserPlus,
   Users
@@ -49,9 +48,6 @@ import {
   Bar,
   BarChart,
   CartesianGrid,
-  Legend,
-  Line,
-  LineChart,
   ResponsiveContainer,
   Tooltip,
   XAxis,
@@ -63,14 +59,13 @@ import type {
   Currency,
   Debit,
   Deposit,
-  LatencyCheck,
+
   Notification as AppNotification,
   PaymentIntent,
   PaymentMethod,
   PaymentSettings,
   Service,
-  ServiceConnectionSettings,
-  ServiceHealthStatus,
+
   TelegramSettings,
   User,
   WallComment,
@@ -117,13 +112,6 @@ type SystemUpdateResult = {
   restart?: { scheduled: boolean; serviceUnit?: string; reason?: string };
 };
 
-type ClientHealth = {
-  status: ServiceHealthStatus | "checking";
-  latencyMs: number | null;
-  checkedAt: string | null;
-  error: string;
-};
-
 type PageResult<T> = {
   rows: T[];
   total: number;
@@ -134,27 +122,8 @@ type PageResult<T> = {
 
 type DashboardData = {
   chart: Array<{ date: string; deposits: number; debits: number }>;
-  latencyTimeline: Array<Record<string, string | number>>;
-  latencySeries: Array<{ key: string; name: string; color: string }>;
-  latencyRecent: PageResult<LatencyCheck>;
-  latencyByUser: Array<{ name: string; avg: number; count: number }>;
+
   notifications: PageResult<AppNotification>;
-};
-
-type LatencyChartData = Pick<DashboardData, "latencyTimeline" | "latencySeries">;
-
-type LatencyPeriodGroup = "day" | "week" | "decade" | "month" | "quarter" | "halfyear" | "year" | "other";
-
-type LatencyPeriodRange = {
-  presetId: string;
-  label: string;
-  from: string;
-  to: string;
-  group: LatencyPeriodGroup;
-};
-
-type LatencyPeriodPreset = LatencyPeriodRange & {
-  description?: string;
 };
 
 type OperationPages = {
@@ -163,7 +132,7 @@ type OperationPages = {
 };
 
 type AccountPages = OperationPages & {
-  latency: PageResult<LatencyCheck>;
+
 };
 
 type WallListData = {
@@ -210,16 +179,6 @@ const operationSourceNames: Record<string, string> = {
   reversal: "Коррекция"
 };
 
-const healthLabels: Record<ServiceHealthStatus | "checking", string> = {
-  online: "Онлайн",
-  offline: "Недоступен",
-  maintenance: "Обслуживание",
-  unknown: "Нет данных",
-  checking: "Проверка"
-};
-
-const latencyLineColors = ["#7aa8ff", "#47d18c", "#f8c15d", "#ff8b82", "#b994ff", "#5ed4d6", "#f49ac2", "#c6cad2"];
-
 const navItems = [
   { id: "dashboard", label: "Обзор", icon: Gauge },
   { id: "wall", label: "Стена", icon: BookOpen },
@@ -236,24 +195,6 @@ const blankService = {
   notes: "",
   monthlyCost: 600,
   currency: "RUB",
-  connection: {
-    enabled: false,
-    host: "",
-    port: 8765,
-    sshPort: 22,
-    user: "",
-    password: "",
-    passwordSet: false,
-    websocketPath: "/echo",
-    useTls: false,
-    lastStatus: "unknown" as ServiceHealthStatus,
-    lastLatencyMs: null,
-    lastCheckedAt: null,
-    lastError: "",
-    lastDeployStatus: "unknown",
-    lastDeployAt: null,
-    lastDeployOutput: ""
-  },
   period: "month" as BillingPeriod,
   interval: 1,
   anchorDay: 1,
@@ -297,16 +238,8 @@ const emptyPage = <T,>(limit = ledgerPageLimit): PageResult<T> => ({
 
 const emptyDashboardData: DashboardData = {
   chart: [],
-  latencyTimeline: [],
-  latencySeries: [],
-  latencyRecent: emptyPage<LatencyCheck>(20),
-  latencyByUser: [],
-  notifications: emptyPage<AppNotification>(8)
-};
 
-const emptyLatencyChart: LatencyChartData = {
-  latencyTimeline: [],
-  latencySeries: []
+  notifications: emptyPage<AppNotification>(8)
 };
 
 const emptyOperationPages: OperationPages = {
@@ -317,7 +250,7 @@ const emptyOperationPages: OperationPages = {
 const emptyAccountPages: AccountPages = {
   deposits: emptyPage<Deposit>(),
   debits: emptyPage<Debit>(),
-  latency: emptyPage<LatencyCheck>(20)
+
 };
 
 const emptyWallData: WallListData = {
@@ -379,292 +312,6 @@ function shortDate(value: string) {
     day: "2-digit",
     month: "2-digit"
   }).format(new Date(value));
-}
-
-function dateInputValue(date: Date) {
-  const year = date.getFullYear();
-  const month = String(date.getMonth() + 1).padStart(2, "0");
-  const day = String(date.getDate()).padStart(2, "0");
-  return `${year}-${month}-${day}`;
-}
-
-function dateFromInput(value: string) {
-  const [year, month, day] = value.split("-").map(Number);
-  if (!year || !month || !day) return new Date();
-  return new Date(year, month - 1, day);
-}
-
-function dateInputToIso(value: string, endOfDay = false) {
-  if (!value) return "";
-  const date = dateFromInput(value);
-  date.setHours(endOfDay ? 23 : 0, endOfDay ? 59 : 0, endOfDay ? 59 : 0, endOfDay ? 999 : 0);
-  return date.toISOString();
-}
-
-function addDays(date: Date, days: number) {
-  const next = new Date(date);
-  next.setDate(next.getDate() + days);
-  return next;
-}
-
-function addMonths(date: Date, months: number) {
-  const next = new Date(date);
-  next.setMonth(next.getMonth() + months);
-  return next;
-}
-
-function startOfWeek(date: Date) {
-  const next = new Date(date);
-  const offset = (next.getDay() + 6) % 7;
-  next.setDate(next.getDate() - offset);
-  return next;
-}
-
-function endOfWeek(date: Date) {
-  return addDays(startOfWeek(date), 6);
-}
-
-function startOfMonth(date: Date) {
-  return new Date(date.getFullYear(), date.getMonth(), 1);
-}
-
-function endOfMonth(date: Date) {
-  return new Date(date.getFullYear(), date.getMonth() + 1, 0);
-}
-
-function decadeRange(date: Date, offset = 0) {
-  const absolute = date.getFullYear() * 36 + date.getMonth() * 3 + Math.floor((date.getDate() - 1) / 10) + offset;
-  const year = Math.floor(absolute / 36);
-  const month = Math.floor((absolute % 36) / 3);
-  const decade = absolute % 3;
-  const from = new Date(year, month, decade * 10 + 1);
-  const to = decade === 2 ? endOfMonth(from) : new Date(year, month, decade * 10 + 10);
-  return { from, to };
-}
-
-function quarterRange(date: Date, offset = 0) {
-  const absolute = date.getFullYear() * 4 + Math.floor(date.getMonth() / 3) + offset;
-  const year = Math.floor(absolute / 4);
-  const quarter = absolute % 4;
-  const from = new Date(year, quarter * 3, 1);
-  return { from, to: new Date(year, quarter * 3 + 3, 0) };
-}
-
-function halfYearRange(date: Date, offset = 0) {
-  const absolute = date.getFullYear() * 2 + Math.floor(date.getMonth() / 6) + offset;
-  const year = Math.floor(absolute / 2);
-  const half = absolute % 2;
-  const from = new Date(year, half * 6, 1);
-  return { from, to: new Date(year, half * 6 + 6, 0) };
-}
-
-function makeLatencyPeriod(presetId: string, label: string, from: Date | "", to: Date | "", group: LatencyPeriodGroup): LatencyPeriodPreset {
-  return {
-    presetId,
-    label,
-    from: from ? dateInputValue(from) : "",
-    to: to ? dateInputValue(to) : "",
-    group
-  };
-}
-
-function latencyPeriodLabel(period: Pick<LatencyPeriodRange, "from" | "to" | "label" | "presetId">) {
-  if (period.label && period.presetId !== "custom") return period.label;
-  if (!period.from && !period.to) return "Весь период";
-  const format = (value: string) => new Intl.DateTimeFormat("ru-RU").format(dateFromInput(value));
-  if (period.from && period.to) return `${format(period.from)} - ${format(period.to)}`;
-  if (period.from) return `С ${format(period.from)}`;
-  return `До ${format(period.to)}`;
-}
-
-function buildLatencyPeriodPresets(group: LatencyPeriodGroup, now = new Date()): LatencyPeriodPreset[] {
-  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-  const weekStart = startOfWeek(today);
-  const monthStart = startOfMonth(today);
-  const currentDecade = decadeRange(today);
-  const previousDecade = decadeRange(today, -1);
-  const nextDecade = decadeRange(today, 1);
-  const currentQuarter = quarterRange(today);
-  const previousQuarter = quarterRange(today, -1);
-  const currentHalfYear = halfYearRange(today);
-  const previousHalfYear = halfYearRange(today, -1);
-
-  if (group === "day") {
-    return [
-      makeLatencyPeriod("today", "Сегодня", today, today, group),
-      makeLatencyPeriod("yesterday", "Вчера", addDays(today, -1), addDays(today, -1), group),
-      makeLatencyPeriod("last3", "Последние 3 дня", addDays(today, -2), today, group),
-      makeLatencyPeriod("tomorrow", "Завтра", addDays(today, 1), addDays(today, 1), group)
-    ];
-  }
-  if (group === "week") {
-    return [
-      makeLatencyPeriod("previousWeek", "Прошлая неделя", addDays(weekStart, -7), addDays(weekStart, -1), group),
-      makeLatencyPeriod("last7", "Последние 7 дней", addDays(today, -6), today, group),
-      makeLatencyPeriod("fromWeekStart", "С начала этой недели", weekStart, today, group),
-      makeLatencyPeriod("thisWeek", "Эта неделя", weekStart, endOfWeek(today), group),
-      makeLatencyPeriod("toWeekEnd", "До конца этой недели", today, endOfWeek(today), group),
-      makeLatencyPeriod("next7", "Следующие 7 дней", today, addDays(today, 6), group),
-      makeLatencyPeriod("nextWeek", "Следующая неделя", addDays(weekStart, 7), addDays(weekStart, 13), group)
-    ];
-  }
-  if (group === "decade") {
-    return [
-      makeLatencyPeriod("previousDecade", "Прошлая декада", previousDecade.from, previousDecade.to, group),
-      makeLatencyPeriod("thisDecade", "Эта декада", currentDecade.from, currentDecade.to, group),
-      makeLatencyPeriod("fromDecadeStart", "С начала этой декады", currentDecade.from, today, group),
-      makeLatencyPeriod("nextDecade", "Следующая декада", nextDecade.from, nextDecade.to, group)
-    ];
-  }
-  if (group === "month") {
-    return [
-      makeLatencyPeriod("previousMonth", "Прошлый месяц", startOfMonth(addMonths(today, -1)), endOfMonth(addMonths(today, -1)), group),
-      makeLatencyPeriod("last30", "Последние 30 дней", addDays(today, -29), today, group),
-      makeLatencyPeriod("fromMonthStart", "С начала месяца", monthStart, today, group),
-      makeLatencyPeriod("thisMonth", "Этот месяц", monthStart, endOfMonth(today), group),
-      makeLatencyPeriod("nextMonth", "Следующий месяц", startOfMonth(addMonths(today, 1)), endOfMonth(addMonths(today, 1)), group)
-    ];
-  }
-  if (group === "quarter") {
-    return [
-      makeLatencyPeriod("previousQuarter", "Прошлый квартал", previousQuarter.from, previousQuarter.to, group),
-      makeLatencyPeriod("thisQuarter", "Этот квартал", currentQuarter.from, currentQuarter.to, group),
-      makeLatencyPeriod("fromQuarterStart", "С начала квартала", currentQuarter.from, today, group)
-    ];
-  }
-  if (group === "halfyear") {
-    return [
-      makeLatencyPeriod("previousHalfYear", "Прошлое полугодие", previousHalfYear.from, previousHalfYear.to, group),
-      makeLatencyPeriod("thisHalfYear", "Это полугодие", currentHalfYear.from, currentHalfYear.to, group),
-      makeLatencyPeriod("fromHalfYearStart", "С начала полугодия", currentHalfYear.from, today, group)
-    ];
-  }
-  if (group === "year") {
-    return [
-      makeLatencyPeriod("previousYear", "Прошлый год", new Date(today.getFullYear() - 1, 0, 1), new Date(today.getFullYear() - 1, 11, 31), group),
-      makeLatencyPeriod("last365", "Последние 365 дней", addDays(today, -364), today, group),
-      makeLatencyPeriod("fromYearStart", "С начала года", new Date(today.getFullYear(), 0, 1), today, group),
-      makeLatencyPeriod("thisYear", "Этот год", new Date(today.getFullYear(), 0, 1), new Date(today.getFullYear(), 11, 31), group)
-    ];
-  }
-  return [
-    { presetId: "all", label: "Весь период", from: "", to: "", group },
-    makeLatencyPeriod("last14", "Последние 14 дней", addDays(today, -13), today, group),
-    makeLatencyPeriod("last90", "Последние 90 дней", addDays(today, -89), today, group)
-  ];
-}
-
-function defaultLatencyPeriod() {
-  return buildLatencyPeriodPresets("week")[1];
-}
-
-function appendLatencyPeriodQuery(query: URLSearchParams, period: LatencyPeriodRange, prefix = "") {
-  const from = dateInputToIso(period.from, false);
-  const to = dateInputToIso(period.to, true);
-  const fromKey = prefix ? `${prefix}From` : "from";
-  const toKey = prefix ? `${prefix}To` : "to";
-  if (from) query.set(fromKey, from);
-  if (to) query.set(toKey, to);
-}
-
-function serviceConnection(service: Service): ServiceConnectionSettings {
-  return { ...blankService.connection, ...(service.connection ?? {}) };
-}
-
-function serviceHealth(service: Service, clientHealth?: ClientHealth): ClientHealth {
-  const connection = serviceConnection(service);
-  if (connection.lastStatus === "maintenance") {
-    return {
-      status: "maintenance",
-      latencyMs: null,
-      checkedAt: connection.lastCheckedAt ?? null,
-      error: connection.lastError ?? ""
-    };
-  }
-
-  return (
-    clientHealth ?? {
-      status: connection.lastStatus ?? "unknown",
-      latencyMs: connection.lastLatencyMs ?? null,
-      checkedAt: connection.lastCheckedAt ?? null,
-      error: connection.lastError ?? ""
-    }
-  );
-}
-
-function healthTone(status: ServiceHealthStatus | "checking"): "good" | "warn" | "bad" | undefined {
-  if (status === "online") return "good";
-  if (status === "offline") return "bad";
-  if (status === "checking" || status === "maintenance") return "warn";
-  return undefined;
-}
-
-function healthValue(health: ClientHealth) {
-  const latency = health.latencyMs !== null ? ` · ${health.latencyMs} мс` : "";
-  return `${healthLabels[health.status]}${latency}`;
-}
-
-function buildServiceWebSocketUrl(service: Service) {
-  const connection = serviceConnection(service);
-  const rawHost = connection.host.trim();
-  let host = rawHost.replace(/^wss?:\/\//i, "").replace(/\/.*$/, "");
-  let port = String(connection.port || 8765);
-  try {
-    const parsed = new URL(/^[a-z]+:\/\//i.test(rawHost) ? rawHost : `ws://${rawHost}`);
-    host = parsed.hostname;
-    port = parsed.port || port;
-  } catch {
-    const hostMatch = host.match(/^(.*):(\d+)$/);
-    host = hostMatch?.[1] || host;
-    port = hostMatch?.[2] || port;
-  }
-  const hostForUrl = host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
-  const path = (connection.websocketPath || "/echo").startsWith("/")
-    ? connection.websocketPath || "/echo"
-    : `/${connection.websocketPath}`;
-  const protocol = connection.useTls || window.location.protocol === "https:" ? "wss" : "ws";
-
-  return `${protocol}://${hostForUrl}:${port}${path}`;
-}
-
-function checkServiceFromClient(service: Service) {
-  const connection = serviceConnection(service);
-  const checkedAt = new Date().toISOString();
-
-  if (!connection.enabled || !connection.host.trim()) {
-    return Promise.resolve({ status: "unknown" as ServiceHealthStatus, latencyMs: null, checkedAt, error: "" });
-  }
-
-  return new Promise<{ status: ServiceHealthStatus; latencyMs: number | null; checkedAt: string; error: string }>((resolve) => {
-    let settled = false;
-    let socket: WebSocket | null = null;
-    const started = performance.now();
-    const payload = `vpn-pay:${service.id}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
-
-    const finish = (status: ServiceHealthStatus, latencyMs: number | null, error = "") => {
-      if (settled) return;
-      settled = true;
-      window.clearTimeout(timeout);
-      try {
-        socket?.close();
-      } catch {
-        // ignore close errors after failed handshakes
-      }
-      resolve({ status, latencyMs, checkedAt: new Date().toISOString(), error });
-    };
-
-    const timeout = window.setTimeout(() => finish("offline", null, "timeout"), 5000);
-
-    try {
-      socket = new WebSocket(buildServiceWebSocketUrl(service));
-      socket.addEventListener("open", () => socket?.send(payload));
-      socket.addEventListener("message", () => finish("online", Math.round(performance.now() - started)));
-      socket.addEventListener("error", () => finish("offline", null, "websocket error"));
-      socket.addEventListener("close", () => finish("offline", null, "connection closed"));
-    } catch (error) {
-      finish("offline", null, error instanceof Error ? error.message : "connection failed");
-    }
-  });
 }
 
 function activeServicesForUser(state: AppState, userId: string) {
@@ -747,15 +394,6 @@ function Stat({
   );
 }
 
-function ServiceHealthBadge({ health, compact = false }: { health: ClientHealth; compact?: boolean }) {
-  return (
-    <span className={classNames("service-health", health.status, compact && "compact")} title={health.error || undefined}>
-      <span className={classNames("status-dot", health.status)} />
-      <span>{healthValue(health)}</span>
-    </span>
-  );
-}
-
 function PaginationControls<T>({ page, onChange }: { page: PageResult<T>; onChange: (offset: number) => void }) {
   const pageNumber = Math.floor(page.offset / page.limit) + 1;
   const pageCount = Math.max(1, Math.ceil(page.total / page.limit));
@@ -790,115 +428,6 @@ function UserAvatar({ user, size = "normal" }: { user: Pick<User, "name" | "avat
 
 function Empty({ label }: { label: string }) {
   return <div className="empty">{label}</div>;
-}
-
-function LatencyPeriodModal({
-  value,
-  onSelect,
-  onClose
-}: {
-  value: LatencyPeriodRange;
-  onSelect: (period: LatencyPeriodRange) => void;
-  onClose: () => void;
-}) {
-  const [group, setGroup] = useState<LatencyPeriodGroup>(value.group);
-  const [draft, setDraft] = useState<LatencyPeriodRange>(value);
-  const presets = useMemo(() => buildLatencyPeriodPresets(group), [group]);
-  const groups: Array<{ id: LatencyPeriodGroup; label: string }> = [
-    { id: "day", label: "День" },
-    { id: "week", label: "Неделя" },
-    { id: "decade", label: "Декада" },
-    { id: "month", label: "Месяц" },
-    { id: "quarter", label: "Квартал" },
-    { id: "halfyear", label: "Полугодие" },
-    { id: "year", label: "Год" },
-    { id: "other", label: "Прочее" }
-  ];
-
-  const setCustomRange = (next: Partial<Pick<LatencyPeriodRange, "from" | "to">>) => {
-    setDraft((current) => ({
-      ...current,
-      ...next,
-      presetId: "custom",
-      label: ""
-    }));
-  };
-
-  return (
-    <ModalShell
-      title="Выберите период"
-      onClose={onClose}
-      footer={
-        <>
-          <button className="ghost" type="button" onClick={onClose}>
-            Отмена
-          </button>
-          <button className="primary" type="button" onClick={() => onSelect({ ...draft, label: latencyPeriodLabel(draft), group })}>
-            <Check size={16} />
-            Выбрать
-          </button>
-        </>
-      }
-    >
-      <div className="period-picker">
-        <div className="period-picker-fields">
-          <label>
-            <input type="date" value={draft.from} onChange={(event) => setCustomRange({ from: event.target.value })} />
-          </label>
-          <span>–</span>
-          <label>
-            <input type="date" value={draft.to} onChange={(event) => setCustomRange({ to: event.target.value })} />
-          </label>
-          <button
-            className="link-button"
-            type="button"
-            onClick={() => {
-              setGroup("other");
-              setDraft({ presetId: "all", label: "Весь период", from: "", to: "", group: "other" });
-            }}
-          >
-            Очистить период
-          </button>
-        </div>
-
-        <div className="period-picker-body">
-          <div className="period-preset-list">
-            {presets.map((preset) => (
-              <button
-                key={preset.presetId}
-                className={classNames("period-preset", draft.presetId === preset.presetId && draft.group === preset.group && "active")}
-                type="button"
-                onClick={() => setDraft(preset)}
-              >
-                {preset.label}
-              </button>
-            ))}
-          </div>
-
-          <div className="period-group-list">
-            {groups.map((item) => (
-              <button
-                key={item.id}
-                className={classNames("period-group", group === item.id && "active")}
-                type="button"
-                onClick={() => setGroup(item.id)}
-              >
-                {item.label}
-              </button>
-            ))}
-          </div>
-        </div>
-
-        <button
-          className="link-button period-custom-link"
-          type="button"
-          onClick={() => setDraft((current) => ({ ...current, presetId: "custom", label: "" }))}
-        >
-          Показать произвольный период
-        </button>
-      </div>
-    </ModalShell>
-  );
 }
 
 function ModalShell({
@@ -949,7 +478,7 @@ function ModalShell({
   );
 }
 
-function AuthScreen({ users, onLogin }: { users: AuthUser[]; onLogin: (userId: string, password: string) => Promise<void> }) {
+function AuthScreen({ users, onLogin, notice }: { notice?: string; users: AuthUser[]; onLogin: (userId: string, password: string) => Promise<void> }) {
   const [selectedUserId, setSelectedUserId] = useState(users[0]?.id ?? "");
   const [password, setPassword] = useState("");
   const [submitting, setSubmitting] = useState(false);
@@ -989,6 +518,7 @@ function AuthScreen({ users, onLogin }: { users: AuthUser[]; onLogin: (userId: s
           <h1>Вход</h1>
           <span className="muted">Выберите участника</span>
         </div>
+        {notice && <p role="status">{notice}</p>}
         {selectedUser ? (
           <>
             <label className="auth-combobox">
@@ -1048,8 +578,7 @@ export default function App() {
   const [serviceForm, setServiceForm] = useState(blankService);
   const [userForm, setUserForm] = useState(blankUser);
   const [currencyForm, setCurrencyForm] = useState({ code: "", name: "", symbol: "", rateToRub: 1 });
-  const [clientHealth, setClientHealth] = useState<Record<string, ClientHealth>>({});
-  const [deployingServiceId, setDeployingServiceId] = useState("");
+
   const [depositForm, setDepositForm] = useState({
     serviceId: "",
     userId: "",
@@ -1059,14 +588,12 @@ export default function App() {
   });
   const [dashboardData, setDashboardData] = useState<DashboardData>(emptyDashboardData);
   const [dashboardNotificationOffset, setDashboardNotificationOffset] = useState(0);
-  const [dashboardLatencyOffset, setDashboardLatencyOffset] = useState(0);
-  const [dashboardLatencyPeriod, setDashboardLatencyPeriod] = useState<LatencyPeriodRange>(() => defaultLatencyPeriod());
+
   const [operationPages, setOperationPages] = useState<OperationPages>(emptyOperationPages);
   const [operationOffsets, setOperationOffsets] = useState({ deposits: 0, debits: 0 });
   const [accountPages, setAccountPages] = useState<AccountPages>(emptyAccountPages);
-  const [accountLatencyChart, setAccountLatencyChart] = useState<LatencyChartData>(emptyLatencyChart);
-  const [accountLatencyPeriod, setAccountLatencyPeriod] = useState<LatencyPeriodRange>(() => defaultLatencyPeriod());
-  const [accountOffsets, setAccountOffsets] = useState({ deposits: 0, debits: 0, latency: 0 });
+
+  const [accountOffsets, setAccountOffsets] = useState({ deposits: 0, debits: 0 });
   const [wallPostId, setWallPostId] = useState(() => wallPostIdFromHash());
   const [wallRefreshKey, setWallRefreshKey] = useState(0);
 
@@ -1104,20 +631,18 @@ export default function App() {
 
   const loadDashboardData = async (
     notificationOffset = dashboardNotificationOffset,
-    latencyOffset = dashboardLatencyOffset,
-    latencyPeriod = dashboardLatencyPeriod
+
   ) => {
     const query = new URLSearchParams({
       notificationOffset: String(notificationOffset),
       notificationLimit: "8",
-      latencyOffset: String(latencyOffset),
-      latencyLimit: "20"
+
     });
-    appendLatencyPeriodQuery(query, latencyPeriod, "latency");
+
     const nextDashboard = await api<DashboardData>(`/api/dashboard?${query.toString()}`);
     setDashboardData(nextDashboard);
     setDashboardNotificationOffset(notificationOffset);
-    setDashboardLatencyOffset(latencyOffset);
+
     return nextDashboard;
   };
 
@@ -1148,8 +673,7 @@ export default function App() {
   const loadAccountData = async (
     depositOffset = accountOffsets.deposits,
     debitOffset = accountOffsets.debits,
-    latencyOffset = accountOffsets.latency,
-    latencyPeriod = accountLatencyPeriod
+
   ) => {
     if (!currentUser) return emptyAccountPages;
     const depositQuery = new URLSearchParams({
@@ -1162,29 +686,20 @@ export default function App() {
       limit: String(ledgerPageLimit),
       userId: currentUser.id
     });
-    const latencyQuery = new URLSearchParams({
-      offset: String(latencyOffset),
-      limit: String(ledgerPageLimit),
-      userId: currentUser.id
-    });
-    const latencyChartQuery = new URLSearchParams({ userId: currentUser.id });
-    appendLatencyPeriodQuery(latencyChartQuery, latencyPeriod);
-    const [deposits, debits, latency, latencyChart] = await Promise.all([
+    const [deposits, debits] = await Promise.all([
       api<PageResult<Deposit>>(`/api/deposits?${depositQuery.toString()}`),
       api<PageResult<Debit>>(`/api/debits?${debitQuery.toString()}`),
-      api<PageResult<LatencyCheck>>(`/api/latency-checks?${latencyQuery.toString()}`),
-      api<LatencyChartData>(`/api/latency-chart?${latencyChartQuery.toString()}`)
     ]);
-    const nextPages = { deposits, debits, latency };
+    const nextPages = { deposits, debits };
     setAccountPages(nextPages);
-    setAccountLatencyChart(latencyChart);
-    setAccountOffsets({ deposits: depositOffset, debits: debitOffset, latency: latencyOffset });
+
+    setAccountOffsets({ deposits: depositOffset, debits: debitOffset });
     return nextPages;
   };
 
   const refreshOpenViewData = async (reset = false) => {
     if (view === "dashboard") {
-      await loadDashboardData(reset ? 0 : dashboardNotificationOffset, reset ? 0 : dashboardLatencyOffset, dashboardLatencyPeriod);
+      await loadDashboardData(reset ? 0 : dashboardNotificationOffset);
     }
     if (view === "ledger") {
       await loadOperationData(reset ? 0 : operationOffsets.deposits, reset ? 0 : operationOffsets.debits);
@@ -1193,8 +708,6 @@ export default function App() {
       await loadAccountData(
         reset ? 0 : accountOffsets.deposits,
         reset ? 0 : accountOffsets.debits,
-        reset ? 0 : accountOffsets.latency,
-        accountLatencyPeriod
       );
     }
     if (view === "wall") {
@@ -1231,7 +744,7 @@ export default function App() {
 
   useEffect(() => {
     if (!state || !currentUser || view !== "dashboard") return;
-    loadDashboardData(0, 0).catch((error) => setToast(error.message));
+    loadDashboardData(0).catch((error) => setToast(error.message));
   }, [view, currentUser?.id]);
 
   useEffect(() => {
@@ -1241,7 +754,7 @@ export default function App() {
 
   useEffect(() => {
     if (!state || !currentUser || view !== "account") return;
-    loadAccountData(0, 0, 0).catch((error) => setToast(error.message));
+    loadAccountData(0, 0).catch((error) => setToast(error.message));
   }, [view, currentUser?.id]);
 
   useEffect(() => {
@@ -1262,81 +775,6 @@ export default function App() {
     setWallPostId("");
     if (window.location.hash !== "#/wall") setWallHash();
   };
-
-  const healthConfigKey = useMemo(
-    () =>
-      state?.services
-        .map((service) => {
-          const connection = serviceConnection(service);
-          return [
-            service.id,
-            connection.enabled,
-            connection.host,
-            connection.port,
-            connection.websocketPath,
-            connection.useTls
-          ].join(":");
-        })
-        .join("|") ?? "",
-    [currentUser?.id, state?.services]
-  );
-
-  const probeService = async (service: Service) => {
-    const connection = serviceConnection(service);
-    if (!currentUser || !connection.enabled || !connection.host.trim() || connection.lastStatus === "maintenance") return;
-
-    setClientHealth((current) => ({
-      ...current,
-      [service.id]: { status: "checking", latencyMs: null, checkedAt: new Date().toISOString(), error: "" }
-    }));
-
-    const result = await checkServiceFromClient(service);
-    setClientHealth((current) => ({
-      ...current,
-      [service.id]: result
-    }));
-
-    try {
-      const nextState = await api(`/api/services/${service.id}/health`, {
-        method: "POST",
-        body: JSON.stringify({ ...result, userId: currentUser.id })
-      });
-      setState(nextState);
-    } catch (error) {
-      setClientHealth((current) => ({
-        ...current,
-        [service.id]: {
-          ...result,
-          status: "offline",
-          error: error instanceof Error ? error.message : result.error
-        }
-      }));
-    }
-  };
-
-  useEffect(() => {
-    if (!state || !currentUser) return;
-    const services = state.services.filter((service) => {
-      const connection = serviceConnection(service);
-      return connection.enabled && connection.host.trim() && connection.lastStatus !== "maintenance";
-    });
-    if (!services.length) return;
-
-    let cancelled = false;
-    const run = () => {
-      for (const service of services) {
-        if (!cancelled) void probeService(service);
-      }
-    };
-
-    run();
-    const timer = window.setInterval(run, 60_000);
-
-    return () => {
-      cancelled = true;
-      window.clearInterval(timer);
-    };
-  }, [healthConfigKey, currentUser?.id]);
 
   useEffect(() => {
     if (!toast) return;
@@ -1418,7 +856,14 @@ export default function App() {
   const importDatabase = async (file: File) => {
     try {
       if (file.name.toLowerCase().endsWith(".json")) {
-        await mutate("/api/database/import", JSON.parse(await file.text()));
+        const token = window.localStorage.getItem(authTokenStorageKey);
+        const response = await fetch("/api/database/import", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", ...(token ? { "x-auth-token": token } : {}) },
+          body: JSON.stringify(JSON.parse(await file.text()))
+        });
+        const result = (await response.json()) as ApiResult;
+        if (!response.ok || !result.ok) throw new Error(result.error || "Не удалось восстановить базу");
       } else {
         const token = window.localStorage.getItem(authTokenStorageKey);
         const response = await fetch("/api/database/import", {
@@ -1433,7 +878,9 @@ export default function App() {
         if (!response.ok || !result.ok) throw new Error(result.error || "Не удалось восстановить базу");
         setState(result.payload as AppState);
       }
-      setToast("База загружена");
+      clearAuth();
+      await loadAuthUsers();
+      setToast("База загружена. Войдите с паролем из резервной копии");
     } catch (error) {
       setToast(error instanceof Error ? error.message : "Ошибка загрузки базы");
     }
@@ -1463,10 +910,7 @@ export default function App() {
         debt: 0,
         chart: [],
         balances: [],
-        latencyTimeline: emptyDashboardData.latencyTimeline,
-        latencySeries: emptyDashboardData.latencySeries,
-        latencyRecent: emptyDashboardData.latencyRecent,
-        latencyByUser: emptyDashboardData.latencyByUser,
+
         notifications: emptyDashboardData.notifications
       };
     }
@@ -1489,10 +933,7 @@ export default function App() {
       debt: state.summaries.reduce((sum, summary) => sum + summary.debtCount, 0),
       chart: dashboardData.chart,
       balances,
-      latencyTimeline: dashboardData.latencyTimeline,
-      latencySeries: dashboardData.latencySeries,
-      latencyRecent: dashboardData.latencyRecent,
-      latencyByUser: dashboardData.latencyByUser,
+
       notifications: dashboardData.notifications
     };
   }, [dashboardData, state]);
@@ -1501,6 +942,7 @@ export default function App() {
     if (!window.localStorage.getItem(authTokenStorageKey)) {
       return (
         <AuthScreen
+          notice={toast}
           users={authUsers}
           onLogin={async (userId, password) => {
             const result = await api<AuthLoginResult>("/api/auth/login", {
@@ -1527,6 +969,7 @@ export default function App() {
   if (!currentUser) {
     return (
       <AuthScreen
+          notice={toast}
         users={authUsers.length ? authUsers : state.users.map((user) => ({
           id: user.id,
           name: user.name,
@@ -1559,70 +1002,25 @@ export default function App() {
         monthlyCost: service.monthlyCost,
         currency: service.currency,
         active: service.active,
-        connection: service.connection,
+
         ...service.billing
       },
       "PUT"
     );
 
-  const toggleServiceMaintenance = async (service: Service, maintenance: boolean) => {
-    try {
-      setToast(maintenance ? "Перевожу сервис на обслуживание" : "Возвращаю сервис в работу");
-      const nextState = await api(`/api/services/${service.id}/maintenance`, {
-        method: "POST",
-        body: JSON.stringify({ maintenance })
-      });
-      setState(nextState);
-      setClientHealth((current) => {
-        const next = { ...current };
-        delete next[service.id];
-        return next;
-      });
-      setToast(maintenance ? "Сервис на обслуживании" : "Сервис возвращён в работу");
-      return nextState;
-    } catch (error) {
-      setToast(error instanceof Error ? error.message : "Ошибка переключения обслуживания");
-      throw error;
-    }
-  };
-
-  const deployEchoServer = async (serviceId: string) => {
-    try {
-      setDeployingServiceId(serviceId);
-      setToast("Запускаю деплой echo-сервера");
-      const nextState = await mutate(`/api/services/${serviceId}/deploy-echo`, {});
-      const service = nextState.services.find((item) => item.id === serviceId);
-      setToast(service && serviceConnection(service).lastDeployStatus === "failed" ? "Деплой не удался" : "Echo-сервер развёрнут");
-      return nextState;
-    } finally {
-      setDeployingServiceId("");
-    }
-  };
-
   const saveUser = (user: User & { adminPassword?: string; currentPassword?: string }) => mutate(`/api/users/${user.id}`, user, "PUT");
   const saveTelegram = (telegram: TelegramSettings) => mutate("/api/settings/telegram", telegram, "PUT");
   const saveCurrency = (currency: Currency) => mutate(`/api/currencies/${currency.code}`, currency, "PUT");
-  const applyDashboardLatencyPeriod = (period: LatencyPeriodRange) => {
-    setDashboardLatencyPeriod(period);
-    loadDashboardData(dashboardNotificationOffset, 0, period).catch((error) => setToast(error.message));
-  };
-  const applyAccountLatencyPeriod = (period: LatencyPeriodRange) => {
-    setAccountLatencyPeriod(period);
-    loadAccountData(accountOffsets.deposits, accountOffsets.debits, 0, period).catch((error) => setToast(error.message));
-  };
-
   const content = {
     dashboard: (
       <Dashboard
         state={state}
         dashboard={dashboard}
-        latencyPeriod={dashboardLatencyPeriod}
-        clientHealth={clientHealth}
+
         serviceById={serviceById}
         userById={userById}
-        onLatencyPeriodChange={applyDashboardLatencyPeriod}
-        onLatencyPageChange={(offset) => loadDashboardData(dashboardNotificationOffset, offset).catch((error) => setToast(error.message))}
-        onNotificationPageChange={(offset) => loadDashboardData(offset, dashboardLatencyOffset).catch((error) => setToast(error.message))}
+
+        onNotificationPageChange={(offset) => loadDashboardData(offset).catch((error) => setToast(error.message))}
       />
     ),
     wall: (
@@ -1658,11 +1056,7 @@ export default function App() {
         userById={userById}
         mutate={mutate}
         setSelectedServiceId={setSelectedServiceId}
-        clientHealth={clientHealth}
-        probeService={probeService}
-        toggleServiceMaintenance={toggleServiceMaintenance}
-        deployingServiceId={deployingServiceId}
-        deployEchoServer={deployEchoServer}
+
         saveService={saveService}
         isAdmin={isAdmin}
       />
@@ -1716,18 +1110,17 @@ export default function App() {
         state={state}
         currentUser={currentUser}
         pages={accountPages}
-        latencyGraph={accountLatencyChart}
-        latencyPeriod={accountLatencyPeriod}
+
         saveUser={saveUser}
         serviceById={serviceById}
         setToast={setToast}
         onPay={() => setView("pay")}
-        onLatencyPeriodChange={applyAccountLatencyPeriod}
+
         onPageChange={(kind, offset) => {
           const nextDepositOffset = kind === "deposits" ? offset : accountOffsets.deposits;
           const nextDebitOffset = kind === "debits" ? offset : accountOffsets.debits;
-          const nextLatencyOffset = kind === "latency" ? offset : accountOffsets.latency;
-          loadAccountData(nextDepositOffset, nextDebitOffset, nextLatencyOffset).catch((error) => setToast(error.message));
+
+          loadAccountData(nextDepositOffset, nextDebitOffset).catch((error) => setToast(error.message));
         }}
       />
     )
@@ -1755,6 +1148,7 @@ export default function App() {
             return (
               <button
                 key={item.id}
+                aria-label={item.label}
                 className={classNames("nav-item", view === item.id && "active")}
                 onClick={() => {
                   if (item.id === "wall") showWallList();
@@ -1852,12 +1246,10 @@ export default function App() {
 function Dashboard({
   state,
   dashboard,
-  latencyPeriod,
-  clientHealth,
+
   serviceById,
   userById,
-  onLatencyPeriodChange,
-  onLatencyPageChange,
+
   onNotificationPageChange
 }: {
   state: AppState;
@@ -1868,21 +1260,15 @@ function Dashboard({
     debt: number;
     chart: Array<{ date: string; deposits: number; debits: number }>;
     balances: Array<{ name: string; balance: number }>;
-    latencyTimeline: Array<Record<string, string | number>>;
-    latencySeries: Array<{ key: string; name: string; color: string }>;
-    latencyRecent: PageResult<LatencyCheck>;
-    latencyByUser: Array<{ name: string; avg: number; count: number }>;
+
     notifications: PageResult<AppNotification>;
   };
-  latencyPeriod: LatencyPeriodRange;
-  clientHealth: Record<string, ClientHealth>;
+
   serviceById: (id: string) => Service | undefined;
   userById: (id: string) => User | undefined;
-  onLatencyPeriodChange: (period: LatencyPeriodRange) => void;
-  onLatencyPageChange: (offset: number) => void;
+
   onNotificationPageChange: (offset: number) => void;
 }) {
-  const [latencyPeriodOpen, setLatencyPeriodOpen] = useState(false);
 
   return (
     <section className="page-grid">
@@ -1968,7 +1354,6 @@ function Dashboard({
                 <th>Стоимость</th>
                 <th>Участники</th>
                 <th>Период</th>
-                <th>Сервер</th>
                 <th>Следующее списание</th>
               </tr>
             </thead>
@@ -1984,9 +1369,7 @@ function Dashboard({
                     <td>{money(service.monthlyCost, service.currency)}</td>
                     <td>{summary?.memberCount ?? 0}</td>
                     <td>{periodNames[service.billing.period]}</td>
-                    <td>
-                      <ServiceHealthBadge health={serviceHealth(service, clientHealth[service.id])} compact />
-                    </td>
+
                     <td>{dateTime(summary?.nextChargeAt)}</td>
                   </tr>
                 );
@@ -1994,118 +1377,6 @@ function Dashboard({
             </tbody>
           </table>
         </div>
-      </div>
-
-      <div className="panel chart-panel">
-        <div className="panel-head">
-          <h2>Пинг пользователей</h2>
-          <span className="chip">{dashboard.latencyByUser.length}</span>
-        </div>
-        <div className="chart-wrap compact">
-          {dashboard.latencyByUser.length ? (
-            <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={dashboard.latencyByUser} layout="vertical" margin={{ left: 12, right: 12 }}>
-                <CartesianGrid stroke="rgba(255,255,255,.06)" horizontal={false} />
-                <XAxis type="number" axisLine={false} tickLine={false} tick={{ fill: "#8a8f98", fontSize: 12 }} />
-                <YAxis
-                  type="category"
-                  width={116}
-                  dataKey="name"
-                  axisLine={false}
-                  tickLine={false}
-                  tick={{ fill: "#c6cad2", fontSize: 12 }}
-                />
-                <Tooltip contentStyle={{ background: "#111318", border: "1px solid #272a33", borderRadius: 8 }} />
-                <Bar dataKey="avg" fill="#47d18c" radius={[0, 4, 4, 0]} name="Средний пинг, мс" />
-              </BarChart>
-            </ResponsiveContainer>
-          ) : (
-            <Empty label="Замеров пока нет" />
-          )}
-        </div>
-      </div>
-
-      <div className="panel chart-panel wide">
-        <div className="panel-head">
-          <h2>История задержки</h2>
-          <div className="actions">
-            <button className="ghost compact period-trigger" type="button" onClick={() => setLatencyPeriodOpen(true)}>
-              <CalendarClock size={14} />
-              {latencyPeriodLabel(latencyPeriod)}
-            </button>
-            <span className="chip">{dashboard.latencySeries.length}</span>
-          </div>
-        </div>
-        <div className="chart-wrap latency-history">
-          {dashboard.latencyTimeline.length && dashboard.latencySeries.length ? (
-            <ResponsiveContainer width="100%" height="100%">
-              <LineChart data={dashboard.latencyTimeline}>
-                <CartesianGrid stroke="rgba(255,255,255,.06)" vertical={false} />
-                <XAxis dataKey="time" axisLine={false} tickLine={false} tick={{ fill: "#8a8f98", fontSize: 12 }} />
-                <YAxis axisLine={false} tickLine={false} tick={{ fill: "#8a8f98", fontSize: 12 }} />
-                <Tooltip contentStyle={{ background: "#111318", border: "1px solid #272a33", borderRadius: 8 }} />
-                <Legend wrapperStyle={{ color: "#c6cad2", fontSize: 12 }} />
-                {dashboard.latencySeries.map((series) => (
-                  <Line
-                    key={series.key}
-                    type="monotone"
-                    dataKey={series.key}
-                    name={series.name}
-                    stroke={series.color}
-                    strokeWidth={2}
-                    dot={false}
-                    connectNulls
-                  />
-                ))}
-              </LineChart>
-            </ResponsiveContainer>
-          ) : (
-            <Empty label="История замеров пока пуста" />
-          )}
-        </div>
-        {latencyPeriodOpen && (
-          <LatencyPeriodModal
-            value={latencyPeriod}
-            onClose={() => setLatencyPeriodOpen(false)}
-            onSelect={(period) => {
-              onLatencyPeriodChange(period);
-              setLatencyPeriodOpen(false);
-            }}
-          />
-        )}
-      </div>
-
-      <div className="panel wide">
-        <div className="panel-head">
-          <h2>Последние замеры</h2>
-          <span className="chip">{dashboard.latencyRecent.total}</span>
-        </div>
-        <div className="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>Дата</th>
-                <th>Пользователь</th>
-                <th>Сервис</th>
-                <th>Статус</th>
-                <th>Задержка</th>
-              </tr>
-            </thead>
-            <tbody>
-              {dashboard.latencyRecent.rows.map((check) => (
-                <tr key={check.id}>
-                  <td>{dateTime(check.checkedAt)}</td>
-                  <td>{userById(check.userId ?? "")?.name ?? "Не выбран"}</td>
-                  <td>{serviceById(check.serviceId)?.name ?? "Сервис"}</td>
-                  <td>{healthLabels[check.status]}</td>
-                  <td>{check.latencyMs === null ? "нет данных" : `${check.latencyMs} мс`}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-          {!dashboard.latencyRecent.rows.length && <Empty label="Замеров пока нет" />}
-        </div>
-        <PaginationControls page={dashboard.latencyRecent} onChange={onLatencyPageChange} />
       </div>
 
       <div className="panel">
@@ -3648,11 +2919,7 @@ function ServicesView({
   userById,
   mutate,
   setSelectedServiceId,
-  clientHealth,
-  probeService,
-  toggleServiceMaintenance,
-  deployingServiceId,
-  deployEchoServer,
+
   saveService,
   isAdmin
 }: {
@@ -3666,11 +2933,7 @@ function ServicesView({
   userById: (id: string) => User | undefined;
   mutate: (path: string, body?: unknown, method?: string) => Promise<AppState>;
   setSelectedServiceId: (id: string) => void;
-  clientHealth: Record<string, ClientHealth>;
-  probeService: (service: Service) => Promise<void>;
-  toggleServiceMaintenance: (service: Service, maintenance: boolean) => Promise<AppState>;
-  deployingServiceId: string;
-  deployEchoServer: (serviceId: string) => Promise<AppState>;
+
   saveService: (service: Service) => Promise<AppState>;
   isAdmin: boolean;
 }) {
@@ -3683,8 +2946,6 @@ function ServicesView({
     setDraft(selectedService ?? null);
   }, [selectedService]);
 
-  const selectedHealth = selectedService ? serviceHealth(selectedService, clientHealth[selectedService.id]) : null;
-
   const openDeposit = (membership: AppState["memberships"][number]) => {
     setDepositDraft({
       serviceId: membership.serviceId,
@@ -3693,34 +2954,6 @@ function ServicesView({
       currency: selectedService?.currency ?? "RUB",
       comment: ""
     });
-  };
-
-  const deploySelectedEchoServer = async () => {
-    if (!draft) return;
-    const savedState = await saveService(draft);
-    const savedService = savedState.services.find((service) => service.id === draft.id);
-    if (!savedService) return;
-    const nextState = await deployEchoServer(savedService.id);
-    const nextService = nextState.services.find((service) => service.id === savedService.id);
-    if (nextService) {
-      setDraft(nextService);
-      if (serviceConnection(nextService).lastDeployStatus === "success") {
-        void probeService(nextService);
-      }
-    }
-  };
-
-  const toggleSelectedMaintenance = async () => {
-    if (!draft) return;
-    const maintenance = serviceConnection(draft).lastStatus !== "maintenance";
-    const nextState = await toggleServiceMaintenance(draft, maintenance);
-    const nextService = nextState.services.find((service) => service.id === draft.id);
-    if (nextService) {
-      setDraft(nextService);
-      if (!maintenance) {
-        void probeService(nextService);
-      }
-    }
   };
 
   return (
@@ -3796,7 +3029,7 @@ function ServicesView({
                 <small>
                   {summary?.memberCount ?? 0} · {money(summary?.perMemberPeriod ?? 0, service.currency)}
                 </small>
-                <ServiceHealthBadge health={serviceHealth(service, clientHealth[service.id])} compact />
+
               </button>
             );
           })}
@@ -3817,24 +3050,7 @@ function ServicesView({
                   {draft.active ? <Archive size={16} /> : <ArchiveRestore size={16} />}
                   {draft.active ? "В архив" : "Вернуть"}
                 </button>
-                <button
-                  className="ghost"
-                  type="button"
-                  disabled={
-                    !serviceConnection(draft).enabled ||
-                    !serviceConnection(draft).host ||
-                    selectedHealth?.status === "checking" ||
-                    serviceConnection(draft).lastStatus === "maintenance"
-                  }
-                  onClick={() => probeService(draft)}
-                >
-                  <Activity size={16} />
-                  Проверить
-                </button>
-                <button className="ghost" type="button" onClick={toggleSelectedMaintenance}>
-                  <Wrench size={16} />
-                  {serviceConnection(draft).lastStatus === "maintenance" ? "Вернуть в работу" : "На обслуживание"}
-                </button>
+
                 <button className="ghost" type="button" onClick={() => mutate(`/api/debits/manual`, { serviceId: selectedService.id })}>
                   <CreditCard size={16} />
                   Списать
@@ -3852,7 +3068,7 @@ function ServicesView({
               <Stat icon={CircleDollarSign} label="С человека в месяц" value={money(selectedSummary?.perMemberMonth ?? 0, draft.currency)} />
               <Stat icon={Clock3} label="Списание за период" value={money(selectedSummary?.perMemberPeriod ?? 0, draft.currency)} />
               <Stat icon={CalendarClock} label="Следующее списание" value={dateTime(draft.billing.nextChargeAt)} />
-              <Stat icon={Activity} label="Сервер" value={selectedHealth ? healthValue(selectedHealth) : "Нет данных"} tone={selectedHealth ? healthTone(selectedHealth.status) : undefined} />
+
             </div>
 
             <div className="service-overview">
@@ -3860,14 +3076,7 @@ function ServicesView({
                 <span className="muted">Заметки</span>
                 <p>{draft.notes || "Заметок пока нет"}</p>
               </div>
-              <div>
-                <span className="muted">Мониторинг</span>
-                <p>
-                  {serviceConnection(draft).enabled && serviceConnection(draft).host
-                    ? `${serviceConnection(draft).host}:${serviceConnection(draft).port}${serviceConnection(draft).websocketPath}`
-                    : "Не настроен"}
-                </p>
-              </div>
+
             </div>
 
             <div className="form-grid service-edit service-edit-hidden" aria-hidden="true">
@@ -3981,103 +3190,7 @@ function ServicesView({
                 <input checked={draft.active} type="checkbox" onChange={(event) => setDraft({ ...draft, active: event.target.checked })} />
                 Активен
               </label>
-              <label className="toggle-row">
-                <input
-                  type="checkbox"
-                  checked={serviceConnection(draft).enabled}
-                  onChange={(event) =>
-                    setDraft({ ...draft, connection: { ...serviceConnection(draft), enabled: event.target.checked } })
-                  }
-                />
-                Мониторинг
-              </label>
-              <label>
-                IP / host
-                <input
-                  value={serviceConnection(draft).host}
-                  onChange={(event) => setDraft({ ...draft, connection: { ...serviceConnection(draft), host: event.target.value } })}
-                />
-              </label>
-              <label>
-                SSH port
-                <input
-                  type="number"
-                  min="1"
-                  max="65535"
-                  value={serviceConnection(draft).sshPort}
-                  onChange={(event) =>
-                    setDraft({ ...draft, connection: { ...serviceConnection(draft), sshPort: Number(event.target.value) } })
-                  }
-                />
-              </label>
-              <label>
-                WS port
-                <input
-                  type="number"
-                  min="1"
-                  max="65535"
-                  value={serviceConnection(draft).port}
-                  onChange={(event) => setDraft({ ...draft, connection: { ...serviceConnection(draft), port: Number(event.target.value) } })}
-                />
-              </label>
-              <label>
-                SSH user
-                <input
-                  value={serviceConnection(draft).user}
-                  onChange={(event) => setDraft({ ...draft, connection: { ...serviceConnection(draft), user: event.target.value } })}
-                />
-              </label>
-              <label>
-                SSH pass
-                <input
-                  type="password"
-                  placeholder={serviceConnection(draft).passwordSet ? "сохранён" : ""}
-                  value={serviceConnection(draft).password}
-                  onChange={(event) => setDraft({ ...draft, connection: { ...serviceConnection(draft), password: event.target.value } })}
-                />
-              </label>
-              <label>
-                WS path
-                <input
-                  value={serviceConnection(draft).websocketPath}
-                  onChange={(event) =>
-                    setDraft({ ...draft, connection: { ...serviceConnection(draft), websocketPath: event.target.value } })
-                  }
-                />
-              </label>
-              <label className="toggle-row">
-                <input
-                  type="checkbox"
-                  checked={serviceConnection(draft).useTls}
-                  onChange={(event) => setDraft({ ...draft, connection: { ...serviceConnection(draft), useTls: event.target.checked } })}
-                />
-                WSS
-              </label>
-              <div className="deploy-control">
-                <button
-                  className="ghost"
-                  type="button"
-                  disabled={
-                    deployingServiceId === draft.id ||
-                    !serviceConnection(draft).host.trim() ||
-                    !serviceConnection(draft).user.trim() ||
-                    (!serviceConnection(draft).password && !serviceConnection(draft).passwordSet)
-                  }
-                  onClick={deploySelectedEchoServer}
-                >
-                  <Upload size={16} />
-                  {deployingServiceId === draft.id ? "Развёртывание..." : "Развернуть echo-сервер"}
-                </button>
-                {serviceConnection(draft).lastDeployStatus !== "unknown" && (
-                  <details className={classNames("deploy-log", serviceConnection(draft).lastDeployStatus)}>
-                    <summary>
-                      {serviceConnection(draft).lastDeployStatus === "success" ? "Последний деплой успешен" : "Последний деплой не удался"} ·{" "}
-                      {dateTime(serviceConnection(draft).lastDeployAt)}
-                    </summary>
-                    <pre>{serviceConnection(draft).lastDeployOutput || "Лог пуст"}</pre>
-                  </details>
-                )}
-              </div>
+
             </div>
           </div>
 
@@ -4173,8 +3286,7 @@ function ServicesView({
               state={state}
               draft={draft}
               setDraft={setDraft}
-              deploying={deployingServiceId === draft.id}
-              deploySelectedEchoServer={deploySelectedEchoServer}
+
               saveService={saveService}
               onClose={() => {
                 setDraft(selectedService);
@@ -4272,22 +3384,17 @@ function ServiceEditModal({
   state,
   draft,
   setDraft,
-  deploying,
-  deploySelectedEchoServer,
+
   saveService,
   onClose
 }: {
   state: AppState;
   draft: Service;
   setDraft: (service: Service) => void;
-  deploying: boolean;
-  deploySelectedEchoServer: () => Promise<void>;
+
   saveService: (service: Service) => Promise<AppState>;
   onClose: () => void;
 }) {
-  const connection = serviceConnection(draft);
-  const setConnection = (next: Partial<ServiceConnectionSettings>) =>
-    setDraft({ ...draft, connection: { ...connection, ...next } });
 
   return (
     <ModalShell
@@ -4368,57 +3475,7 @@ function ServiceEditModal({
           <input checked={draft.active} type="checkbox" onChange={(event) => setDraft({ ...draft, active: event.target.checked })} />
           Активен
         </label>
-        <label className="toggle-row">
-          <input type="checkbox" checked={connection.enabled} onChange={(event) => setConnection({ enabled: event.target.checked })} />
-          Мониторинг
-        </label>
-        <label>
-          IP / host
-          <input value={connection.host} onChange={(event) => setConnection({ host: event.target.value })} />
-        </label>
-        <label>
-          SSH port
-          <input type="number" min="1" max="65535" value={connection.sshPort} onChange={(event) => setConnection({ sshPort: Number(event.target.value) })} />
-        </label>
-        <label>
-          WS port
-          <input type="number" min="1" max="65535" value={connection.port} onChange={(event) => setConnection({ port: Number(event.target.value) })} />
-        </label>
-        <label>
-          SSH user
-          <input value={connection.user} onChange={(event) => setConnection({ user: event.target.value })} />
-        </label>
-        <label>
-          SSH pass
-          <input type="password" placeholder={connection.passwordSet ? "сохранён" : ""} value={connection.password} onChange={(event) => setConnection({ password: event.target.value })} />
-        </label>
-        <label>
-          WS path
-          <input value={connection.websocketPath} onChange={(event) => setConnection({ websocketPath: event.target.value })} />
-        </label>
-        <label className="toggle-row">
-          <input type="checkbox" checked={connection.useTls} onChange={(event) => setConnection({ useTls: event.target.checked })} />
-          WSS
-        </label>
-        <div className="deploy-control">
-          <button
-            className="ghost"
-            type="button"
-            disabled={deploying || !connection.host.trim() || !connection.user.trim() || (!connection.password && !connection.passwordSet)}
-            onClick={deploySelectedEchoServer}
-          >
-            <Upload size={16} />
-            {deploying ? "Развёртывание..." : "Развернуть echo-сервер"}
-          </button>
-          {connection.lastDeployStatus !== "unknown" && (
-            <details className={classNames("deploy-log", connection.lastDeployStatus)}>
-              <summary>
-                {connection.lastDeployStatus === "success" ? "Последний деплой успешен" : "Последний деплой не удался"} · {dateTime(connection.lastDeployAt)}
-              </summary>
-              <pre>{connection.lastDeployOutput || "Лог пуст"}</pre>
-            </details>
-          )}
-        </div>
+
       </div>
     </ModalShell>
   );
@@ -4711,29 +3768,27 @@ function AccountView({
   state,
   currentUser,
   pages,
-  latencyGraph,
-  latencyPeriod,
+
   saveUser,
   serviceById,
   setToast,
   onPay,
-  onLatencyPeriodChange,
+
   onPageChange
 }: {
   state: AppState;
   currentUser: User;
   pages: AccountPages;
-  latencyGraph: LatencyChartData;
-  latencyPeriod: LatencyPeriodRange;
+
   saveUser: (user: User & { adminPassword?: string; currentPassword?: string }) => Promise<AppState>;
   serviceById: (id: string) => Service | undefined;
   setToast: (value: string) => void;
   onPay: () => void;
-  onLatencyPeriodChange: (period: LatencyPeriodRange) => void;
+
   onPageChange: (kind: keyof AccountPages, offset: number) => void;
 }) {
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [latencyPeriodOpen, setLatencyPeriodOpen] = useState(false);
+
   const userServices = useMemo(() => activeServicesForUser(state, currentUser.id), [currentUser.id, state.memberships, state.services]);
 
   const moneyTimeline = useMemo(() => {
@@ -4755,43 +3810,6 @@ function AccountView({
       .sort((a, b) => a.ts - b.ts)
       .slice(-14);
   }, [pages.debits.rows, pages.deposits.rows]);
-
-  const latencyChart = useMemo(() => {
-    const series: Array<{ key: string; name: string; color: string; serviceId: string }> = [];
-    const byService = new Map<string, { key: string; name: string; color: string; serviceId: string }>();
-    const points = new Map<string, Record<string, string | number>>();
-
-    for (const check of pages.latency.rows.filter((item) => item.latencyMs !== null).slice().reverse()) {
-      const service = serviceById(check.serviceId);
-      let item = byService.get(check.serviceId);
-      if (!item && series.length < latencyLineColors.length) {
-        item = {
-          key: `latency_${series.length}`,
-          name: service?.name ?? "Сервис",
-          color: latencyLineColors[series.length],
-          serviceId: check.serviceId
-        };
-        byService.set(check.serviceId, item);
-        series.push(item);
-      }
-      if (!item) continue;
-      const date = new Date(check.checkedAt);
-      date.setSeconds(0, 0);
-      const bucketId = date.toISOString();
-      const point = points.get(bucketId) ?? {
-        time: new Intl.DateTimeFormat("ru-RU", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" }).format(date)
-      };
-      point[item.key] = check.latencyMs ?? 0;
-      points.set(bucketId, point);
-    }
-
-    return {
-      series,
-      points: Array.from(points.entries())
-        .sort(([a], [b]) => new Date(a).getTime() - new Date(b).getTime())
-        .map(([, point]) => point)
-    };
-  }, [pages.latency.rows, serviceById]);
 
   return (
     <section className="page-grid account-page">
@@ -4821,7 +3839,7 @@ function AccountView({
         <Stat icon={Shield} label="Сервисов" value={String(userServices.length)} />
         <Stat icon={Coins} label="Баланс" value={money(currentUser.balance, "RUB")} tone={currentUser.balance < 0 ? "bad" : "good"} />
         <Stat icon={CircleDollarSign} label="Пополнений" value={String(pages.deposits.total)} />
-        <Stat icon={Activity} label="Замеров" value={String(pages.latency.total)} />
+
       </div>
 
       <div className="panel chart-panel wide">
@@ -4857,56 +3875,6 @@ function AccountView({
         </div>
       </div>
 
-      <div className="panel chart-panel wide">
-        <div className="panel-head">
-          <h2>Моя задержка до сервисов</h2>
-          <div className="actions">
-            <button className="ghost compact period-trigger" type="button" onClick={() => setLatencyPeriodOpen(true)}>
-              <CalendarClock size={14} />
-              {latencyPeriodLabel(latencyPeriod)}
-            </button>
-            <span className="chip">{latencyGraph.latencySeries.length}</span>
-          </div>
-        </div>
-        <div className="chart-wrap latency-history">
-          {latencyGraph.latencyTimeline.length && latencyGraph.latencySeries.length ? (
-            <ResponsiveContainer width="100%" height="100%">
-              <LineChart data={latencyGraph.latencyTimeline}>
-                <CartesianGrid stroke="rgba(255,255,255,.06)" vertical={false} />
-                <XAxis dataKey="time" axisLine={false} tickLine={false} tick={{ fill: "#8a8f98", fontSize: 12 }} />
-                <YAxis axisLine={false} tickLine={false} tick={{ fill: "#8a8f98", fontSize: 12 }} />
-                <Tooltip contentStyle={{ background: "#111318", border: "1px solid #272a33", borderRadius: 8 }} />
-                <Legend wrapperStyle={{ color: "#c6cad2", fontSize: 12 }} />
-                {latencyGraph.latencySeries.map((series) => (
-                  <Line
-                    key={series.key}
-                    type="monotone"
-                    dataKey={series.key}
-                    name={series.name}
-                    stroke={series.color}
-                    strokeWidth={2}
-                    dot={false}
-                    connectNulls
-                  />
-                ))}
-              </LineChart>
-            </ResponsiveContainer>
-          ) : (
-            <Empty label="Замеров задержки пока нет" />
-          )}
-        </div>
-        {latencyPeriodOpen && (
-          <LatencyPeriodModal
-            value={latencyPeriod}
-            onClose={() => setLatencyPeriodOpen(false)}
-            onSelect={(period) => {
-              onLatencyPeriodChange(period);
-              setLatencyPeriodOpen(false);
-            }}
-          />
-        )}
-      </div>
-
       <HistoryTable
         title="Мои пополнения"
         page={pages.deposits}
@@ -4934,20 +3902,6 @@ function AccountView({
           money(debit.amountBalanceCurrency ?? debit.amount, debit.balanceCurrency ?? "RUB"),
           <OperationCell source={debit.source} cancelledAt={debit.cancelledAt} reversesId={debit.reversesId} />,
           money(debit.balanceAfter, debit.balanceCurrency ?? "RUB")
-        ]}
-      />
-
-      <HistoryTable
-        title="Мои замеры задержки"
-        page={pages.latency}
-        onPageChange={(offset) => onPageChange("latency", offset)}
-        columns={["Дата", "Сервис", "Статус", "Задержка", "Ошибка"]}
-        render={(check) => [
-          dateTime(check.checkedAt),
-          serviceById(check.serviceId)?.name ?? "Сервис",
-          healthLabels[check.status],
-          check.latencyMs === null ? "нет данных" : `${check.latencyMs} мс`,
-          check.error || "нет"
         ]}
       />
 
@@ -5111,7 +4065,7 @@ function PeopleView({
               onSave={saveUser}
               canEditPassword={isAdmin}
               onDelete={() => {
-                if (!window.confirm(`Удалить участника "${user.name}" и его историю замеров пинга?`)) return Promise.resolve(state);
+                if (!window.confirm(`Удалить участника "${user.name}"?`)) return Promise.resolve(state);
                 return mutate(`/api/users/${user.id}`, undefined, "DELETE");
               }}
             />

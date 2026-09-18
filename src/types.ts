@@ -23,17 +23,6 @@ export type User = {
   createdAt: string;
 };
 
-export type LatencyCheck = {
-  id: string;
-  serviceId: string;
-  userId: string | null;
-  status: ServiceHealthStatus;
-  latencyMs: number | null;
-  checkedAt: string;
-  error: string;
-  createdAt: string;
-};
-
 export type BillingSettings = {
   period: BillingPeriod;
   interval: number;
@@ -46,28 +35,6 @@ export type BillingSettings = {
   lowBalanceThresholdPeriods: number;
 };
 
-export type ServiceHealthStatus = "unknown" | "online" | "offline" | "maintenance";
-export type ServiceDeployStatus = "unknown" | "success" | "failed";
-
-export type ServiceConnectionSettings = {
-  enabled: boolean;
-  host: string;
-  port: number;
-  sshPort: number;
-  user: string;
-  password: string;
-  passwordSet?: boolean;
-  websocketPath: string;
-  useTls: boolean;
-  lastStatus: ServiceHealthStatus;
-  lastLatencyMs: number | null;
-  lastCheckedAt: string | null;
-  lastError: string;
-  lastDeployStatus: ServiceDeployStatus;
-  lastDeployAt: string | null;
-  lastDeployOutput: string;
-};
-
 export type Service = {
   id: string;
   name: string;
@@ -76,7 +43,6 @@ export type Service = {
   monthlyCost: number;
   currency: string;
   active: boolean;
-  connection: ServiceConnectionSettings;
   billing: BillingSettings;
   createdAt: string;
 };
@@ -150,7 +116,7 @@ export type Notification = {
   id: string;
   serviceId: string;
   userId: string | null;
-  kind: "low_balance" | "period_summary" | "telegram_reply" | "latency_report" | "payment" | "system";
+  kind: "low_balance" | "period_summary" | "telegram_reply" | "payment" | "system";
   message: string;
   status: "sent" | "skipped" | "failed";
   createdAt: string;
@@ -277,7 +243,6 @@ export type PaymentIntent = {
 export type AppCounts = {
   deposits: number;
   debits: number;
-  latencyChecks: number;
   notifications: number;
   payments: number;
 };
@@ -290,7 +255,6 @@ export type AppState = {
   autoDeposits: AutoDeposit[];
   deposits: Deposit[];
   debits: Debit[];
-  latencyChecks: LatencyCheck[];
   notifications: Notification[];
   payments: PaymentIntent[];
   settings: { telegram: TelegramSettings; security: SecuritySettings; payments: PaymentSettings };
