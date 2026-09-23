@@ -13,6 +13,8 @@ NODE_MAJOR="${NODE_MAJOR:-22}"
 DOMAIN="${DOMAIN:-}"
 SETUP_NGINX="${SETUP_NGINX:-false}"
 ENABLE_SSL="${ENABLE_SSL:-false}"
+REQUESTED_HTTPS_PORT="${HTTPS_PORT:-}"
+HTTPS_PORT="${HTTPS_PORT:-8443}"
 EMAIL="${EMAIL:-}"
 ENABLE_UFW="${ENABLE_UFW:-false}"
 APP_ENV_FILE="${APP_ENV_FILE:-/etc/${APP_NAME}.env}"
@@ -41,6 +43,9 @@ load_existing_env() {
     # shellcheck disable=SC1090
     source "${APP_ENV_FILE}"
     set +a
+  fi
+  if [[ -n "${REQUESTED_HTTPS_PORT}" ]]; then
+    HTTPS_PORT="${REQUESTED_HTTPS_PORT}"
   fi
 }
 
@@ -128,6 +133,34 @@ shell_escape_env_value() {
   printf "'%s'" "${value//\'/\'\\\'\'}"
 }
 
+public_url() {
+  if [[ -z "${DOMAIN}" ]]; then
+    printf 'not configured'
+  elif [[ "${ENABLE_SSL}" == "true" ]]; then
+    printf 'https://%s:%s' "${DOMAIN}" "${HTTPS_PORT}"
+  else
+    printf 'http://%s' "${DOMAIN}"
+  fi
+}
+
+validate_public_ports() {
+  if [[ "${ENABLE_SSL}" != "true" ]]; then
+    return
+  fi
+  if [[ ! "${HTTPS_PORT}" =~ ^[0-9]+$ ]] || (( HTTPS_PORT < 1 || HTTPS_PORT > 65535 )); then
+    echo "HTTPS_PORT must be a number from 1 to 65535" >&2
+    exit 1
+  fi
+  if [[ "${HTTPS_PORT}" == "443" ]]; then
+    echo "Port 443 is unavailable on this host; choose another HTTPS_PORT (default: 8443)" >&2
+    exit 1
+  fi
+  if [[ "${HTTPS_PORT}" == "80" || "${HTTPS_PORT}" == "${PORT}" ]]; then
+    echo "HTTPS_PORT must differ from ports 80 and ${PORT}" >&2
+    exit 1
+  fi
+}
+
 write_app_env() {
   if [[ -f "${APP_ENV_FILE}" ]]; then
     log "Preserving existing environment ${APP_ENV_FILE}"
@@ -146,13 +179,26 @@ write_app_env() {
     echo "APP_DATA_DIR=$(shell_escape_env_value "${APP_DIR}/data")"
     echo "INITIAL_ADMIN_PASSWORD=$(shell_escape_env_value "${INITIAL_ADMIN_PASSWORD}")"
     if [[ -n "${DOMAIN}" ]]; then
-      if [[ "${ENABLE_SSL}" == "true" ]]; then
-        echo "PUBLIC_BASE_URL=$(shell_escape_env_value "https://${DOMAIN}")"
-      else
-        echo "PUBLIC_BASE_URL=$(shell_escape_env_value "http://${DOMAIN}")"
-      fi
+      echo "PUBLIC_BASE_URL=$(shell_escape_env_value "$(public_url)")"
+      echo "HTTPS_PORT=$(shell_escape_env_value "${HTTPS_PORT}")"
     fi
   } >"${APP_ENV_FILE}"
+  chmod 640 "${APP_ENV_FILE}"
+}
+
+sync_public_env() {
+  if [[ -z "${DOMAIN}" || ! -f "${APP_ENV_FILE}" ]]; then
+    return
+  fi
+  local temporary
+  temporary="$(mktemp)"
+  grep -Ev '^(PUBLIC_BASE_URL|HTTPS_PORT)=' "${APP_ENV_FILE}" >"${temporary}" || true
+  {
+    cat "${temporary}"
+    echo "PUBLIC_BASE_URL=$(shell_escape_env_value "$(public_url)")"
+    echo "HTTPS_PORT=$(shell_escape_env_value "${HTTPS_PORT}")"
+  } >"${APP_ENV_FILE}"
+  rm -f -- "${temporary}"
   chmod 640 "${APP_ENV_FILE}"
 }
 
@@ -210,6 +256,7 @@ install_nginx() {
 
   log "Installing nginx reverse proxy"
   apt-get install -y nginx
+  mkdir -p /var/www/letsencrypt
 
   local server_name
   server_name="${DOMAIN:-_}"
@@ -220,6 +267,11 @@ server {
     server_name ${server_name};
 
     client_max_body_size 2048m;
+
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/www/letsencrypt;
+        default_type text/plain;
+    }
 
     location / {
         proxy_pass http://127.0.0.1:${PORT};
@@ -251,13 +303,66 @@ install_ssl() {
   fi
 
   log "Requesting Let's Encrypt certificate for ${DOMAIN}"
-  apt-get install -y certbot python3-certbot-nginx
-  certbot --nginx \
+  apt-get install -y certbot
+  certbot certonly --webroot \
     --non-interactive \
     --agree-tos \
-    --redirect \
     --email "${EMAIL}" \
+    --webroot-path /var/www/letsencrypt \
     -d "${DOMAIN}"
+
+  log "Configuring HTTPS on port ${HTTPS_PORT}"
+  cat >"/etc/nginx/sites-available/${APP_NAME}.conf" <<EOF
+server {
+    listen 80;
+    server_name ${DOMAIN};
+
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/www/letsencrypt;
+        default_type text/plain;
+    }
+
+    location / {
+        return 308 https://\$host:${HTTPS_PORT}\$request_uri;
+    }
+}
+
+server {
+    listen ${HTTPS_PORT} ssl;
+    server_name ${DOMAIN};
+
+    ssl_certificate /etc/letsencrypt/live/${DOMAIN}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${DOMAIN}/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 1d;
+
+    client_max_body_size 2048m;
+
+    location / {
+        proxy_pass http://127.0.0.1:${PORT};
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Port ${HTTPS_PORT};
+    }
+}
+EOF
+
+  mkdir -p /etc/letsencrypt/renewal-hooks/deploy
+  cat >"/etc/letsencrypt/renewal-hooks/deploy/${APP_NAME}-reload-nginx" <<EOF
+#!/usr/bin/env bash
+set -e
+nginx -t
+systemctl reload nginx
+EOF
+  chmod 755 "/etc/letsencrypt/renewal-hooks/deploy/${APP_NAME}-reload-nginx"
+  nginx -t
+  systemctl reload nginx
 }
 
 configure_ufw() {
@@ -269,7 +374,10 @@ configure_ufw() {
   apt-get install -y ufw
   ufw allow OpenSSH
   if [[ -n "${DOMAIN}" || "${SETUP_NGINX}" == "true" ]]; then
-    ufw allow "Nginx Full"
+    ufw allow 80/tcp
+    if [[ "${ENABLE_SSL}" == "true" ]]; then
+      ufw allow "${HTTPS_PORT}/tcp"
+    fi
   else
     ufw allow "${PORT}/tcp"
   fi
@@ -277,15 +385,6 @@ configure_ufw() {
 }
 
 print_summary() {
-  local public_url
-  public_url="not configured"
-  if [[ -n "${DOMAIN}" ]]; then
-    public_url="http://${DOMAIN}"
-    if [[ "${ENABLE_SSL}" == "true" ]]; then
-      public_url="https://${DOMAIN}"
-    fi
-  fi
-
   log "Deployment complete"
   systemctl --no-pager --full status "${APP_NAME}.service" || true
 
@@ -295,7 +394,7 @@ App directory: ${APP_DIR}
 Systemd unit:  ${APP_NAME}.service
 Env file:      ${APP_ENV_FILE}
 Local URL:     http://127.0.0.1:${PORT}
-Public URL:    ${public_url}
+Public URL:    $(public_url)
 Initial admin password: ${INITIAL_ADMIN_PASSWORD}
 
 Useful commands:
@@ -309,12 +408,14 @@ EOF
 main() {
   require_root "$@"
   load_existing_env
+  validate_public_ports
   install_base_packages
   install_node
   ensure_app_user
   checkout_repo
   build_app
   write_app_env
+  sync_public_env
   install_systemd_service
   install_restart_sudoers
   APP_SERVICE_NAME="${APP_NAME}" bash "${APP_DIR}/scripts/install-update-service.sh"

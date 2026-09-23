@@ -74,13 +74,15 @@ curl -fsSL https://raw.githubusercontent.com/Jetvac/service-payment/main/scripts
 curl -fsSL https://raw.githubusercontent.com/Jetvac/service-payment/main/scripts/deploy-ubuntu.sh | sudo env DOMAIN=pay.example.com bash
 ```
 
-С HTTPS через Let's Encrypt:
+С HTTPS через Let's Encrypt на внешнем порту `8443`:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Jetvac/service-payment/main/scripts/deploy-ubuntu.sh | sudo env DOMAIN=pay.example.com ENABLE_SSL=true EMAIL=admin@example.com bash
 ```
 
-Полезные переменные: `APP_DIR=/opt/service-payment`, `PORT=4077`, `BRANCH=main`, `ENABLE_UFW=true`. Сгенерированный начальный пароль администратора печатается в итогах установки и сохраняется в `/etc/service-payment.env`. После первого входа смените его в `Telegram → Система`.
+Сайт будет доступен по адресу `https://pay.example.com:8443`; HTTP на порту `80` перенаправляет туда и используется для автоматического продления сертификата. Порт `443` скрипт не занимает. Другой внешний порт задаётся через `HTTPS_PORT`, например `HTTPS_PORT=9443`. Значение `443` намеренно отклоняется.
+
+Полезные переменные: `APP_DIR=/opt/service-payment`, `PORT=4077`, `HTTPS_PORT=8443`, `BRANCH=main`, `ENABLE_UFW=true`. `PORT` — внутренний порт приложения, `HTTPS_PORT` — внешний порт nginx. Сгенерированный начальный пароль администратора печатается в итогах установки и сохраняется в `/etc/service-payment.env`. После первого входа смените его в `Telegram → Система`.
 
 ## Обновление сервера
 
