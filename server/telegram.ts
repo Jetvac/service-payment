@@ -1,3 +1,4 @@
+import https from "node:https";
 import type { AppData, Service, User } from "./types";
 import {
   addDeposit,
@@ -28,6 +29,10 @@ type SendOptions = {
   notificationTopic?: boolean;
   threadId?: string | number;
 };
+
+type TelegramPayload = { ok?: boolean; description?: string; result?: unknown } | null;
+type TelegramHttpResponse = { ok: boolean; status: number; statusText: string };
+type TelegramApiResult = { response: TelegramHttpResponse; payload: TelegramPayload };
 
 function telegramUrl(token: string, method: string) {
   return `https://api.telegram.org/bot${token}/${method}`;
@@ -63,20 +68,101 @@ function resolveThreadId(data: AppData, options: SendOptions) {
   return Number.isFinite(threadId) && threadId > 0 ? threadId : undefined;
 }
 
-async function telegramApi<TBody extends Record<string, unknown>>(token: string, method: string, body: TBody) {
-  try {
-    const response = await fetch(telegramUrl(token, method), {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(15_000)
-    });
-    const payload = (await response.json().catch(() => null)) as { ok?: boolean; description?: string; result?: unknown } | null;
-    return { response, payload };
-  } catch (error) {
-    const reason = error instanceof Error && error.message ? `: ${error.message}` : "";
-    throw new Error(`Telegram API недоступен (${method})${reason}`);
+function networkErrorDetails(error: unknown) {
+  const details: string[] = [];
+  let current: unknown = error;
+  for (let depth = 0; depth < 3 && current; depth += 1) {
+    const record = current as { message?: unknown; code?: unknown; syscall?: unknown; address?: unknown; port?: unknown; cause?: unknown };
+    const message = String(record.message ?? "").trim();
+    if (message && !details.includes(message)) details.push(message);
+    const metadata = [record.code, record.syscall, record.address, record.port]
+      .filter((value) => value !== undefined && value !== null && String(value).trim())
+      .map(String)
+      .join(" ");
+    if (metadata && !details.includes(metadata)) details.push(metadata);
+    current = record.cause;
   }
+  return details.join(" — ") || "неизвестная сетевая ошибка";
+}
+
+async function telegramApiViaFetch<TBody extends Record<string, unknown>>(token: string, method: string, body: TBody): Promise<TelegramApiResult> {
+  const response = await fetch(telegramUrl(token, method), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(15_000)
+  });
+  const payload = (await response.json().catch(() => null)) as TelegramPayload;
+  return {
+    response: { ok: response.ok, status: response.status, statusText: response.statusText },
+    payload
+  };
+}
+
+function telegramApiViaIpv4<TBody extends Record<string, unknown>>(token: string, method: string, body: TBody): Promise<TelegramApiResult> {
+  const content = JSON.stringify(body);
+  return new Promise((resolve, reject) => {
+    const request = https.request(
+      telegramUrl(token, method),
+      {
+        method: "POST",
+        family: 4,
+        timeout: 15_000,
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/json",
+          "Content-Length": Buffer.byteLength(content)
+        }
+      },
+      (response) => {
+        const chunks: Buffer[] = [];
+        response.on("data", (chunk: Buffer | string) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
+        response.on("error", reject);
+        response.on("end", () => {
+          const raw = Buffer.concat(chunks).toString("utf8");
+          let payload: TelegramPayload = null;
+          try {
+            payload = raw ? (JSON.parse(raw) as TelegramPayload) : null;
+          } catch {
+            payload = null;
+          }
+          const status = response.statusCode ?? 0;
+          resolve({
+            response: {
+              ok: status >= 200 && status < 300,
+              status,
+              statusText: response.statusMessage ?? ""
+            },
+            payload
+          });
+        });
+      }
+    );
+    request.on("timeout", () => request.destroy(new Error("тайм-аут подключения через IPv4")));
+    request.on("error", reject);
+    request.end(content);
+  });
+}
+
+async function telegramApi<TBody extends Record<string, unknown>>(token: string, method: string, body: TBody) {
+  const transport = String(process.env.TELEGRAM_API_TRANSPORT ?? "auto").toLowerCase();
+  const failures: string[] = [];
+
+  if (transport !== "fetch") {
+    try {
+      return await telegramApiViaIpv4(token, method, body);
+    } catch (error) {
+      failures.push(`IPv4 HTTPS: ${networkErrorDetails(error)}`);
+    }
+  }
+
+  try {
+    return await telegramApiViaFetch(token, method, body);
+  } catch (error) {
+    failures.push(`fetch: ${networkErrorDetails(error)}`);
+  }
+
+  throw new Error(`Telegram API недоступен (${method}): ${failures.join("; ")}`);
 }
 
 function telegramApiError(

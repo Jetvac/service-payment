@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { afterEach, test } from "node:test";
+import { afterEach, beforeEach, test } from "node:test";
 import { runDebitForService, seedData } from "./domain";
 import {
   configureTelegramIntegration,
@@ -13,9 +13,16 @@ import {
 import type { AppData } from "./types";
 
 const originalFetch = globalThis.fetch;
+const originalTelegramTransport = process.env.TELEGRAM_API_TRANSPORT;
+
+beforeEach(() => {
+  process.env.TELEGRAM_API_TRANSPORT = "fetch";
+});
 
 afterEach(() => {
   globalThis.fetch = originalFetch;
+  if (originalTelegramTransport === undefined) delete process.env.TELEGRAM_API_TRANSPORT;
+  else process.env.TELEGRAM_API_TRANSPORT = originalTelegramTransport;
 });
 
 function telegramData() {
@@ -207,7 +214,7 @@ test("network failures name the Telegram method instead of returning a generic f
     throw new TypeError("fetch failed");
   };
 
-  await assert.rejects(pollTelegramUpdates(data), /Telegram API недоступен \(getUpdates\): fetch failed/);
+  await assert.rejects(pollTelegramUpdates(data), /Telegram API недоступен \(getUpdates\): fetch: fetch failed/);
 });
 
 test("a sendMessage network failure is recorded and does not escape as an unhandled fetch error", async () => {
@@ -219,6 +226,6 @@ test("a sendMessage network failure is recorded and does not escape as an unhand
   const result = await command(data, "101", "/balance");
   assert.equal(result.handled, true);
   assert.match(result.reply ?? "", /Общий баланс/);
-  assert.match(data.settings.telegram.lastError, /Telegram API недоступен \(sendMessage\): fetch failed/);
+  assert.match(data.settings.telegram.lastError, /Telegram API недоступен \(sendMessage\): fetch: fetch failed/);
   assert.equal(data.notifications.at(-1)?.status, "failed");
 });
