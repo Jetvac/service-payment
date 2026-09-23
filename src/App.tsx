@@ -1286,7 +1286,7 @@ function Dashboard({
         </div>
         <div className="chart-wrap">
           {dashboard.chart.length ? (
-            <ResponsiveContainer width="100%" height="100%">
+            <ResponsiveContainer width="100%" height="100%" initialDimension={{ width: 640, height: 280 }}>
               <AreaChart data={dashboard.chart}>
                 <defs>
                   <linearGradient id="deposits" x1="0" y1="0" x2="0" y2="1">
@@ -1319,7 +1319,7 @@ function Dashboard({
         </div>
         <div className="chart-wrap compact">
           {dashboard.balances.length ? (
-            <ResponsiveContainer width="100%" height="100%">
+            <ResponsiveContainer width="100%" height="100%" initialDimension={{ width: 480, height: 300 }}>
               <BarChart data={dashboard.balances} layout="vertical" margin={{ left: 12, right: 12 }}>
                 <CartesianGrid stroke="rgba(255,255,255,.06)" horizontal={false} />
                 <XAxis type="number" axisLine={false} tickLine={false} tick={{ fill: "#8a8f98", fontSize: 12 }} />
@@ -3051,7 +3051,11 @@ function ServicesView({
                   {draft.active ? "В архив" : "Вернуть"}
                 </button>
 
-                <button className="ghost" type="button" onClick={() => mutate(`/api/debits/manual`, { serviceId: selectedService.id })}>
+                <button
+                  className="ghost"
+                  type="button"
+                  onClick={() => void mutate(`/api/debits/manual`, { serviceId: selectedService.id }).catch(() => undefined)}
+                >
                   <CreditCard size={16} />
                   Списать
                 </button>
@@ -3849,7 +3853,7 @@ function AccountView({
         </div>
         <div className="chart-wrap">
           {moneyTimeline.length ? (
-            <ResponsiveContainer width="100%" height="100%">
+            <ResponsiveContainer width="100%" height="100%" initialDimension={{ width: 640, height: 280 }}>
               <AreaChart data={moneyTimeline}>
                 <defs>
                   <linearGradient id="accountDeposits" x1="0" y1="0" x2="0" y2="1">
@@ -4913,15 +4917,19 @@ function BotView({
           </button>
         </div>
         <div className="bot-quick-actions">
-          <button className="ghost" type="button" onClick={saveAndConfigure}>
+          <button className="ghost" type="button" onClick={() => void saveAndConfigure().catch(() => undefined)}>
             <Settings2 size={16} />
             Webhook
           </button>
-          <button className="ghost" type="button" onClick={saveAndTest}>
+          <button className="ghost" type="button" onClick={() => void saveAndTest().catch(() => undefined)}>
             <Send size={16} />
             Тест
           </button>
-          <button className="ghost" type="button" onClick={telegram.pollingEnabled ? stopPolling : startPolling}>
+          <button
+            className="ghost"
+            type="button"
+            onClick={() => void (telegram.pollingEnabled ? stopPolling() : startPolling()).catch(() => undefined)}
+          >
             <RefreshCcw size={16} />
             {telegram.pollingEnabled ? "Stop polling" : "Polling"}
           </button>
@@ -5121,7 +5129,6 @@ function BotView({
           <code>/deposit 600 VPN Main</code>
           <code>/balance</code>
           <code>/services</code>
-          <code>/status</code>
           <code>/users</code>
           <code>/help</code>
           <code>/settopic</code>

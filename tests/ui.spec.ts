@@ -33,6 +33,36 @@ test("main payment flow has no viewport overflow", async ({ page }) => {
   expect(overflow).toBeLessThanOrEqual(1);
 });
 
+test("manual debit succeeds without Telegram delivery and charts do not emit size warnings", async ({ page }) => {
+  const pageErrors: string[] = [];
+  const chartWarnings: string[] = [];
+  page.on("pageerror", error => pageErrors.push(error.message));
+  page.on("console", message => {
+    if (message.text().includes("width(-1)") || message.text().includes("height(-1)")) chartWarnings.push(message.text());
+  });
+  await login(page);
+  await page.getByRole("button", { name: "Сервисы", exact: true }).click();
+  const responsePromise = page.waitForResponse(response => response.url().includes("/api/debits/manual"));
+  await page.getByRole("button", { name: "Списать", exact: true }).click();
+  expect((await responsePromise).status()).toBe(200);
+  await expect(page.getByText("Сохранено")).toBeVisible();
+  expect(pageErrors).toEqual([]);
+  expect(chartWarnings).toEqual([]);
+});
+
+test("Telegram action errors are handled without an unhandled promise", async ({ page }) => {
+  const pageErrors: string[] = [];
+  page.on("pageerror", error => pageErrors.push(error.message));
+  await page.route("**/api/telegram/test", route =>
+    route.fulfill({ status: 400, contentType: "application/json", body: JSON.stringify({ ok: false, error: "Telegram недоступен" }) })
+  );
+  await login(page);
+  await page.getByRole("button", { name: "Telegram", exact: true }).click();
+  await page.getByRole("button", { name: "Тест", exact: true }).click();
+  await expect(page.getByText("Telegram недоступен")).toBeVisible();
+  expect(pageErrors).toEqual([]);
+});
+
 test("full backup restores wall attachments through the system import button", async ({ page }, testInfo) => {
   const errors: string[] = [];
   page.on("pageerror", error => errors.push(error.message));

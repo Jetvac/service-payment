@@ -47,10 +47,17 @@ test("legacy JSON and disk attachments migrate without losing business data", as
 test("SQLite round trip restores every section and binary attachment, including after restart", () => {
   const store = new Store();
   const expected = store.exportData();
+  const liveReference = store.read();
   try {
     store.write(data => { data.payments = []; data.wallPosts = []; data.wallComments = []; data.wallTags = []; data.settings.telegram.botToken = "changed"; data.users[0].balance = -100; });
+    assert.equal(store.read(), liveReference);
+    assert.equal(liveReference.settings.telegram.botToken, "changed");
+    liveReference.services[0].monthlyCost = 777;
     store.deleteWallFileBlob(file.id);
     store.replaceWithDatabase(path.join(root, "complete.sqlite"));
+    assert.equal(store.read(), liveReference);
+    assert.equal(liveReference.settings.telegram.botToken, "test-token");
+    assert.equal(liveReference.services[0].monthlyCost, expected.services[0].monthlyCost);
     assert.deepEqual(store.exportData(), expected);
     assert.deepEqual(store.readWallFile(file.id), bytes);
   } finally { store.close(); }

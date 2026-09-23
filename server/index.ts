@@ -1738,13 +1738,7 @@ app.post("/api/debits/manual", async (req, res) => {
       runDebitForService(data, serviceId, "manual");
     });
 
-    const data = store.read();
-    const service = data.services.find((item) => item.id === serviceId);
-    if (service) {
-      await sendServiceBalanceSummary(data, service);
-      await sendLowBalanceWarnings(data, service);
-      store.persist();
-    }
+    await sendDebitNotifications(serviceId);
 
     res.json(ok(apiState()));
   } catch (error) {
@@ -1859,6 +1853,7 @@ app.post("/api/telegram/polling/start", async (req, res) => {
     store.persist();
     res.json(ok(apiState()));
   } catch (error) {
+    persistTelegramError("Запуск polling", error);
     res.status(400).json(fail(error));
   }
 });
@@ -1886,6 +1881,7 @@ app.post("/api/telegram/configure", async (req, res) => {
     store.persist();
     res.json(ok(apiState()));
   } catch (error) {
+    persistTelegramError("Настройка webhook", error);
     res.status(400).json(fail(error));
   }
 });
@@ -1896,8 +1892,10 @@ app.post("/api/telegram/test", async (req, res) => {
     const data = store.read();
     const chatId = String(req.body.chatId ?? data.settings.telegram.chatId ?? "");
     const sent = await sendTelegramMessage(data, "Проверка связи VPN Pay. Команды доступны в меню.", chatId, {
-      commandKeyboard: true
+      removeKeyboard: true
     });
+
+    if (!sent) throw new Error(data.settings.telegram.lastError || "Telegram не подтвердил отправку тестового сообщения");
 
     addNotification(data, {
       serviceId: data.services[0]?.id ?? "",
@@ -1909,6 +1907,7 @@ app.post("/api/telegram/test", async (req, res) => {
     store.persist();
     res.json(ok(apiState()));
   } catch (error) {
+    persistTelegramError("Проверка связи", error);
     res.status(400).json(fail(error));
   }
 });
@@ -1942,15 +1941,12 @@ async function processDueServices() {
     }
   });
 
-  const data = store.read();
   for (const serviceId of dueServices) {
-    const service = data.services.find((item) => item.id === serviceId);
-    if (!service) continue;
-    await sendServiceBalanceSummary(data, service);
-    await sendLowBalanceWarnings(data, service);
+    await sendDebitNotifications(serviceId);
   }
 
   if (dueServices.length) {
+    const data = store.read();
     addNotification(data, {
       serviceId: dueServices[0],
       userId: null,
@@ -1960,6 +1956,45 @@ async function processDueServices() {
     });
     store.persist();
   }
+}
+
+async function sendDebitNotifications(serviceId: string) {
+  try {
+    const data = store.read();
+    const service = data.services.find((item) => item.id === serviceId);
+    if (!service) return;
+    await sendServiceBalanceSummary(data, service);
+    await sendLowBalanceWarnings(data, service);
+    store.persist();
+  } catch (error) {
+    // The debit is already committed. Report a delivery problem without making
+    // the client retry the debit and charge every participant a second time.
+    const data = store.read();
+    const message = error instanceof Error ? error.message : "Ошибка уведомления Telegram";
+    data.settings.telegram.lastError = message;
+    addNotification(data, {
+      serviceId,
+      userId: null,
+      kind: "system",
+      message: `Списание сохранено, но уведомление не отправлено: ${message}`,
+      status: "failed"
+    });
+    store.persist();
+  }
+}
+
+function persistTelegramError(context: string, error: unknown) {
+  const data = store.read();
+  const detail = error instanceof Error ? error.message : "Ошибка Telegram";
+  data.settings.telegram.lastError = detail;
+  addNotification(data, {
+    serviceId: data.services[0]?.id ?? "",
+    userId: null,
+    kind: "system",
+    message: `${context}: ${detail}`,
+    status: "failed"
+  });
+  store.persist();
 }
 
 function processDueAutoDeposits() {

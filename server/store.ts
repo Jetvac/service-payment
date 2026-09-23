@@ -50,8 +50,7 @@ export class Store {
     const next = cloneData(this.data);
     mutator(next);
     this.persistData(next);
-    this.data = next;
-    return this.data;
+    return this.updateInMemory(next);
   }
 
   replace(raw: unknown) {
@@ -63,8 +62,7 @@ export class Store {
     }
     this.validateFiles(this.db, next);
     this.persistData(next);
-    this.data = next;
-    return this.data;
+    return this.updateInMemory(next);
   }
 
   persist() {
@@ -131,7 +129,7 @@ export class Store {
       this.persistData(next);
     });
     save();
-    this.data = next;
+    this.updateInMemory(next);
     return file;
   }
 
@@ -180,8 +178,7 @@ export class Store {
         }
         this.persistData(next);
       })();
-      this.data = next;
-      return this.data;
+      return this.updateInMemory(next);
     } finally {
       candidate.close();
     }
@@ -189,6 +186,17 @@ export class Store {
 
   close() {
     this.db.close();
+  }
+
+  /**
+   * Keep one long-lived state object for HTTP handlers, Telegram polling and
+   * schedulers. Async Telegram work can hold this root reference while a web
+   * request commits a newer SQLite snapshot; replacing only its properties
+   * makes every reader observe that committed snapshot instead of a stale one.
+   */
+  private updateInMemory(next: AppData) {
+    Object.assign(this.data, next);
+    return this.data;
   }
 
   private validateFiles(db: Database.Database, data: AppData) {

@@ -24,7 +24,7 @@ type TelegramUpdate = {
 };
 
 type SendOptions = {
-  commandKeyboard?: boolean;
+  removeKeyboard?: boolean;
   notificationTopic?: boolean;
   threadId?: string | number;
 };
@@ -51,11 +51,9 @@ function mentionUser(user: User) {
   return escapeHtml(user.name);
 }
 
-function commandKeyboard() {
+function removeKeyboard() {
   return {
-    keyboard: [["/balance", "/services"], ["/help"], ["/pay 600", "/users"]],
-    resize_keyboard: true,
-    is_persistent: true
+    remove_keyboard: true
   };
 }
 
@@ -66,13 +64,27 @@ function resolveThreadId(data: AppData, options: SendOptions) {
 }
 
 async function telegramApi<TBody extends Record<string, unknown>>(token: string, method: string, body: TBody) {
-  const response = await fetch(telegramUrl(token, method), {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body)
-  });
-  const payload = (await response.json().catch(() => null)) as { ok?: boolean; description?: string; result?: unknown } | null;
-  return { response, payload };
+  try {
+    const response = await fetch(telegramUrl(token, method), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(15_000)
+    });
+    const payload = (await response.json().catch(() => null)) as { ok?: boolean; description?: string; result?: unknown } | null;
+    return { response, payload };
+  } catch (error) {
+    const reason = error instanceof Error && error.message ? `: ${error.message}` : "";
+    throw new Error(`Telegram API недоступен (${method})${reason}`);
+  }
+}
+
+function telegramApiError(
+  method: string,
+  result: Awaited<ReturnType<typeof telegramApi>>
+) {
+  if (result.response.ok && result.payload?.ok !== false) return "";
+  return `Telegram API отклонил ${method}: ${result.payload?.description ?? `${result.response.status} ${result.response.statusText}`}`;
 }
 
 export async function sendTelegramMessage(data: AppData, text: string, chatId?: string | number, options: SendOptions = {}) {
@@ -91,16 +103,33 @@ export async function sendTelegramMessage(data: AppData, text: string, chatId?: 
     return false;
   }
 
-  const { response, payload } = await telegramApi(settings.botToken, "sendMessage", {
-    chat_id: targetChat,
-    text,
-    parse_mode: "HTML",
-    disable_web_page_preview: true,
-    ...(messageThreadId ? { message_thread_id: messageThreadId } : {}),
-    ...(options.commandKeyboard ? { reply_markup: commandKeyboard() } : {})
-  });
+  let result: Awaited<ReturnType<typeof telegramApi>>;
+  try {
+    result = await telegramApi(settings.botToken, "sendMessage", {
+      chat_id: targetChat,
+      text,
+      parse_mode: "HTML",
+      disable_web_page_preview: true,
+      ...(messageThreadId ? { message_thread_id: messageThreadId } : {}),
+      ...(options.removeKeyboard ? { reply_markup: removeKeyboard() } : {})
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Telegram API недоступен (sendMessage)";
+    data.settings.telegram.lastError = message;
+    addNotification(data, {
+      serviceId: data.services[0]?.id ?? "",
+      userId: null,
+      kind: "system",
+      message,
+      status: "failed"
+    });
+    return false;
+  }
+
+  const { response, payload } = result;
 
   if (!response.ok || payload?.ok === false) {
+    data.settings.telegram.lastError = payload?.description ?? `${response.status} ${response.statusText}`;
     addNotification(data, {
       serviceId: data.services[0]?.id ?? "",
       userId: null,
@@ -111,12 +140,14 @@ export async function sendTelegramMessage(data: AppData, text: string, chatId?: 
     return false;
   }
 
+  data.settings.telegram.lastError = "";
   return true;
 }
 
 export async function configureTelegramIntegration(data: AppData, webhookUrl: string) {
   const settings = data.settings.telegram;
   if (!settings.botToken) throw new Error("Укажите Bot token");
+  const botToken = settings.botToken;
 
   const privateCommands = [
     { command: "pay", description: "Зачислить средства: /pay 600" },
@@ -133,11 +164,11 @@ export async function configureTelegramIntegration(data: AppData, webhookUrl: st
     { command: "help", description: "Показать помощь" }
   ];
 
-  const privateCommandResult = await telegramApi(settings.botToken, "setMyCommands", {
+  const privateCommandResult = await telegramApi(botToken, "setMyCommands", {
     commands: privateCommands,
     scope: { type: "all_private_chats" }
   });
-  const groupCommandResult = await telegramApi(settings.botToken, "setMyCommands", {
+  const groupCommandResult = await telegramApi(botToken, "setMyCommands", {
     commands: groupCommands,
     scope: { type: "all_group_chats" }
   });
@@ -145,12 +176,12 @@ export async function configureTelegramIntegration(data: AppData, webhookUrl: st
   let webhookResult: Awaited<ReturnType<typeof telegramApi>> | null = null;
   const cleanWebhookUrl = webhookUrl.trim();
   if (cleanWebhookUrl) {
-    webhookResult = await telegramApi(settings.botToken, "setWebhook", {
+    webhookResult = await telegramApi(botToken, "setWebhook", {
       url: cleanWebhookUrl,
       allowed_updates: ["message", "edited_message"],
       drop_pending_updates: false
     });
-    settings.pollingEnabled = false;
+    data.settings.telegram.pollingEnabled = false;
   }
 
   const failed =
@@ -172,20 +203,36 @@ export async function configureTelegramIntegration(data: AppData, webhookUrl: st
     status: failed ? "failed" : "sent"
   });
 
+  if (failed) {
+    const message =
+      telegramApiError("setMyCommands", privateCommandResult) ||
+      telegramApiError("setMyCommands", groupCommandResult) ||
+      (webhookResult ? telegramApiError("setWebhook", webhookResult) : "") ||
+      "Telegram не подтвердил настройку";
+    data.settings.telegram.lastError = message;
+    throw new Error(message);
+  }
+
+  data.settings.telegram.lastError = "";
+
   return { commands: privateCommandResult.payload, groupCommands: groupCommandResult.payload, webhook: webhookResult?.payload ?? null };
 }
 
 export async function enableTelegramPolling(data: AppData) {
   const settings = data.settings.telegram;
   if (!settings.botToken) throw new Error("Укажите Bot token");
+  const botToken = settings.botToken;
 
-  await telegramApi(settings.botToken, "deleteWebhook", {
+  const deleteWebhookResult = await telegramApi(botToken, "deleteWebhook", {
     drop_pending_updates: false
   });
+  const deleteWebhookError = telegramApiError("deleteWebhook", deleteWebhookResult);
+  if (deleteWebhookError) throw new Error(deleteWebhookError);
+  if (data.settings.telegram.botToken !== botToken) throw new Error("Настройки Telegram изменились во время запуска polling. Повторите запуск");
 
   await configureTelegramIntegration(data, "");
-  settings.pollingEnabled = true;
-  settings.lastError = "";
+  data.settings.telegram.pollingEnabled = true;
+  data.settings.telegram.lastError = "";
 
   addNotification(data, {
     serviceId: data.services[0]?.id ?? "",
@@ -208,14 +255,28 @@ export function disableTelegramPolling(data: AppData) {
 }
 
 export async function pollTelegramUpdates(data: AppData) {
-  const settings = data.settings.telegram;
-  if (!settings.enabled || !settings.pollingEnabled || !settings.botToken) return 0;
+  const pollingSettings = data.settings.telegram;
+  if (!pollingSettings.enabled || !pollingSettings.pollingEnabled || !pollingSettings.botToken) return 0;
+  const pollingToken = pollingSettings.botToken;
+  const pollingOffset = pollingSettings.updateOffset || 0;
 
-  const result = await telegramApi(settings.botToken, "getUpdates", {
-    offset: settings.updateOffset || undefined,
+  const result = await telegramApi(pollingToken, "getUpdates", {
+    offset: pollingOffset || undefined,
     timeout: 0,
     allowed_updates: ["message", "edited_message"]
   });
+
+  // A web request or database restore may have committed a new settings object
+  // while getUpdates was in flight. Continue only with the current snapshot.
+  const settings = data.settings.telegram;
+  if (
+    !settings.enabled ||
+    !settings.pollingEnabled ||
+    settings.botToken !== pollingToken ||
+    (settings.updateOffset || 0) !== pollingOffset
+  ) {
+    return 0;
+  }
 
   if (!result.response.ok || result.payload?.ok === false) {
     settings.lastError = result.payload?.description ?? result.response.statusText;
@@ -397,38 +458,38 @@ export async function handleTelegramUpdate(data: AppData, message: TelegramMessa
 
   if (!user) {
     const reply = `Профиль не найден. Передайте администратору ваш Telegram ID: ${telegramId}`;
-    await sendTelegramMessage(data, reply, message.chat?.id, { commandKeyboard: message.chat?.type === "private", threadId: message.message_thread_id });
+    await sendTelegramMessage(data, reply, message.chat?.id, { removeKeyboard: true, threadId: message.message_thread_id });
     return { handled: true, reply };
   }
 
   if (command === "/start" || command === "/help") {
     const reply = helpText(user, data);
-    await sendTelegramMessage(data, reply, message.chat?.id, { commandKeyboard: message.chat?.type === "private", threadId: message.message_thread_id });
+    await sendTelegramMessage(data, reply, message.chat?.id, { removeKeyboard: true, threadId: message.message_thread_id });
     return { handled: true, reply };
   }
 
   if (command === "/services") {
     const reply = userServicesText(data, user);
-    await sendTelegramMessage(data, reply, message.chat?.id, { commandKeyboard: message.chat?.type === "private", threadId: message.message_thread_id });
+    await sendTelegramMessage(data, reply, message.chat?.id, { removeKeyboard: true, threadId: message.message_thread_id });
     return { handled: true, reply };
   }
 
   if (command === "/users") {
     if (!user.botAdmin) {
       const reply = "Команда доступна только администратору бота.";
-      await sendTelegramMessage(data, reply, message.chat?.id, { commandKeyboard: message.chat?.type === "private", threadId: message.message_thread_id });
+      await sendTelegramMessage(data, reply, message.chat?.id, { removeKeyboard: true, threadId: message.message_thread_id });
       return { handled: true, reply };
     }
 
     const reply = usersByServiceText(data);
-    await sendTelegramMessage(data, reply, message.chat?.id, { commandKeyboard: message.chat?.type === "private", threadId: message.message_thread_id });
+    await sendTelegramMessage(data, reply, message.chat?.id, { removeKeyboard: true, threadId: message.message_thread_id });
     return { handled: true, reply };
   }
 
   if (command === "/settopic") {
     if (!user.botAdmin) {
       const reply = "Команда доступна только администратору бота.";
-      await sendTelegramMessage(data, reply, message.chat?.id, { threadId: message.message_thread_id });
+      await sendTelegramMessage(data, reply, message.chat?.id, { removeKeyboard: true, threadId: message.message_thread_id });
       return { handled: true, reply };
     }
 
@@ -439,7 +500,7 @@ export async function handleTelegramUpdate(data: AppData, message: TelegramMessa
       ? `Готово. Общие уведомления будут идти в этот топик: <b>${message.message_thread_id}</b>.`
       : "Готово. Общие уведомления будут идти в этот чат без topic id.";
 
-    await sendTelegramMessage(data, reply, message.chat?.id, { threadId: message.message_thread_id });
+    await sendTelegramMessage(data, reply, message.chat?.id, { removeKeyboard: true, threadId: message.message_thread_id });
     addNotification(data, {
       serviceId: data.services[0]?.id ?? "",
       userId: user.id,
@@ -453,7 +514,7 @@ export async function handleTelegramUpdate(data: AppData, message: TelegramMessa
   const service = findServiceForCommand(data, user, rest);
   if (!service) {
     const reply = "У вас нет активных сервисов.";
-    await sendTelegramMessage(data, reply, message.chat?.id, { commandKeyboard: message.chat?.type === "private", threadId: message.message_thread_id });
+    await sendTelegramMessage(data, reply, message.chat?.id, { removeKeyboard: true, threadId: message.message_thread_id });
     return { handled: true, reply };
   }
 
@@ -468,20 +529,20 @@ export async function handleTelegramUpdate(data: AppData, message: TelegramMessa
       }`,
       `Участников: <b>${memberCount(data, service.id)}</b>`
     ].join("\n");
-    await sendTelegramMessage(data, reply, message.chat?.id, { commandKeyboard: message.chat?.type === "private", threadId: message.message_thread_id });
+    await sendTelegramMessage(data, reply, message.chat?.id, { removeKeyboard: true, threadId: message.message_thread_id });
     return { handled: true, reply };
   }
 
   if (user.commandDepositsBlocked) {
     const reply = "Пополнение через команду отключено.";
-    await sendTelegramMessage(data, reply, message.chat?.id, { commandKeyboard: message.chat?.type === "private", threadId: message.message_thread_id });
+    await sendTelegramMessage(data, reply, message.chat?.id, { removeKeyboard: true, threadId: message.message_thread_id });
     return { handled: true, reply };
   }
 
   const amount = Number(String(rest[0] ?? "").replace(",", "."));
   if (!Number.isFinite(amount) || amount <= 0) {
     const reply = "Укажите сумму: /pay 600";
-    await sendTelegramMessage(data, reply, message.chat?.id, { commandKeyboard: message.chat?.type === "private", threadId: message.message_thread_id });
+    await sendTelegramMessage(data, reply, message.chat?.id, { removeKeyboard: true, threadId: message.message_thread_id });
     return { handled: true, reply };
   }
 
@@ -500,6 +561,6 @@ export async function handleTelegramUpdate(data: AppData, message: TelegramMessa
     `Новый общий баланс: <b>${formatMoney(deposit.balanceAfter, BALANCE_CURRENCY)}</b>`
   ].join("\n");
 
-  await sendTelegramMessage(data, reply, message.chat?.id, { commandKeyboard: message.chat?.type === "private", threadId: message.message_thread_id });
+  await sendTelegramMessage(data, reply, message.chat?.id, { removeKeyboard: true, threadId: message.message_thread_id });
   return { handled: true, reply };
 }
