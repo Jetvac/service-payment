@@ -37,13 +37,23 @@ server.listen(port, () => {
   console.log(`VPN Payment Control: http://localhost:${port}`);
 });
 
+/**
+ * systemd (and the update script) stop the app with SIGTERM. Open realtime
+ * sockets and keep-alive connections would otherwise hold `server.close()`
+ * open, so they are terminated before the database is closed cleanly.
+ */
+let shuttingDown = false;
 function shutdown() {
+  if (shuttingDown) return;
+  shuttingDown = true;
   stopJobs();
+  for (const client of realtimeClients) client.terminate();
   realtime.close();
   server.close(() => {
     store.close();
     process.exit(0);
   });
+  server.closeAllConnections();
   setTimeout(() => process.exit(0), 5_000).unref();
 }
 
