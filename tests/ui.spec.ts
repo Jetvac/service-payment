@@ -38,7 +38,9 @@ test("pages have no horizontal overflow", async ({ page }) => {
   await login(page);
   for (const section of ["Внести оплату", "Сервисы", "История", "Стена", "Участники", "Настройки"]) {
     await openSection(page, section);
-    const overflow = await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
+    // clientWidth, not innerWidth: on mobile an overflowing page zooms out and
+    // innerWidth grows with it, which would hide the overflow.
+    const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
     expect(overflow, section).toBeLessThanOrEqual(1);
   }
 });
@@ -118,7 +120,8 @@ test("SQLite and legacy JSON backups download, and a full backup restores wall a
   await expect(page.getByText("База восстановлена. Войдите с паролем из резервной копии")).toBeVisible();
   await page.getByLabel("Пароль").fill("test-password-123");
   await page.getByRole("button", { name: "Войти", exact: true }).click();
-  await expect(page.getByRole("heading", { name: "Обзор", level: 1 })).toBeVisible();
+  // The address keeps #/settings, so the app returns to where the restore started.
+  await expect(page.getByRole("heading", { name: "Настройки", level: 1 })).toBeVisible();
 
   const newToken = await page.evaluate(() => localStorage.getItem("vpn-payment-auth-token")!);
   const restored = await page.request.get(`/api/wall/posts/${post.id}`, { headers: { "x-auth-token": newToken } });

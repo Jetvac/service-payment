@@ -218,6 +218,28 @@ input[type="color"] {
   color: var(--text-3);
 }
 
+/*
+ * Single-column grids get an explicit shrinkable track. With the default
+ * `auto` track one unbreakable child (a long URL, a nowrap row) widens the
+ * whole column, the page overflows, and mobile browsers zoom out.
+ */
+.page,
+.card,
+.detail,
+.form,
+.field,
+.settings-section,
+.post-detail,
+.login-card,
+.login-form,
+.login-users,
+.login-user-list,
+.composer-body,
+.comment-body,
+.modal-body {
+  grid-template-columns: minmax(0, 1fr);
+}
+
 /* ==========================================================================
    Utilities
    ========================================================================== */
@@ -2566,6 +2588,11 @@ input[type="color"] {
   display: grid;
   gap: 8px;
   width: min(380px, calc(100vw - 32px));
+  pointer-events: none;
+}
+
+.toast {
+  pointer-events: auto;
 }
 
 .toast {
@@ -2884,9 +2911,11 @@ input[type="color"] {
     flex: 1;
   }
 
+  /* Bottom sheets own the lower edge on phones; toasts go to the top. */
   .toast-stack {
+    top: 64px;
     right: 16px;
-    bottom: 16px;
+    bottom: auto;
   }
 
   .table th,
