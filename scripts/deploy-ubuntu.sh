@@ -24,6 +24,33 @@ log() {
   printf '\n==> %s\n' "$*"
 }
 
+# Fresh Ubuntu servers run unattended-upgrades/apt-daily right after boot, which
+# holds the dpkg lock for minutes. Wait for it instead of failing the deploy.
+APT_LOCK_TIMEOUT="${APT_LOCK_TIMEOUT:-900}"
+export DEBIAN_FRONTEND=noninteractive
+
+wait_for_apt_lock() {
+  local locks=(/var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock /var/cache/apt/archives/lock)
+  command -v fuser >/dev/null 2>&1 || return 0
+  local waited=0
+  while fuser "${locks[@]}" >/dev/null 2>&1; do
+    if (( waited == 0 )); then
+      log "Waiting for another package manager (apt/unattended-upgrades) to finish"
+    fi
+    if (( waited >= APT_LOCK_TIMEOUT )); then
+      echo "apt is still locked after ${APT_LOCK_TIMEOUT}s" >&2
+      return 1
+    fi
+    sleep 5
+    waited=$(( waited + 5 ))
+  done
+}
+
+apt_get() {
+  wait_for_apt_lock
+  apt-get -o DPkg::Lock::Timeout="${APT_LOCK_TIMEOUT}" "$@"
+}
+
 require_root() {
   if [[ "${EUID}" -ne 0 ]]; then
     exec sudo -E bash "$0" "$@"
@@ -32,8 +59,8 @@ require_root() {
 
 install_base_packages() {
   log "Installing base packages"
-  apt-get update
-  apt-get install -y ca-certificates curl gnupg git openssl sudo build-essential python3
+  apt_get update
+  apt_get install -y ca-certificates curl gnupg git openssl sudo build-essential python3
 }
 
 load_existing_env() {
@@ -64,8 +91,9 @@ install_node() {
   fi
 
   log "Installing Node.js ${NODE_MAJOR}.x"
+  wait_for_apt_lock
   curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | bash -
-  apt-get install -y nodejs
+  apt_get install -y nodejs
 }
 
 ensure_app_user() {
@@ -255,7 +283,7 @@ install_nginx() {
   fi
 
   log "Installing nginx reverse proxy"
-  apt-get install -y nginx
+  apt_get install -y nginx
   mkdir -p /var/www/letsencrypt
 
   local server_name
@@ -303,7 +331,7 @@ install_ssl() {
   fi
 
   log "Requesting Let's Encrypt certificate for ${DOMAIN}"
-  apt-get install -y certbot
+  apt_get install -y certbot
   certbot certonly --webroot \
     --non-interactive \
     --agree-tos \
@@ -371,7 +399,7 @@ configure_ufw() {
   fi
 
   log "Configuring UFW"
-  apt-get install -y ufw
+  apt_get install -y ufw
   ufw allow OpenSSH
   ufw allow out 443/tcp
   ufw allow out 53/tcp
