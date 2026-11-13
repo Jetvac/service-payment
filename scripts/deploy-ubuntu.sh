@@ -373,6 +373,9 @@ configure_ufw() {
   log "Configuring UFW"
   apt-get install -y ufw
   ufw allow OpenSSH
+  ufw allow out 443/tcp
+  ufw allow out 53/tcp
+  ufw allow out 53/udp
   if [[ -n "${DOMAIN}" || "${SETUP_NGINX}" == "true" ]]; then
     ufw allow 80/tcp
     if [[ "${ENABLE_SSL}" == "true" ]]; then

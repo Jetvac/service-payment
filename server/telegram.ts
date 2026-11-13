@@ -11,14 +11,14 @@ import {
   roundMoney
 } from "./domain";
 
-type TelegramMessage = {
+export type TelegramMessage = {
   chat?: { id?: number | string; type?: string };
   from?: { id?: number | string; username?: string; first_name?: string };
   message_thread_id?: number;
   text?: string;
 };
 
-type TelegramUpdate = {
+export type TelegramUpdate = {
   update_id: number;
   message?: TelegramMessage;
   edited_message?: TelegramMessage;
@@ -34,8 +34,18 @@ type TelegramPayload = { ok?: boolean; description?: string; result?: unknown } 
 type TelegramHttpResponse = { ok: boolean; status: number; statusText: string };
 type TelegramApiResult = { response: TelegramHttpResponse; payload: TelegramPayload };
 
+function telegramBaseUrl() {
+  const configuredBaseUrl = String(process.env.TELEGRAM_API_BASE_URL ?? "").trim();
+  const baseUrl = new URL(configuredBaseUrl || "https://api.telegram.org");
+  if (baseUrl.protocol !== "https:") throw new Error("TELEGRAM_API_BASE_URL должен использовать HTTPS");
+  if (baseUrl.username || baseUrl.password || baseUrl.search || baseUrl.hash) {
+    throw new Error("TELEGRAM_API_BASE_URL не должен содержать логин, пароль, query или fragment");
+  }
+  return baseUrl.toString().replace(/\/$/, "");
+}
+
 function telegramUrl(token: string, method: string) {
-  return `https://api.telegram.org/bot${token}/${method}`;
+  return `${telegramBaseUrl()}/bot${token}/${method}`;
 }
 
 export function formatMoney(amount: number, currency: string) {
@@ -178,16 +188,9 @@ export async function sendTelegramMessage(data: AppData, text: string, chatId?: 
   const targetChat = chatId ?? settings.chatId;
   const messageThreadId = resolveThreadId(data, options);
 
-  if (!settings.enabled || !settings.botToken || !targetChat) {
-    addNotification(data, {
-      serviceId: data.services[0]?.id ?? "",
-      userId: null,
-      kind: "system",
-      message: text,
-      status: "skipped"
-    });
-    return false;
-  }
+  // Callers record what they tried to deliver; logging the skipped text here
+  // as well produced a duplicate notification for every message.
+  if (!settings.enabled || !settings.botToken || !targetChat) return false;
 
   let result: Awaited<ReturnType<typeof telegramApi>>;
   try {
@@ -365,32 +368,59 @@ export async function pollTelegramUpdates(data: AppData) {
   }
 
   if (!result.response.ok || result.payload?.ok === false) {
-    settings.lastError = result.payload?.description ?? result.response.statusText;
-    addNotification(data, {
-      serviceId: data.services[0]?.id ?? "",
-      userId: null,
-      kind: "system",
-      message: `Telegram polling: ${settings.lastError}`,
-      status: "failed"
-    });
-    return 0;
+    const message = `Telegram polling: ${result.payload?.description ?? result.response.statusText}`;
+    settings.lastError = message;
+    throw new Error(message);
   }
 
+  settings.lastError = "";
   const updates = (Array.isArray(result.payload?.result) ? result.payload?.result : []) as TelegramUpdate[];
   for (const update of updates) {
     settings.updateOffset = Math.max(settings.updateOffset || 0, update.update_id + 1);
-    const message = update.message ?? update.edited_message;
-    if (message) {
-      await handleTelegramUpdate(data, message);
-    }
+    // Edited messages are ignored on purpose: editing "/pay 600" must not
+    // credit the balance a second time.
+    if (update.message) await handleTelegramUpdate(data, update.message);
   }
 
   if (updates.length) {
     settings.lastUpdateAt = new Date().toISOString();
-    settings.lastError = "";
   }
 
   return updates.length;
+}
+
+/**
+ * Downloads the participant's current Telegram profile photo as a data URL.
+ * Uses the same transport and relay as every other Bot API call and gives up
+ * quietly (returning null) so a slow Telegram never blocks saving a profile.
+ */
+export async function fetchTelegramAvatar(data: AppData, telegramId: string): Promise<string | null> {
+  const token = data.settings.telegram.botToken;
+  const userId = telegramId.trim();
+  if (!token || !/^\d+$/.test(userId)) return null;
+
+  try {
+    const photos = await telegramApi(token, "getUserProfilePhotos", { user_id: Number(userId), limit: 1 });
+    const sizes = ((photos.payload?.result as { photos?: Array<Array<{ file_id: string; file_size?: number }>> })?.photos?.[0] ?? [])
+      .slice()
+      .sort((a, b) => (a.file_size ?? 0) - (b.file_size ?? 0));
+    const photo = sizes.at(-1);
+    if (!photo?.file_id) return null;
+
+    const file = await telegramApi(token, "getFile", { file_id: photo.file_id });
+    const filePath = (file.payload?.result as { file_path?: string } | undefined)?.file_path;
+    if (!filePath) return null;
+
+    const image = await fetch(`${telegramBaseUrl()}/file/bot${token}/${filePath}`, { signal: AbortSignal.timeout(10_000) });
+    if (!image.ok) return null;
+    const contentType = image.headers.get("content-type") || "image/jpeg";
+    if (!contentType.startsWith("image/")) return null;
+    const bytes = Buffer.from(await image.arrayBuffer());
+    if (!bytes.length || bytes.length > 512 * 1024) return null;
+    return `data:${contentType};base64,${bytes.toString("base64")}`;
+  } catch {
+    return null;
+  }
 }
 
 export async function sendLowBalanceWarnings(data: AppData, service: Service) {
@@ -428,6 +458,7 @@ export async function sendLowBalanceWarnings(data: AppData, service: Service) {
 }
 
 export async function sendServiceBalanceSummary(data: AppData, service: Service) {
+  if (!data.settings.telegram.monthlySummary) return;
   const rows = data.memberships
     .filter((item) => item.serviceId === service.id && item.active)
     .map((membership) => {
