@@ -8,6 +8,7 @@ export type Currency = {
   updatedAt: string;
 };
 
+/** Participant as the server exposes it (no password hash). */
 export type User = {
   id: string;
   name: string;
@@ -17,11 +18,12 @@ export type User = {
   avatarUrl: string;
   commandDepositsBlocked: boolean;
   botAdmin: boolean;
-  password: string;
-  passwordSet?: boolean;
+  passwordSet: boolean;
   notes: string;
   createdAt: string;
 };
+
+export type AuthUser = Pick<User, "id" | "name" | "avatarUrl" | "botAdmin" | "passwordSet">;
 
 export type BillingSettings = {
   period: BillingPeriod;
@@ -51,12 +53,18 @@ export type Membership = {
   id: string;
   serviceId: string;
   userId: string;
-  balance?: number;
   active: boolean;
   joinedAt: string;
 };
 
-export type Deposit = {
+type OperationState = {
+  cancelledAt?: string | null;
+  cancellationReason?: string;
+  reversalId?: string | null;
+  reversesId?: string | null;
+};
+
+export type Deposit = OperationState & {
   id: string;
   serviceId: string;
   userId: string;
@@ -70,10 +78,22 @@ export type Deposit = {
   source: "manual" | "telegram" | "auto" | "payment" | "reversal";
   createdAt: string;
   balanceAfter: number;
-  cancelledAt?: string | null;
-  cancellationReason?: string;
-  reversalId?: string | null;
-  reversesId?: string | null;
+};
+
+export type Debit = OperationState & {
+  id: string;
+  serviceId: string;
+  userId: string;
+  amount: number;
+  currency: string;
+  amountBalanceCurrency: number;
+  balanceCurrency: string;
+  periodStart: string;
+  periodEnd: string;
+  comment: string;
+  source: "manual" | "auto" | "reversal";
+  createdAt: string;
+  balanceAfter: number;
 };
 
 export type AutoDeposit = {
@@ -92,26 +112,6 @@ export type AutoDeposit = {
   updatedAt: string;
 };
 
-export type Debit = {
-  id: string;
-  serviceId: string;
-  userId: string;
-  amount: number;
-  currency: string;
-  amountBalanceCurrency: number;
-  balanceCurrency: string;
-  periodStart: string;
-  periodEnd: string;
-  comment: string;
-  source: "manual" | "auto" | "reversal";
-  createdAt: string;
-  balanceAfter: number;
-  cancelledAt?: string | null;
-  cancellationReason?: string;
-  reversalId?: string | null;
-  reversesId?: string | null;
-};
-
 export type Notification = {
   id: string;
   serviceId: string;
@@ -122,14 +122,7 @@ export type Notification = {
   createdAt: string;
 };
 
-export type WallTag = {
-  id: string;
-  name: string;
-  color: string;
-  pinned: boolean;
-  archived: boolean;
-  createdAt: string;
-};
+export type WallTag = { id: string; name: string; color: string; pinned: boolean; archived: boolean; createdAt: string };
 
 export type WallFile = {
   id: string;
@@ -179,46 +172,33 @@ export type ServiceSummary = {
   nextChargeAt: string | null;
 };
 
+/** Telegram settings as seen by an administrator; secrets are only flagged. */
 export type TelegramSettings = {
   enabled: boolean;
-  botToken: string;
-  botTokenSet?: boolean;
+  botTokenSet: boolean;
   chatId: string;
   notificationTopicId: string;
-  webhookSecret: string;
-  webhookSecretSet?: boolean;
+  webhookSecretSet: boolean;
+  webhookUrl: string;
   lowBalanceNotifications: boolean;
   monthlySummary: boolean;
   pollingEnabled: boolean;
-  updateOffset: number;
   lastUpdateAt: string | null;
   lastError: string;
 };
 
-export type SecuritySettings = {
-  adminPassword: string;
-  adminPasswordSet?: boolean;
-  sessions?: Record<string, { userId: string; createdAt: string; expiresAt?: string }>;
-};
-
-export type PaymentMethod = "manual" | "sbp" | "sberbank";
-export type PaymentStatus = "pending" | "succeeded" | "canceled" | "failed";
-
+/** Recipient details shown to participants who pay by hand. */
 export type PaymentSettings = {
-  enabled: boolean;
-  provider: "yookassa";
   manualEnabled: boolean;
-  sbpEnabled: boolean;
-  sberPayEnabled: boolean;
-  shopId: string;
-  secretKey: string;
-  secretKeySet?: boolean;
   recipientName: string;
   bankName: string;
   phone: string;
   account: string;
   paymentPurpose: string;
 };
+
+/** "sbp" / "sberbank" only appear in history imported from older versions. */
+export type PaymentMethod = "manual" | "sbp" | "sberbank";
 
 export type PaymentIntent = {
   id: string;
@@ -228,9 +208,7 @@ export type PaymentIntent = {
   currency: string;
   method: PaymentMethod;
   provider: "manual" | "yookassa";
-  status: PaymentStatus;
-  externalId: string;
-  confirmationUrl: string;
+  status: "pending" | "succeeded" | "canceled" | "failed";
   description: string;
   comment: string;
   depositId: string | null;
@@ -240,25 +218,26 @@ export type PaymentIntent = {
   paidAt: string | null;
 };
 
-export type AppCounts = {
-  deposits: number;
-  debits: number;
-  notifications: number;
-  payments: number;
-};
-
 export type AppState = {
+  viewerId: string;
   currencies: Currency[];
   users: User[];
   services: Service[];
   memberships: Membership[];
   autoDeposits: AutoDeposit[];
-  deposits: Deposit[];
-  debits: Debit[];
-  notifications: Notification[];
-  payments: PaymentIntent[];
-  settings: { telegram: TelegramSettings; security: SecuritySettings; payments: PaymentSettings };
   summaries: ServiceSummary[];
-  counts: AppCounts;
+  botEnabled: boolean;
+  settings: { payments: PaymentSettings; telegram: TelegramSettings | null };
+  counts: { deposits: number; debits: number; notifications: number; payments: number };
   serverTime: string;
 };
+
+export type PageResult<T> = { rows: T[]; total: number; offset: number; limit: number; hasMore: boolean };
+
+export type DashboardData = {
+  currency: string;
+  chart: Array<{ date: string; deposits: number; debits: number }>;
+  notifications: PageResult<Notification>;
+};
+
+export type WallListData = { posts: PageResult<WallPost>; tags: WallTag[]; files: WallFile[] };

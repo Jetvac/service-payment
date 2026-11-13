@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { afterEach, beforeEach, test } from "node:test";
-import { runDebitForService, seedData } from "./domain";
+import { ensureMembership, runDebitForService, seedData } from "./domain";
 import {
   configureTelegramIntegration,
   disableTelegramPolling,
@@ -14,15 +14,19 @@ import type { AppData } from "./types";
 
 const originalFetch = globalThis.fetch;
 const originalTelegramTransport = process.env.TELEGRAM_API_TRANSPORT;
+const originalTelegramBaseUrl = process.env.TELEGRAM_API_BASE_URL;
 
 beforeEach(() => {
   process.env.TELEGRAM_API_TRANSPORT = "fetch";
+  delete process.env.TELEGRAM_API_BASE_URL;
 });
 
 afterEach(() => {
   globalThis.fetch = originalFetch;
   if (originalTelegramTransport === undefined) delete process.env.TELEGRAM_API_TRANSPORT;
   else process.env.TELEGRAM_API_TRANSPORT = originalTelegramTransport;
+  if (originalTelegramBaseUrl === undefined) delete process.env.TELEGRAM_API_BASE_URL;
+  else process.env.TELEGRAM_API_BASE_URL = originalTelegramBaseUrl;
 });
 
 function telegramData() {
@@ -31,9 +35,17 @@ function telegramData() {
   data.settings.telegram.botToken = "test-token";
   data.settings.telegram.chatId = "-100500";
   data.settings.telegram.pollingEnabled = true;
-  data.users[0].telegramId = "101";
-  data.users[0].botAdmin = true;
-  data.users[1].telegramId = "202";
+  Object.assign(data.users[0], { name: "Алексей", telegramId: "101", telegramUsername: "alex", botAdmin: true, balance: 240 });
+  data.users.push({
+    ...data.users[0],
+    id: "usr_maria",
+    name: "Мария",
+    telegramId: "202",
+    telegramUsername: "maria",
+    botAdmin: false,
+    balance: 60
+  });
+  ensureMembership(data, data.services[0].id, "usr_maria");
   return data;
 }
 
@@ -45,10 +57,11 @@ function okResponse(result: unknown = true) {
 }
 
 function captureTelegramRequests() {
-  const requests: Array<{ method: string; body: Record<string, unknown> }> = [];
+  const requests: Array<{ url: string; method: string; body: Record<string, unknown> }> = [];
   globalThis.fetch = async (input, init) => {
-    const method = String(input).split("/").at(-1) ?? "";
-    requests.push({ method, body: JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown> });
+    const url = String(input);
+    const method = url.split("/").at(-1) ?? "";
+    requests.push({ url, method, body: JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown> });
     return okResponse();
   };
   return requests;
@@ -158,6 +171,22 @@ test("polling resumes against current settings after an in-flight state replacem
   assert.ok(data.settings.telegram.lastUpdateAt);
 });
 
+test("polling ignores edited messages so an edited /pay never credits twice", async () => {
+  const data = telegramData();
+  globalThis.fetch = async (input) =>
+    String(input).endsWith("/getUpdates")
+      ? okResponse([
+          { update_id: 20, message: { chat: { id: 777, type: "private" }, from: { id: 101 }, text: "/pay 100" } },
+          { update_id: 21, edited_message: { chat: { id: 777, type: "private" }, from: { id: 101 }, text: "/pay 100" } }
+        ])
+      : okResponse();
+
+  assert.equal(await pollTelegramUpdates(data), 2);
+  assert.equal(data.users[0].balance, 340);
+  assert.equal(data.deposits.length, 1);
+  assert.equal(data.settings.telegram.updateOffset, 22);
+});
+
 test("configuration surfaces Telegram API rejections and records diagnostics", async () => {
   const data = telegramData();
   globalThis.fetch = async () =>
@@ -189,6 +218,18 @@ test("webhook and polling setup register the right Telegram API methods", async 
   assert.equal(data.settings.telegram.pollingEnabled, false);
 });
 
+test("a configured HTTPS relay receives the same Bot API path and payload", async () => {
+  const data = telegramData();
+  const requests = captureTelegramRequests();
+  process.env.TELEGRAM_API_BASE_URL = "https://relay.example/telegram/";
+
+  await command(data, "101", "/balance");
+
+  assert.equal(requests[0].url, "https://relay.example/telegram/bottest-token/sendMessage");
+  assert.equal(requests[0].body.chat_id, 777);
+  assert.deepEqual(requests[0].body.reply_markup, { remove_keyboard: true });
+});
+
 test("post-debit summaries and low-balance warnings contain current balances and use the configured topic", async () => {
   const data = telegramData();
   const requests = captureTelegramRequests();
@@ -215,6 +256,24 @@ test("network failures name the Telegram method instead of returning a generic f
   };
 
   await assert.rejects(pollTelegramUpdates(data), /Telegram API недоступен \(getUpdates\): fetch: fetch failed/);
+});
+
+test("polling API errors are surfaced without creating a notification on every attempt", async () => {
+  const data = telegramData();
+  globalThis.fetch = async () =>
+    new Response(JSON.stringify({ ok: false, description: "Too Many Requests" }), {
+      status: 429,
+      statusText: "Too Many Requests",
+      headers: { "Content-Type": "application/json" }
+    });
+
+  await assert.rejects(pollTelegramUpdates(data), /Telegram polling: Too Many Requests/);
+  assert.equal(data.notifications.length, 0);
+  assert.equal(data.settings.telegram.lastError, "Telegram polling: Too Many Requests");
+
+  globalThis.fetch = async () => okResponse([]);
+  assert.equal(await pollTelegramUpdates(data), 0);
+  assert.equal(data.settings.telegram.lastError, "");
 });
 
 test("a sendMessage network failure is recorded and does not escape as an unhandled fetch error", async () => {

@@ -193,18 +193,18 @@ export type SecuritySettings = {
   sessions?: Record<string, { userId: string; createdAt: string; expiresAt?: string }>;
 };
 
+/**
+ * New payments are always "manual" (entered by hand). "sbp" and "sberbank"
+ * only exist in history imported from older versions that had online
+ * acquiring; they are kept read-only so legacy backups round-trip unchanged.
+ */
 export type PaymentMethod = "manual" | "sbp" | "sberbank";
+export type PaymentProvider = "manual" | "yookassa";
 export type PaymentStatus = "pending" | "succeeded" | "canceled" | "failed";
 
+/** Recipient details shown to participants who pay by hand. */
 export type PaymentSettings = {
-  enabled: boolean;
-  provider: "yookassa";
   manualEnabled: boolean;
-  sbpEnabled: boolean;
-  sberPayEnabled: boolean;
-  shopId: string;
-  secretKey: string;
-  secretKeySet?: boolean;
   recipientName: string;
   bankName: string;
   phone: string;
@@ -219,7 +219,7 @@ export type PaymentIntent = {
   amount: number;
   currency: string;
   method: PaymentMethod;
-  provider: "manual" | "yookassa";
+  provider: PaymentProvider;
   status: PaymentStatus;
   externalId: string;
   confirmationUrl: string;

@@ -1,6 +1,6 @@
 import type {
-  AutoDeposit,
   AppData,
+  AutoDeposit,
   BillingPeriod,
   Debit,
   Deposit,
@@ -13,6 +13,9 @@ import type {
 } from "./types";
 
 export const BALANCE_CURRENCY = "RUB";
+export const MAX_NOTIFICATIONS = 500;
+export const BILLING_PERIODS: readonly BillingPeriod[] = ["month", "week", "day", "hour"];
+
 export const nowIso = () => new Date().toISOString();
 
 export const id = (prefix: string) =>
@@ -23,20 +26,23 @@ export function roundMoney(value: number) {
 }
 
 export function normalizeNumber(value: unknown, fallback = 0) {
+  if (value === null || value === undefined || value === "") return fallback;
   const number = Number(value);
   return Number.isFinite(number) ? number : fallback;
 }
 
+/** Integer within [min, max]; anything unparsable becomes the fallback. */
+export function clampInt(value: unknown, min: number, max: number, fallback: number) {
+  return Math.min(max, Math.max(min, Math.round(normalizeNumber(value, fallback))));
+}
+
+export function isBillingPeriod(value: unknown): value is BillingPeriod {
+  return typeof value === "string" && (BILLING_PERIODS as readonly string[]).includes(value);
+}
+
 export function defaultPaymentSettings(): PaymentSettings {
   return {
-    enabled: true,
-    provider: "yookassa",
     manualEnabled: true,
-    sbpEnabled: false,
-    sberPayEnabled: false,
-    shopId: "",
-    secretKey: "",
-    secretKeySet: false,
     recipientName: "",
     bankName: "",
     phone: "",
@@ -45,11 +51,15 @@ export function defaultPaymentSettings(): PaymentSettings {
   };
 }
 
+/**
+ * First start without any data: one administrator attached to one service.
+ * Balances start at zero so that every rouble on a balance is backed by a
+ * ledger operation.
+ */
 export function seedData(): AppData {
   const createdAt = nowIso();
   const initialPassword = process.env.INITIAL_ADMIN_PASSWORD || "admin";
-  const userA = id("usr");
-  const userB = id("usr");
+  const adminId = id("usr");
   const serviceId = id("svc");
 
   return {
@@ -60,28 +70,14 @@ export function seedData(): AppData {
     ],
     users: [
       {
-        id: userA,
-        name: "Алексей",
-        balance: 240,
+        id: adminId,
+        name: "Администратор",
+        balance: 0,
         telegramId: "",
-        telegramUsername: "alex",
+        telegramUsername: "",
         avatarUrl: "",
         commandDepositsBlocked: false,
         botAdmin: true,
-        password: initialPassword,
-        passwordSet: true,
-        notes: "",
-        createdAt
-      },
-      {
-        id: userB,
-        name: "Мария",
-        balance: 60,
-        telegramId: "",
-        telegramUsername: "maria",
-        avatarUrl: "",
-        commandDepositsBlocked: false,
-        botAdmin: false,
         password: initialPassword,
         passwordSet: true,
         notes: "",
@@ -111,10 +107,7 @@ export function seedData(): AppData {
         createdAt
       }
     ],
-    memberships: [
-      { id: id("mem"), serviceId, userId: userA, active: true, joinedAt: createdAt },
-      { id: id("mem"), serviceId, userId: userB, active: true, joinedAt: createdAt }
-    ],
+    memberships: [{ id: id("mem"), serviceId, userId: adminId, active: true, joinedAt: createdAt }],
     autoDeposits: [],
     deposits: [],
     debits: [],
@@ -170,11 +163,16 @@ export function calculatePerMemberPeriod(data: AppData, service: Service) {
   const monthly = calculatePerMemberMonth(data, service);
   const interval = Math.max(1, service.billing.interval || 1);
 
-  if (service.billing.period === "month") return roundMoney(monthly * interval);
-  if (service.billing.period === "week") return roundMoney((monthly * 12 * interval) / 52);
-  if (service.billing.period === "day") return roundMoney((monthly * interval) / 30.4375);
-
-  return roundMoney((monthly * interval) / 730.5);
+  switch (service.billing.period) {
+    case "month":
+      return roundMoney(monthly * interval);
+    case "week":
+      return roundMoney((monthly * 12 * interval) / 52);
+    case "day":
+      return roundMoney((monthly * interval) / 30.4375);
+    case "hour":
+      return roundMoney((monthly * interval) / 730.5);
+  }
 }
 
 export function getCurrency(data: AppData, code: string) {
@@ -184,13 +182,8 @@ export function getCurrency(data: AppData, code: string) {
 export function convertCurrency(data: AppData, amount: number, fromCode: string, toCode: string) {
   const from = getCurrency(data, fromCode);
   const to = getCurrency(data, toCode);
-
-  if (!from || !to) {
-    throw new Error("Не найдена валюта для конвертации");
-  }
-
-  const amountRub = amount * from.rateToRub;
-  return roundMoney(amountRub / to.rateToRub);
+  if (!from || !to) throw new Error("Не найдена валюта для конвертации");
+  return roundMoney((amount * from.rateToRub) / to.rateToRub);
 }
 
 export function convertToBalanceCurrency(data: AppData, amount: number, fromCode: string) {
@@ -231,17 +224,16 @@ export function addDeposit(
   }
 ) {
   const service = data.services.find((item) => item.id === input.serviceId);
-
   if (!service) throw new Error("Сервис не найден");
   ensureActiveMembership(data, input.serviceId, input.userId);
-  if (input.amount <= 0) throw new Error("Сумма должна быть больше нуля");
+  if (!Number.isFinite(input.amount) || input.amount <= 0) throw new Error("Сумма должна быть больше нуля");
+  if (!getCurrency(data, input.currency)) throw new Error("Валюта не найдена");
 
   const user = findUser(data, input.userId);
   const amountOriginal = roundMoney(input.amount);
   const amountServiceCurrency =
     input.currency === service.currency ? amountOriginal : convertCurrency(data, amountOriginal, input.currency, service.currency);
   const amountBalanceCurrency = convertToBalanceCurrency(data, amountOriginal, input.currency);
-
   const balanceAfter = adjustUserBalance(user, amountBalanceCurrency);
 
   const deposit: Deposit = {
@@ -281,10 +273,9 @@ export function addDebit(
   }
 ) {
   const service = data.services.find((item) => item.id === input.serviceId);
-
   if (!service) throw new Error("Сервис не найден");
   ensureActiveMembership(data, input.serviceId, input.userId);
-  if (input.amount <= 0) throw new Error("Сумма должна быть больше нуля");
+  if (!Number.isFinite(input.amount) || input.amount <= 0) throw new Error("Сумма должна быть больше нуля");
 
   const user = findUser(data, input.userId);
   const amount = roundMoney(input.amount);
@@ -315,16 +306,22 @@ export function addDebit(
   return debit;
 }
 
+/**
+ * Reverses a deposit with a compensating debit. A payment that produced the
+ * deposit is marked cancelled too, so the payment history never claims money
+ * was credited when it no longer is.
+ */
 export function cancelDeposit(data: AppData, depositId: string, reason = "") {
   const deposit = data.deposits.find((item) => item.id === depositId);
   if (!deposit) throw new Error("Зачисление не найдено");
   if (deposit.cancelledAt) throw new Error("Зачисление уже отменено");
-  if (deposit.reversesId) throw new Error("Корректирующую операцию нельзя отменить повторно");
+  if (deposit.reversesId) throw new Error("Корректирующую операцию нельзя отменить");
 
   const user = findUser(data, deposit.userId);
   const amountBalanceCurrency =
     deposit.amountBalanceCurrency ?? convertToBalanceCurrency(data, deposit.amountServiceCurrency, deposit.serviceCurrency);
   const balanceAfter = adjustUserBalance(user, -amountBalanceCurrency);
+  const cancelledAt = nowIso();
 
   const reversal: Debit = {
     id: id("deb"),
@@ -336,20 +333,27 @@ export function cancelDeposit(data: AppData, depositId: string, reason = "") {
     balanceCurrency: BALANCE_CURRENCY,
     rateSnapshot: rateSnapshot(data),
     periodStart: deposit.createdAt,
-    periodEnd: nowIso(),
+    periodEnd: cancelledAt,
     comment: reason || `Отмена зачисления ${deposit.id}`,
     source: "reversal",
-    createdAt: nowIso(),
+    createdAt: cancelledAt,
     balanceAfter,
     cancelledAt: null,
     reversalId: null,
     reversesId: deposit.id
   };
 
-  deposit.cancelledAt = nowIso();
+  deposit.cancelledAt = cancelledAt;
   deposit.cancellationReason = reason;
   deposit.reversalId = reversal.id;
   data.debits.unshift(reversal);
+
+  for (const payment of data.payments.filter((item) => item.depositId === deposit.id && item.status === "succeeded")) {
+    payment.status = "canceled";
+    payment.failureReason = reason || "Зачисление отменено администратором";
+    payment.updatedAt = cancelledAt;
+  }
+
   return reversal;
 }
 
@@ -357,14 +361,12 @@ export function cancelDebit(data: AppData, debitId: string, reason = "") {
   const debit = data.debits.find((item) => item.id === debitId);
   if (!debit) throw new Error("Списание не найдено");
   if (debit.cancelledAt) throw new Error("Списание уже отменено");
-  if (debit.reversesId) throw new Error("Корректирующую операцию нельзя отменить повторно");
-
-  const service = data.services.find((item) => item.id === debit.serviceId);
-  if (!service) throw new Error("Сервис не найден");
+  if (debit.reversesId) throw new Error("Корректирующую операцию нельзя отменить");
 
   const user = findUser(data, debit.userId);
   const amountBalanceCurrency = debit.amountBalanceCurrency ?? convertToBalanceCurrency(data, debit.amount, debit.currency);
   const balanceAfter = adjustUserBalance(user, amountBalanceCurrency);
+  const cancelledAt = nowIso();
 
   const reversal: Deposit = {
     id: id("dep"),
@@ -373,37 +375,31 @@ export function cancelDebit(data: AppData, debitId: string, reason = "") {
     amountOriginal: debit.amount,
     currencyOriginal: debit.currency,
     amountServiceCurrency: debit.amount,
-    serviceCurrency: service.currency,
+    serviceCurrency: debit.currency,
     amountBalanceCurrency,
     balanceCurrency: BALANCE_CURRENCY,
     rateSnapshot: rateSnapshot(data),
     comment: reason || `Отмена списания ${debit.id}`,
     source: "reversal",
-    createdAt: nowIso(),
+    createdAt: cancelledAt,
     balanceAfter,
     cancelledAt: null,
     reversalId: null,
     reversesId: debit.id
   };
 
-  debit.cancelledAt = nowIso();
+  debit.cancelledAt = cancelledAt;
   debit.cancellationReason = reason;
   debit.reversalId = reversal.id;
   data.deposits.unshift(reversal);
   return reversal;
 }
 
-export function addNotification(
-  data: AppData,
-  input: Omit<Notification, "id" | "createdAt">
-) {
-  const notification: Notification = {
-    ...input,
-    id: id("ntf"),
-    createdAt: nowIso()
-  };
-
+/** Notifications are a rolling log; the oldest entries are dropped. */
+export function addNotification(data: AppData, input: Omit<Notification, "id" | "createdAt">) {
+  const notification: Notification = { ...input, id: id("ntf"), createdAt: nowIso() };
   data.notifications.unshift(notification);
+  if (data.notifications.length > MAX_NOTIFICATIONS) data.notifications.length = MAX_NOTIFICATIONS;
   return notification;
 }
 
@@ -411,33 +407,51 @@ function daysInMonth(year: number, month: number) {
   return new Date(year, month + 1, 0).getDate();
 }
 
-function buildMonthlyDate(year: number, month: number, anchorDay: number, anchorHour: number, shiftDays: number) {
+/**
+ * Charge moment for a month identified by an absolute month index
+ * (year * 12 + month). The anchor day is clamped to the month length before
+ * the shift is applied, so 31 becomes 28/29 in February.
+ */
+function monthlyDate(monthIndex: number, anchorDay: number, anchorHour: number, shiftDays: number) {
+  const year = Math.floor(monthIndex / 12);
+  const month = monthIndex - year * 12;
   const day = Math.min(Math.max(1, anchorDay), daysInMonth(year, month));
   const date = new Date(year, month, day, Math.max(0, Math.min(23, anchorHour)), 0, 0, 0);
   date.setDate(date.getDate() + shiftDays);
   return date;
 }
 
+const monthIndexOf = (date: Date) => date.getFullYear() * 12 + date.getMonth();
+
 export function buildNextAutoDepositDate(from: Date, dayOfMonth: number, hour: number) {
-  let cursor = buildMonthlyDate(from.getFullYear(), from.getMonth(), dayOfMonth, hour, 0);
-
+  let monthIndex = monthIndexOf(from);
+  let cursor = monthlyDate(monthIndex, dayOfMonth, hour, 0);
   while (cursor <= from) {
-    cursor = buildMonthlyDate(cursor.getFullYear(), cursor.getMonth() + 1, dayOfMonth, hour, 0);
+    monthIndex += 1;
+    cursor = monthlyDate(monthIndex, dayOfMonth, hour, 0);
   }
-
   return cursor;
 }
 
 export function advanceAutoDepositDate(schedule: Pick<AutoDeposit, "dayOfMonth" | "hour">, from: Date) {
-  let cursor = buildMonthlyDate(from.getFullYear(), from.getMonth() + 1, schedule.dayOfMonth, schedule.hour, 0);
-
+  let monthIndex = monthIndexOf(from) + 1;
+  let cursor = monthlyDate(monthIndex, schedule.dayOfMonth, schedule.hour, 0);
   while (cursor <= from) {
-    cursor = buildMonthlyDate(cursor.getFullYear(), cursor.getMonth() + 1, schedule.dayOfMonth, schedule.hour, 0);
+    monthIndex += 1;
+    cursor = monthlyDate(monthIndex, schedule.dayOfMonth, schedule.hour, 0);
   }
-
   return cursor;
 }
 
+function addPeriod(date: Date, period: Exclude<BillingPeriod, "month">, interval: number) {
+  const next = new Date(date);
+  if (period === "week") next.setDate(next.getDate() + 7 * interval);
+  if (period === "day") next.setDate(next.getDate() + interval);
+  if (period === "hour") next.setHours(next.getHours() + interval);
+  return next;
+}
+
+/** First charge moment strictly after `from`. */
 export function buildNextChargeDate(
   from: Date,
   period: BillingPeriod,
@@ -446,47 +460,41 @@ export function buildNextChargeDate(
   anchorHour: number,
   shiftDays: number
 ) {
-  const safeInterval = Math.max(1, interval || 1);
+  const step = Math.max(1, interval || 1);
 
   if (period === "month") {
-    let cursor = buildMonthlyDate(from.getFullYear(), from.getMonth(), anchorDay, anchorHour, shiftDays);
-
+    // A positive shift can push the previous month's charge past `from`.
+    const previous = monthlyDate(monthIndexOf(from) - 1, anchorDay, anchorHour, shiftDays);
+    if (previous > from) return previous;
+    let monthIndex = monthIndexOf(from);
+    let cursor = monthlyDate(monthIndex, anchorDay, anchorHour, shiftDays);
     while (cursor <= from) {
-      cursor = buildMonthlyDate(cursor.getFullYear(), cursor.getMonth() + safeInterval, anchorDay, anchorHour, shiftDays);
+      monthIndex += step;
+      cursor = monthlyDate(monthIndex, anchorDay, anchorHour, shiftDays);
     }
-
     return cursor;
   }
 
-  const next = new Date(from);
-  next.setHours(Math.max(0, Math.min(23, anchorHour)), 0, 0, 0);
-  if (next <= from) {
-    if (period === "week") next.setDate(next.getDate() + 7 * safeInterval);
-    if (period === "day") next.setDate(next.getDate() + safeInterval);
-    if (period === "hour") next.setHours(next.getHours() + safeInterval);
-  }
-
+  let next = new Date(from);
+  if (period === "hour") next.setMinutes(0, 0, 0);
+  else next.setHours(Math.max(0, Math.min(23, anchorHour)), 0, 0, 0);
+  while (next <= from) next = addPeriod(next, period, step);
   return next;
 }
 
+/** Charge moment that follows a charge made at `from`. */
 export function advanceChargeDate(service: Service, from: Date) {
   const { period, interval, anchorDay, anchorHour, shiftDays } = service.billing;
+  const step = Math.max(1, interval || 1);
 
   if (period === "month") {
-    return buildMonthlyDate(
-      from.getFullYear(),
-      from.getMonth() + Math.max(1, interval || 1),
-      anchorDay,
-      anchorHour,
-      shiftDays
-    );
+    // Undo the shift to find which month `from` belongs to, then step forward.
+    const base = new Date(from);
+    base.setDate(base.getDate() - shiftDays);
+    return monthlyDate(monthIndexOf(base) + step, anchorDay, anchorHour, shiftDays);
   }
 
-  const next = new Date(from);
-  if (period === "week") next.setDate(next.getDate() + 7 * Math.max(1, interval || 1));
-  if (period === "day") next.setDate(next.getDate() + Math.max(1, interval || 1));
-  if (period === "hour") next.setHours(next.getHours() + Math.max(1, interval || 1));
-  return next;
+  return addPeriod(from, period, step);
 }
 
 function resolveAutoDepositService(data: AppData, schedule: AutoDeposit) {
@@ -501,10 +509,7 @@ function resolveAutoDepositService(data: AppData, schedule: AutoDeposit) {
   const fallback = data.memberships.find(
     (membership) => membership.userId === schedule.userId && membership.active && serviceIsActive(membership.serviceId)
   );
-
-  if (!fallback) {
-    throw new Error("Для автоплатежа нужен активный сервис участника");
-  }
+  if (!fallback) throw new Error("Для автоплатежа нужен активный сервис участника");
 
   schedule.serviceId = fallback.serviceId;
   return fallback.serviceId;
@@ -512,7 +517,7 @@ function resolveAutoDepositService(data: AppData, schedule: AutoDeposit) {
 
 export function runAutoDepositSchedule(data: AppData, scheduleId: string, options: { advance: boolean }) {
   const schedule = data.autoDeposits.find((item) => item.id === scheduleId);
-  if (!schedule) throw new Error("Автоплатеж не найден");
+  if (!schedule) throw new Error("Автоплатёж не найден");
   if (!schedule.enabled && options.advance) return null;
 
   const serviceId = resolveAutoDepositService(data, schedule);
@@ -522,15 +527,13 @@ export function runAutoDepositSchedule(data: AppData, scheduleId: string, option
     userId: schedule.userId,
     amount: schedule.amount,
     currency: schedule.currency,
-    comment: schedule.comment || "Автоплатеж",
+    comment: schedule.comment || "Автоплатёж",
     source: "auto"
   });
 
   schedule.lastDepositedAt = deposit.createdAt;
   schedule.updatedAt = nowIso();
-  if (options.advance) {
-    schedule.nextDepositAt = advanceAutoDepositDate(schedule, dueAt).toISOString();
-  }
+  if (options.advance) schedule.nextDepositAt = advanceAutoDepositDate(schedule, dueAt).toISOString();
 
   return deposit;
 }
@@ -548,6 +551,11 @@ export function getPeriodRange(service: Service, chargeDate: Date) {
   return { periodStart: periodStart.toISOString(), periodEnd };
 }
 
+/**
+ * Charges every active member one period and moves the schedule forward.
+ * A free service or one without members still advances its schedule, so the
+ * scheduler never gets stuck retrying the same due date.
+ */
 export function runDebitForService(data: AppData, serviceId: string, source: Debit["source"]) {
   const service = data.services.find((item) => item.id === serviceId);
   if (!service) throw new Error("Сервис не найден");
@@ -557,28 +565,34 @@ export function runDebitForService(data: AppData, serviceId: string, source: Deb
   const chargeDate = new Date(service.billing.nextChargeAt ?? nowIso());
   const { periodStart, periodEnd } = getPeriodRange(service, chargeDate);
 
-  const debits = members.map((membership) =>
-    addDebit(data, {
-      serviceId: service.id,
-      userId: membership.userId,
-      amount,
-      periodStart,
-      periodEnd,
-      comment: `Списание за ${service.billing.interval} ${periodLabel(service.billing.period)}`,
-      source
-    })
-  );
+  const debits =
+    amount > 0
+      ? members.map((membership) =>
+          addDebit(data, {
+            serviceId: service.id,
+            userId: membership.userId,
+            amount,
+            periodStart,
+            periodEnd,
+            comment: `Списание за ${service.billing.interval} ${periodLabel(service.billing.period)}`,
+            source
+          })
+        )
+      : [];
 
   service.billing.lastChargedAt = nowIso();
   service.billing.nextChargeAt = advanceChargeDate(service, chargeDate).toISOString();
-
   return debits;
 }
 
 export function computeSummaries(data: AppData): ServiceSummary[] {
   return data.services.map((service) => {
     const perMemberPeriod = calculatePerMemberPeriod(data, service);
-    const lowBorder = convertToBalanceCurrency(data, perMemberPeriod * Math.max(1, service.billing.lowBalanceThresholdPeriods || 1), service.currency);
+    const lowBorder = convertToBalanceCurrency(
+      data,
+      perMemberPeriod * Math.max(1, service.billing.lowBalanceThresholdPeriods || 1),
+      service.currency
+    );
     const memberships = data.memberships.filter((item) => item.serviceId === service.id && item.active);
     const users = memberships
       .map((membership) => data.users.find((user) => user.id === membership.userId))
@@ -589,7 +603,7 @@ export function computeSummaries(data: AppData): ServiceSummary[] {
       memberCount: memberships.length,
       perMemberMonth: calculatePerMemberMonth(data, service),
       perMemberPeriod,
-      lowBalanceCount: users.filter((user) => user.balance > 0 && user.balance < lowBorder).length,
+      lowBalanceCount: users.filter((user) => user.balance >= 0 && user.balance < lowBorder).length,
       debtCount: users.filter((user) => user.balance < 0).length,
       nextChargeAt: service.billing.nextChargeAt
     };
@@ -603,13 +617,7 @@ export function ensureMembership(data: AppData, serviceId: string, userId: strin
     return existing;
   }
 
-  const membership: Membership = {
-    id: id("mem"),
-    serviceId,
-    userId,
-    active: true,
-    joinedAt: nowIso()
-  };
+  const membership: Membership = { id: id("mem"), serviceId, userId, active: true, joinedAt: nowIso() };
   data.memberships.push(membership);
   return membership;
 }

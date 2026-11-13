@@ -1,11 +1,12 @@
 import fs from "node:fs";
 import path from "node:path";
 import Database from "better-sqlite3";
-import type { AppData, WallFile } from "./types";
+import type { AppData, PaymentSettings, WallFile } from "./types";
 import {
   BALANCE_CURRENCY,
   buildNextAutoDepositDate,
   defaultPaymentSettings,
+  MAX_NOTIFICATIONS,
   normalizeNumber,
   nowIso,
   roundMoney,
@@ -44,6 +45,18 @@ export class Store {
 
   exportData() {
     return cloneData(this.data);
+  }
+
+  /**
+   * Full state in the legacy JSON backup format (the format older versions
+   * exported and that `replace()` still imports). Login sessions are left
+   * out: a backup file must not carry live access tokens. Attachment bytes
+   * are not part of this format; use the SQLite backup for those.
+   */
+  exportLegacyJson() {
+    const data = cloneData(this.data);
+    data.settings.security.sessions = {};
+    return data;
   }
 
   write(mutator: (data: AppData) => void) {
@@ -310,8 +323,15 @@ export class Store {
       user.telegramId ??= "";
       user.telegramUsername ??= "";
       user.avatarUrl ??= "";
-      user.password = String(user.password || process.env.INITIAL_ADMIN_PASSWORD || "admin");
-      if (!isPasswordHash(user.password)) user.password = hashPassword(user.password);
+      // Records from before logins existed have no password field at all and
+      // get the initial password once. An empty string means "no password
+      // set" and must stay that way, or anyone knowing the initial password
+      // could sign in as every participant created without one.
+      if (user.password === undefined || user.password === null) {
+        user.password = process.env.INITIAL_ADMIN_PASSWORD || "admin";
+      }
+      user.password = String(user.password);
+      if (user.password && !isPasswordHash(user.password)) user.password = hashPassword(user.password);
       user.passwordSet = Boolean(user.password);
       const legacyBalances = (data.memberships ?? []).filter(
         (membership) => membership.userId === user.id && typeof membership.balance === "number"
@@ -335,6 +355,7 @@ export class Store {
     }
 
     data.notifications ??= [];
+    if (data.notifications.length > MAX_NOTIFICATIONS) data.notifications.length = MAX_NOTIFICATIONS;
     data.payments ??= [];
     data.wallTags ??= [];
     data.wallFiles ??= [];
@@ -371,8 +392,19 @@ export class Store {
     data.settings.telegram.lastError ??= "";
     data.settings.telegram.botTokenSet = Boolean(data.settings.telegram.botToken);
     data.settings.telegram.webhookSecretSet = Boolean(data.settings.telegram.webhookSecret);
-    data.settings.payments = { ...defaultPaymentSettings(), ...(data.settings.payments ?? {}) };
-    data.settings.payments.secretKeySet = Boolean(data.settings.payments.secretKey);
+    // Online acquiring was removed: only the manual-entry switch and the
+    // recipient details survive. Provider credentials from older versions
+    // (shop id, secret key) are dropped instead of being kept around unused.
+    const legacyPayments = (data.settings.payments ?? {}) as Partial<PaymentSettings>;
+    const paymentDefaults = defaultPaymentSettings();
+    data.settings.payments = {
+      manualEnabled: typeof legacyPayments.manualEnabled === "boolean" ? legacyPayments.manualEnabled : paymentDefaults.manualEnabled,
+      recipientName: String(legacyPayments.recipientName ?? ""),
+      bankName: String(legacyPayments.bankName ?? ""),
+      phone: String(legacyPayments.phone ?? ""),
+      account: String(legacyPayments.account ?? ""),
+      paymentPurpose: String(legacyPayments.paymentPurpose ?? paymentDefaults.paymentPurpose)
+    };
 
     for (const payment of data.payments) {
       payment.id = String(payment.id ?? "");
@@ -380,6 +412,7 @@ export class Store {
       payment.serviceId = String(payment.serviceId ?? "");
       payment.amount = roundMoney(Math.max(0, normalizeNumber(payment.amount, 0)));
       payment.currency = String(payment.currency ?? BALANCE_CURRENCY).toUpperCase();
+      // Historical online payments keep their method so old backups round-trip.
       payment.method = ["manual", "sbp", "sberbank"].includes(payment.method) ? payment.method : "manual";
       payment.provider = payment.method === "manual" ? "manual" : "yookassa";
       payment.status = ["pending", "succeeded", "canceled", "failed"].includes(payment.status)

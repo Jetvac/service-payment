@@ -123,11 +123,17 @@ cd "${APP_DIR}"
 log 'Migrating and verifying SQLite with all attachments'
 node --import tsx scripts/verify-data.ts
 fix_owner
+if command -v ufw >/dev/null && ufw status | grep -q '^Status: active'; then
+  log 'Allowing required outbound HTTPS and DNS through UFW'
+  ufw allow out 443/tcp >/dev/null
+  ufw allow out 53/tcp >/dev/null
+  ufw allow out 53/udp >/dev/null
+fi
 if [[ "${RESTART_SERVICE}" == true ]]; then
   systemctl start "${service_unit}"
   healthy=false
   for _ in $(seq 1 30); do
-    if curl -fsS "${HEALTH_URL}" >/dev/null && systemctl is-active --quiet "${service_unit}"; then healthy=true; break; fi
+    if curl -fs "${HEALTH_URL}" >/dev/null 2>&1 && systemctl is-active --quiet "${service_unit}"; then healthy=true; break; fi
     sleep 1
   done
   [[ "${healthy}" == true ]] || { echo 'Health check failed' >&2; exit 1; }

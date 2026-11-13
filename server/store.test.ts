@@ -20,9 +20,17 @@ legacy.wallFiles = [file];
 legacy.wallPosts = [{ id: "post", title: "Old post", content: "Text", previewFileId: file.id, fileIds: [file.id], tagIds: ["tag"], authorId: legacy.users[0].id, serviceId: legacy.services[0].id, views: 17, createdAt: file.createdAt, updatedAt: file.createdAt }];
 legacy.wallTags = [{ id: "tag", name: "Tag", color: "#123456", pinned: true, archived: false, createdAt: file.createdAt }];
 legacy.wallComments = [{ id: "comment", postId: "post", parentId: null, authorId: legacy.users[0].id, content: "Comment", fileIds: [file.id], deletedAt: null, createdAt: file.createdAt, updatedAt: file.createdAt }];
-legacy.payments = [{ id: "payment", userId: legacy.users[0].id, serviceId: legacy.services[0].id, amount: 123, currency: "RUB", method: "manual", provider: "manual", status: "succeeded", externalId: "", confirmationUrl: "", description: "Payment", comment: "", depositId: null, failureReason: "", createdAt: file.createdAt, updatedAt: file.createdAt, paidAt: file.createdAt }];
+legacy.payments = [
+  { id: "payment", userId: legacy.users[0].id, serviceId: legacy.services[0].id, amount: 123, currency: "RUB", method: "manual", provider: "manual", status: "succeeded", externalId: "", confirmationUrl: "", description: "Payment", comment: "", depositId: null, failureReason: "", createdAt: file.createdAt, updatedAt: file.createdAt, paidAt: file.createdAt },
+  { id: "online", userId: legacy.users[0].id, serviceId: legacy.services[0].id, amount: 600, currency: "RUB", method: "sbp", provider: "yookassa", status: "succeeded", externalId: "yk-1", confirmationUrl: "https://yoomoney.example/confirm", description: "Online", comment: "", depositId: null, failureReason: "", createdAt: file.createdAt, updatedAt: file.createdAt, paidAt: file.createdAt }
+];
 legacy.settings.telegram.botToken = "test-token";
-legacy.settings.payments.secretKey = "test-secret";
+// Settings shape of releases that still had online acquiring.
+(legacy.settings as unknown as Record<string, unknown>).payments = {
+  enabled: true, provider: "yookassa", manualEnabled: false, sbpEnabled: true, sberPayEnabled: true,
+  shopId: "shop", secretKey: "test-secret", recipientName: "Иван", bankName: "Банк", phone: "+7900", account: "4081", paymentPurpose: "VPN"
+};
+legacy.users.push({ ...legacy.users[0], id: "usr_nopass", name: "No password", password: "", passwordSet: false, botAdmin: false });
 (legacy as unknown as Record<string, unknown>).latencyChecks = [{ id: "discard" }];
 (legacy.services[0] as unknown as Record<string, unknown>).connection = { host: "discard" };
 fs.mkdirSync(path.join(process.env.APP_DATA_DIR, "wall-files"), { recursive: true });
@@ -37,6 +45,11 @@ test("legacy JSON and disk attachments migrate without losing business data", as
     for (const key of ["payments", "deposits", "debits", "memberships", "wallPosts", "wallFiles", "wallTags", "wallComments"] as const) assert.deepEqual(migrated[key], legacy[key]);
     assert.equal(migrated.users[0].balance, legacy.users[0].balance);
     assert.equal(migrated.settings.telegram.botToken, "test-token");
+    // Online acquiring is gone: credentials are dropped, recipient details and history stay.
+    assert.deepEqual(migrated.settings.payments, { manualEnabled: false, recipientName: "Иван", bankName: "Банк", phone: "+7900", account: "4081", paymentPurpose: "VPN" });
+    assert.equal(migrated.payments.find((payment) => payment.id === "online")?.method, "sbp");
+    // A participant without a password must not silently receive the initial admin password.
+    assert.equal(migrated.users.find((user) => user.id === "usr_nopass")?.password, "");
     assert.equal("latencyChecks" in migrated, false);
     assert.equal("connection" in migrated.services[0], false);
     assert.ok(fs.existsSync(path.join(process.env.APP_DATA_DIR!, "db.json")));
@@ -106,6 +119,24 @@ test("JSON restores supplied wall sections and preserves omitted legacy sections
     store.replace(financial);
     assert.equal(store.read().wallPosts[0].title, "Restored title");
     assert.deepEqual(store.readWallFile(file.id), bytes);
+  } finally { store.close(); }
+});
+
+test("legacy JSON export omits sessions and imports back unchanged", () => {
+  const store = new Store();
+  try {
+    store.write((data) => {
+      data.settings.security.sessions = { sess_live: { userId: data.users[0].id, createdAt: new Date().toISOString() } };
+    });
+    const exported = JSON.parse(JSON.stringify(store.exportLegacyJson()));
+    assert.deepEqual(exported.settings.security.sessions, {});
+    const before = store.exportData();
+    store.replace(exported);
+    const after = store.exportData();
+    for (const key of ["users", "services", "memberships", "payments", "deposits", "debits", "wallPosts", "wallFiles", "currencies"] as const) {
+      assert.deepEqual(after[key], before[key]);
+    }
+    assert.deepEqual(after.settings.payments, before.settings.payments);
   } finally { store.close(); }
 });
 
